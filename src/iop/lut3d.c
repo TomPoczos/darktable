@@ -43,7 +43,7 @@
 #include "win/scandir.h"
 #endif // defined (_WIN32)
 
-DT_MODULE_INTROSPECTION(3, dt_iop_lut3d_params_t)
+DT_MODULE_INTROSPECTION(4, dt_iop_lut3d_params_t)
 
 #define DT_IOP_LUT3D_MAX_PATHNAME 512
 #define DT_IOP_LUT3D_MAX_LUTNAME 128
@@ -67,6 +67,12 @@ typedef enum dt_iop_lut3d_interpolation_t
   DT_IOP_PYRAMID = 2,     // $DESCRIPTION: "pyramid"
 } dt_iop_lut3d_interpolation_t;
 
+typedef enum dt_iop_lut3d_input_t
+{
+  DT_IOP_LUT3D_DISPLAY_REFERRED = 0, // $DESCRIPTION: "display-referred"
+  DT_IOP_LUT3D_SCENE_REFERRED = 1,   // $DESCRIPTION: "scene-referred"
+} dt_iop_lut3d_input_t;
+
 typedef struct dt_iop_lut3d_params_t
 {
   char filepath[DT_IOP_LUT3D_MAX_PATHNAME];
@@ -75,6 +81,7 @@ typedef struct dt_iop_lut3d_params_t
   int nb_keypoints; // $DEFAULT: 0 >0 indicates the presence of compressed lut
   char c_clut[DT_IOP_LUT3D_MAX_KEYPOINTS*2*3];
   char lutname[DT_IOP_LUT3D_MAX_LUTNAME];
+  dt_iop_lut3d_input_t input; // $DEFAULT: DT_IOP_LUT3D_DISPLAY_REFERRED $DESCRIPTION: "input"
 } dt_iop_lut3d_params_t;
 
 typedef struct dt_iop_lut3d_gui_data_t
@@ -83,6 +90,7 @@ typedef struct dt_iop_lut3d_gui_data_t
   GtkWidget *filepath;
   GtkWidget *colorspace;
   GtkWidget *interpolation;
+  GtkWidget *input;
 #ifdef HAVE_GMIC
   GtkWidget *lutentry;
   GtkWidget *lutname;
@@ -137,9 +145,9 @@ const char **description(dt_iop_module_t *self)
 {
   return dt_iop_set_description(self, _("perform color space corrections and apply look"),
                                       _("corrective or creative"),
-                                      _("linear, RGB, display-referred"),
+                                      _("linear, RGB, scene-referred or display-referred"),
                                       _("defined by profile, RGB"),
-                                      _("linear or non-linear, RGB, display-referred"));
+                                      _("linear or non-linear, RGB, scene-referred or display-referred"));
 }
 
 int flags()
@@ -221,6 +229,18 @@ int legacy_params(dt_iop_module_t *self,
     *new_version = 3;
     return 0;
   }
+  if(old_version == 3)
+  {
+    const dt_iop_lut3d_params_v3_t *o = (dt_iop_lut3d_params_v3_t *)old_params;
+    dt_iop_lut3d_params_t *n = calloc(1, sizeof(dt_iop_lut3d_params_t));
+    memcpy(n, o, sizeof(dt_iop_lut3d_params_v3_t));
+    n->input = DT_IOP_LUT3D_DISPLAY_REFERRED;
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_lut3d_params_t);
+    *new_version = 4;
+    return 0;
+  }
 
   return 1;
 }
@@ -230,7 +250,8 @@ static void _correct_pixel_trilinear(const float *const in,
                                      float *const out,
                                      const size_t pixel_nb,
                                      const float *const restrict clut,
-                                     const uint16_t level)
+                                     const uint16_t level,
+                                     const gboolean scene_referred)
 {
   const int level_minus_2 = (level - 2);
   const size_t level2 = level * level;
@@ -251,7 +272,7 @@ static void _correct_pixel_trilinear(const float *const in,
 
     // scale the input according to grid size
     for_each_channel(c, aligned(input))
-      rgbd[c] = CLIP(input[c]) * flevel_1;
+      rgbd[c] = (scene_referred ? input[c] : CLIP(input[c])) * flevel_1;
     // quantize to grid
     for_each_channel(c)
       rgbi[c] = (int)rgbd[c];
@@ -300,7 +321,8 @@ static void _correct_pixel_tetrahedral(const float *const in,
                                        float *const out,
                                        const size_t pixel_nb,
                                        const float *const restrict clut,
-                                       const uint16_t level)
+                                       const uint16_t level,
+                                       const gboolean scene_referred)
 {
   const size_t level2 = level * level;
   const size_t level1_stride = 3 * level;
@@ -317,7 +339,7 @@ static void _correct_pixel_tetrahedral(const float *const in,
     dt_aligned_pixel_t rgbi;
     dt_aligned_pixel_t rgbd;
     for_each_channel(c)
-      rgbd[c] = CLIP(input[c]) * flevel_1;
+      rgbd[c] = (scene_referred ? input[c] : CLIP(input[c])) * flevel_1;
 
     for_each_channel(c)
     {
@@ -395,7 +417,8 @@ static void _correct_pixel_pyramid(const float *const in,
                                    float *const out,
                                    const size_t pixel_nb,
                                    const float *const restrict clut,
-                                   const uint16_t level)
+                                   const uint16_t level,
+                                   const gboolean scene_referred)
 {
   const int level2 = level * level;
   const float flevel_1 = (float)(level - 1);
@@ -410,7 +433,7 @@ static void _correct_pixel_pyramid(const float *const in,
     dt_aligned_pixel_t rgbd;
     // scale the input according to grid size
     for_each_channel(c)
-      rgbd[c] = CLIP(input[c]) * flevel_1;
+      rgbd[c] = (scene_referred ? input[c] : CLIP(input[c])) * flevel_1;
     // clip coordinates to LUT grid
     for_each_channel(c)
       rgbi[c] = (int)rgbd[c];
@@ -1011,6 +1034,7 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
   const int kernel = (d->params.interpolation == DT_IOP_TETRAHEDRAL) ? gd->kernel_lut3d_tetrahedral
     : (d->params.interpolation == DT_IOP_TRILINEAR) ? gd->kernel_lut3d_trilinear
     : gd->kernel_lut3d_pyramid;
+  const int scene_referred = (d->params.input == DT_IOP_LUT3D_SCENE_REFERRED);
   const int colorspace
     = (d->params.colorspace == DT_IOP_SRGB) ? DT_COLORSPACE_SRGB
     : (d->params.colorspace == DT_IOP_REC709) ? DT_COLORSPACE_REC709
@@ -1047,10 +1071,12 @@ int process_cl(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, cl_mem dev_
     if(transform)
       // FIXME OPENCL is this safe here ?
       err = dt_opencl_enqueue_kernel_2d_args(devid, kernel, width, height,
-              CLARG(dev_out), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level));
+              CLARG(dev_out), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level),
+              CLARG(scene_referred));
     else
       err = dt_opencl_enqueue_kernel_2d_args(devid, kernel, width, height,
-              CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level));
+              CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(clut_cl), CLARG(level),
+              CLARG(scene_referred));
 
     if(err != CL_SUCCESS) goto cleanup;
 
@@ -1083,6 +1109,7 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
   const float *const clut = (float *)d->clut;
   const uint16_t level = d->level;
   const int interpolation = d->params.interpolation;
+  const gboolean scene_referred = (d->params.input == DT_IOP_LUT3D_SCENE_REFERRED);
   const int colorspace
     = (d->params.colorspace == DT_IOP_SRGB) ? DT_COLORSPACE_SRGB
     : (d->params.colorspace == DT_IOP_REC709) ? DT_COLORSPACE_REC709
@@ -1102,22 +1129,22 @@ void process(dt_iop_module_t *self, dt_dev_pixelpipe_iop_t *piece, const void *c
       dt_ioppr_transform_image_colorspace_rgb(ibuf, obuf, width, height,
         work_profile, lut_profile, "work profile to LUT profile");
       if(interpolation == DT_IOP_TETRAHEDRAL)
-        _correct_pixel_tetrahedral(obuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_tetrahedral(obuf, obuf, (size_t)width * height, clut, level, scene_referred);
       else if(interpolation == DT_IOP_TRILINEAR)
-        _correct_pixel_trilinear(obuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_trilinear(obuf, obuf, (size_t)width * height, clut, level, scene_referred);
       else
-        _correct_pixel_pyramid(obuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_pyramid(obuf, obuf, (size_t)width * height, clut, level, scene_referred);
       dt_ioppr_transform_image_colorspace_rgb(obuf, obuf, width, height,
         lut_profile, work_profile, "LUT profile to work profile");
     }
     else
     {
       if(interpolation == DT_IOP_TETRAHEDRAL)
-        _correct_pixel_tetrahedral(ibuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_tetrahedral(ibuf, obuf, (size_t)width * height, clut, level, scene_referred);
       else if(interpolation == DT_IOP_TRILINEAR)
-        _correct_pixel_trilinear(ibuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_trilinear(ibuf, obuf, (size_t)width * height, clut, level, scene_referred);
       else
-        _correct_pixel_pyramid(ibuf, obuf, (size_t)width * height, clut, level);
+        _correct_pixel_pyramid(ibuf, obuf, (size_t)width * height, clut, level, scene_referred);
     }
   }
   else  // no clut
@@ -1748,6 +1775,11 @@ void gui_init(dt_iop_module_t *self)
 
   g->interpolation = dt_bauhaus_combobox_from_params(self, N_("interpolation"));
   gtk_widget_set_tooltip_text(g->interpolation, _("select the interpolation method"));
+
+  g->input = dt_bauhaus_combobox_from_params(self, "input");
+  gtk_widget_set_tooltip_text(g->input,
+    _("display-referred: input is clipped to [0,1] before applying the LUT, as expected by most LUTs\n"
+      "scene-referred: input is not clipped, values above 1 are extrapolated beyond the LUT boundary"));
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_MODULE_MOVED, _module_moved_callback);
 }
