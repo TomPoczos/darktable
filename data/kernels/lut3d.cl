@@ -20,7 +20,7 @@
 
 kernel void
 lut3d_tetrahedral(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-           global float *clut, const int level)
+           global float *clut, const int level, const int scene_referred)
 {
   int4 rgbi = (int4)(0);
   float4 rgbd = (float4)(0.0f);
@@ -30,7 +30,7 @@ lut3d_tetrahedral(read_only image2d_t in, write_only image2d_t out, const int wi
 
   if(x >= width || y >= height) return;
 
-  float4 input = clip4(readpixel(in, x, y));
+  float4 input = scene_referred ? readpixel(in, x, y) : clip4(readpixel(in, x, y));
   float4 output = (float4)(0.0f);
 
   rgbd = input * (float)(level - 1);
@@ -96,7 +96,7 @@ lut3d_tetrahedral(read_only image2d_t in, write_only image2d_t out, const int wi
 
 kernel void
 lut3d_trilinear(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-           global float *clut, const uint level)
+           global float *clut, const uint level, const int scene_referred)
 {
   int4 rgbi = (int4)(0);
   float4 rgbd = (float4)(0.0f);
@@ -108,7 +108,7 @@ lut3d_trilinear(read_only image2d_t in, write_only image2d_t out, const int widt
 
   if(x >= width || y >= height) return;
 
-  float4 input = clip4(readpixel(in, x, y));
+  float4 input = scene_referred ? readpixel(in, x, y) : clip4(readpixel(in, x, y));
   float4 output = (float4)(0.0f);
 
   rgbd = input * (float)(level - 1);
@@ -152,7 +152,7 @@ lut3d_trilinear(read_only image2d_t in, write_only image2d_t out, const int widt
 
 kernel void
 lut3d_pyramid(read_only image2d_t in, write_only image2d_t out, const int width, const int height,
-           global float *clut, const uint level)
+           global float *clut, const uint level, const int scene_referred)
 {
   int4 rgbi = (int4)(0);
   float4 rgbd = (float4)(0.0f);
@@ -162,7 +162,7 @@ lut3d_pyramid(read_only image2d_t in, write_only image2d_t out, const int width,
 
   if(x >= width || y >= height) return;
 
-  float4 input = clip4(readpixel(in, x, y));
+  float4 input = scene_referred ? readpixel(in, x, y) : clip4(readpixel(in, x, y));
   float4 output = (float4)(0.0f);
 
   rgbd = input * (float)(level - 1);
