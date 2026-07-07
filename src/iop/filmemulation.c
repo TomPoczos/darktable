@@ -84,6 +84,25 @@ typedef enum dt_iop_filmemulation_process_t
   DT_FE_PROCESS_NEGATIVE = 1, // $DESCRIPTION: "negative"
 } dt_iop_filmemulation_process_t;
 
+// How a normalized pipe RGB is turned into the per-wavelength spectrum that
+// gets dotted against each layer's spectral sensitivity -- three published
+// "spectral upsampling" methods, all recovering a plausible but necessarily
+// arbitrary metamer for the same RGB (see task 08's own writeup for why this
+// is inherently a guess, and where the three differ in practice).
+typedef enum dt_iop_filmemulation_spectral_method_t
+{
+  // Jakob & Hanika 2019: an analytic sigmoid whose 3 coefficients come from
+  // a baked LUT fitted for smoothness -- darktable's original method here.
+  DT_FE_SPECTRAL_JAKOB_HANIKA2019 = 0, // $DESCRIPTION: "smooth sigmoid (Jakob & Hanika 2019)"
+  // Mallett & Yuksel 2019: a fixed 3-spectrum linear reflectance basis --
+  // simpler and cheaper, not more accurate than Jakob-Hanika.
+  DT_FE_SPECTRAL_MALLETT2019 = 1, // $DESCRIPTION: "linear basis (Mallett & Yuksel 2019)"
+  // Hanatos 2025: a closed-form reconstruction fitted against real curated/
+  // measured spectra rather than an idealized smoothness criterion -- can
+  // diverge from the other two for narrow-band/heavily colored light.
+  DT_FE_SPECTRAL_HANATOS2025 = 2, // $DESCRIPTION: "measured-spectra fit (Hanatos 2025)"
+} dt_iop_filmemulation_spectral_method_t;
+
 typedef enum dt_iop_filmemulation_route_t
 {
   DT_FE_ROUTE_DIRECT = 0,        // $DESCRIPTION: "straight to paper"
@@ -145,6 +164,8 @@ typedef struct dt_iop_filmemulation_params_t
   dt_iop_filmemulation_negative_film_t negative_film; // $DEFAULT: DT_FE_NEG_PORTRA400 $DESCRIPTION: "film"
   dt_iop_filmemulation_ladder_paper_t negative_paper;  // $DEFAULT: DT_FE_LADDER_PORTRA_ENDURA $DESCRIPTION: "paper"
 
+  dt_iop_filmemulation_spectral_method_t spectral_method; // $DEFAULT: DT_FE_SPECTRAL_HANATOS2025 $DESCRIPTION: "spectral reconstruction"
+
   float print_gamma; // $MIN: 1.0 $MAX: 1.6 $DEFAULT: 1.25 $DESCRIPTION: "print gamma"
   gboolean use_hk; // $DEFAULT: FALSE $DESCRIPTION: "perceptual color correction (HK)"
 
@@ -161,6 +182,7 @@ typedef struct dt_iop_filmemulation_gui_data_t
   GtkWidget *box_reversal, *reversal_film, *route;
   GtkWidget *box_direct, *direct_paper;
   GtkWidget *box_internegative, *internegative_paper;
+  GtkWidget *spectral_method;
   GtkWidget *print_gamma, *use_hk;
   GtkWidget *dir_couplers_active, *dir_couplers_amount;
 } dt_iop_filmemulation_gui_data_t;
@@ -215,6 +237,14 @@ typedef struct dt_iop_filmemulation_data_t
   int n_layers; // 1 (B&W) or 3 (color)
   dt_iop_filmemulation_layer_data_t layer[3];
   gboolean use_hk;
+
+  dt_iop_filmemulation_spectral_method_t spectral_method;
+  // Hanatos2025 only: the reconstructed spectral shape at the working
+  // white point, pre-scaled by white's own XYZ sum -- every pixel's
+  // reconstructed spectrum is divided by this so a neutral RGB reconstructs
+  // as a flat reflectance of that same value, exactly like the other two
+  // methods (see _fe_hanatos_spectrum()).
+  float hanatos_ref_shape[FE_N_WAVELENGTHS];
 
   // DIR-coupler (dye coupler inter-layer crosstalk) state -- only ever
   // active for n_layers == 3 (color). See _fe_setup_dir_couplers() and
@@ -711,6 +741,114 @@ static inline void _fe_sigmoid_spectrum(const float coeffs[3], float spectrum[FE
 }
 
 // ---------------------------------------------------------------------------
+// Spectral reconstruction, alternate method 1: Mallett & Yuksel 2019 -- a
+// fixed linear reflectance basis (fe_mallett_basis_{r,g,b} in
+// filmemulation_data.c). By construction the three basis spectra sum to
+// 1.0 at every wavelength, so a neutral RGB reconstructs as a flat
+// reflectance of that same value automatically, matching how
+// _fe_sigmoid_spectrum() above handles a neutral input.
+// ---------------------------------------------------------------------------
+static inline void _fe_mallett_spectrum(const float rgb[3], float spectrum[FE_N_WAVELENGTHS])
+{
+  const float r = CLAMPF(rgb[0], 0.f, 1.f);
+  const float g = CLAMPF(rgb[1], 0.f, 1.f);
+  const float b = CLAMPF(rgb[2], 0.f, 1.f);
+  for(int i = 0; i < FE_N_WAVELENGTHS; i++)
+    spectrum[i] = r * fe_mallett_basis_r[i] + g * fe_mallett_basis_g[i] + b * fe_mallett_basis_b[i];
+}
+
+// ---------------------------------------------------------------------------
+// Spectral reconstruction, alternate method 2: Hanatos 2025 -- a closed-form
+// rational-function fit against real curated/measured spectra (rather than
+// an idealized smoothness criterion), indexed by chromaticity via a baked
+// coefficient LUT (fe_hanatos_coeffs in filmemulation_data.c, itself a
+// downsampled port of spektrafilm's hanatos_irradiance_xy_coeffs LUT).
+// ---------------------------------------------------------------------------
+
+// Maps a CIE xy chromaticity into the LUT's square-warped grid coordinate
+// -- matches spektrafilm's _tri2quad(): samples the LUT with uniform
+// density across the whole xy triangle instead of wasting resolution
+// outside the visible locus.
+static inline void _fe_tri2quad(const float cx, const float cy, float *tx, float *ty)
+{
+  const float omc = fmaxf(1.f - cx, 1e-6f);
+  *ty = CLAMPF(cy / omc, 0.f, 1.f);
+  *tx = CLAMPF(omc * omc, 0.f, 1.f);
+}
+
+static inline void _fe_hanatos_fetch_coeffs(const float tx, const float ty, float coeffs[4])
+{
+  const int N = FE_HANATOS_GRID_SIZE;
+  const float gx = CLAMPF(tx, 0.f, 1.f) * (N - 1);
+  const float gy = CLAMPF(ty, 0.f, 1.f) * (N - 1);
+  int x0 = (int)gx; if(x0 > N - 2) x0 = N - 2;
+  int y0 = (int)gy; if(y0 > N - 2) y0 = N - 2;
+  const float fx = gx - x0, fy = gy - y0;
+  for(int k = 0; k < 4; k++)
+  {
+    const float c00 = fe_hanatos_coeffs[x0][y0][k];
+    const float c01 = fe_hanatos_coeffs[x0][y0 + 1][k];
+    const float c10 = fe_hanatos_coeffs[x0 + 1][y0][k];
+    const float c11 = fe_hanatos_coeffs[x0 + 1][y0 + 1][k];
+    const float lo = c00 * (1.f - fy) + c01 * fy;
+    const float hi = c10 * (1.f - fy) + c11 * fy;
+    coeffs[k] = lo * (1.f - fx) + hi * fx;
+  }
+}
+
+// Reconstructs the Hanatos-2025 spectrum shape for an RGB color, scaled by
+// its own XYZ magnitude -- matches spektrafilm's compute_lut_spectra()'s
+// per-pixel evaluation (_fetch_coeffs() + _compute_spectra_from_coeffs()),
+// collapsed to a direct per-wavelength evaluation instead of the Python
+// reference's upsample/blur/downsample (that resampling exists there only
+// to anti-alias before interpolating onto a coarser measurement grid; the
+// rational-function shape itself is smooth enough to evaluate directly at
+// darktable's own 31 wavelengths). Not clamped to reflectance range: this
+// represents a full scene-irradiance-like spectrum, not a reflectance, so
+// its overall scale is normalized away by the caller instead (see
+// _fe_hanatos_spectrum() and hanatos_ref_shape's own comment).
+static inline void _fe_hanatos_reconstruct(const float rgb[3], float shape_scaled[FE_N_WAVELENGTHS])
+{
+  const float r = fmaxf(rgb[0], 0.f), g = fmaxf(rgb[1], 0.f), b = fmaxf(rgb[2], 0.f);
+  const float X = fe_adobergb_rgb2xyz[0][0] * r + fe_adobergb_rgb2xyz[0][1] * g + fe_adobergb_rgb2xyz[0][2] * b;
+  const float Y = fe_adobergb_rgb2xyz[1][0] * r + fe_adobergb_rgb2xyz[1][1] * g + fe_adobergb_rgb2xyz[1][2] * b;
+  const float Z = fe_adobergb_rgb2xyz[2][0] * r + fe_adobergb_rgb2xyz[2][1] * g + fe_adobergb_rgb2xyz[2][2] * b;
+  const float sum = fmaxf(X + Y + Z, 1e-9f);
+
+  float tx, ty;
+  _fe_tri2quad(X / sum, Y / sum, &tx, &ty);
+
+  float coeffs[4];
+  _fe_hanatos_fetch_coeffs(tx, ty, coeffs);
+  const float c3 = fmaxf(coeffs[3], 1e-6f);
+
+  for(int i = 0; i < FE_N_WAVELENGTHS; i++)
+  {
+    const float wl = fe_wavelengths[i];
+    const float x = (coeffs[0] * wl + coeffs[1]) * wl + coeffs[2];
+    const float y = 1.f / sqrtf(x * x + 1.f);
+    const float shape = (0.5f * x * y + 0.5f) / c3;
+    shape_scaled[i] = shape * sum;
+  }
+}
+
+// Per-pixel Hanatos-2025 spectrum: the reconstructed shape above, divided
+// by the same shape reconstructed for the working white point (see
+// hanatos_ref_shape's own comment in dt_iop_filmemulation_data_t) -- puts
+// it on the same "flat reflectance of 1 under white light" footing the
+// other two methods use, without needing any of spektrafilm's own
+// per-sensitivity calibration constants.
+static inline void _fe_hanatos_spectrum(const dt_iop_filmemulation_data_t *d,
+                                        const float rgb[3],
+                                        float spectrum[FE_N_WAVELENGTHS])
+{
+  float shape[FE_N_WAVELENGTHS];
+  _fe_hanatos_reconstruct(rgb, shape);
+  for(int i = 0; i < FE_N_WAVELENGTHS; i++)
+    spectrum[i] = shape[i] / fmaxf(d->hanatos_ref_shape[i], 1e-6f);
+}
+
+// ---------------------------------------------------------------------------
 // Helmholtz-Kohlrausch exposure multiplier (Fairchild & Pirrotta 1991),
 // applied to LINEAR Adobe-RGB-primaries input -- direct port of
 // generate_film_looks.py's hk_mul(), including its HK_MAX_MUL ceiling.
@@ -802,6 +940,13 @@ void commit_params(dt_iop_module_t *self,
 
   d->use_hk = p->use_hk;
 
+  d->spectral_method = p->spectral_method;
+  if(d->spectral_method == DT_FE_SPECTRAL_HANATOS2025)
+  {
+    const float white[3] = { 1.f, 1.f, 1.f };
+    _fe_hanatos_reconstruct(white, d->hanatos_ref_shape);
+  }
+
   if(p->type == DT_FE_TYPE_BW)
   {
     d->n_layers = 1;
@@ -877,10 +1022,24 @@ static inline void _fe_compute_layer_exposures(const dt_iop_filmemulation_data_t
   dt_aligned_pixel_t rgb;
   dt_apply_transposed_color_matrix(pix_in, pipe_to_adobergb, rgb);
 
-  float coeffs[3];
-  _fe_rgb_to_sigmoid_coeffs(rgb[0], rgb[1], rgb[2], coeffs);
   float spectrum[FE_N_WAVELENGTHS];
-  _fe_sigmoid_spectrum(coeffs, spectrum);
+  switch(d->spectral_method)
+  {
+    case DT_FE_SPECTRAL_MALLETT2019:
+      _fe_mallett_spectrum(rgb, spectrum);
+      break;
+    case DT_FE_SPECTRAL_HANATOS2025:
+      _fe_hanatos_spectrum(d, rgb, spectrum);
+      break;
+    case DT_FE_SPECTRAL_JAKOB_HANIKA2019:
+    default:
+    {
+      float coeffs[3];
+      _fe_rgb_to_sigmoid_coeffs(rgb[0], rgb[1], rgb[2], coeffs);
+      _fe_sigmoid_spectrum(coeffs, spectrum);
+      break;
+    }
+  }
 
   const float hk = d->use_hk ? _fe_hk_mul(rgb[0], rgb[1], rgb[2]) : 1.f;
 
@@ -1225,6 +1384,15 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(main_box, g->box_color);
 
   self->widget = main_box;
+
+  g->spectral_method = dt_bauhaus_combobox_from_params(self, "spectral_method");
+  gtk_widget_set_tooltip_text(g->spectral_method,
+                              _("how a scene color is turned into the full-spectrum light the film's\n"
+                                "layers actually react to. RGB never carries enough information to\n"
+                                "know the real light spectrum, so this is always an educated guess;\n"
+                                "the three methods mostly agree for ordinary daylight/tungsten photos\n"
+                                "and can diverge for narrow-band or heavily colored light (colored\n"
+                                "LEDs, sodium-vapor, neon, stage lighting)."));
 
   g->print_gamma = dt_bauhaus_slider_from_params(self, "print_gamma");
   gtk_widget_set_tooltip_text(g->print_gamma, _("Jones system-gamma target: how contrasty the film+paper pairing\n"
