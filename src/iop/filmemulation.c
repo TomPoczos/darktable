@@ -34,6 +34,7 @@
 #include "common/chromatic_adaptation.h"
 #include "common/colorspaces.h"
 #include "common/gamut_mapping.h"
+#include "common/gaussian.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
@@ -47,6 +48,7 @@
 #include <gtk/gtk.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "external/filmemulation_data.c"
 
@@ -145,6 +147,9 @@ typedef struct dt_iop_filmemulation_params_t
 
   float print_gamma; // $MIN: 1.0 $MAX: 1.6 $DEFAULT: 1.25 $DESCRIPTION: "print gamma"
   gboolean use_hk; // $DEFAULT: FALSE $DESCRIPTION: "perceptual color correction (HK)"
+
+  gboolean dir_couplers_active; // $DEFAULT: TRUE $DESCRIPTION: "dye coupler interaction"
+  float dir_couplers_amount; // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 1.0 $DESCRIPTION: "amount"
 } dt_iop_filmemulation_params_t;
 
 typedef struct dt_iop_filmemulation_gui_data_t
@@ -157,6 +162,7 @@ typedef struct dt_iop_filmemulation_gui_data_t
   GtkWidget *box_direct, *direct_paper;
   GtkWidget *box_internegative, *internegative_paper;
   GtkWidget *print_gamma, *use_hk;
+  GtkWidget *dir_couplers_active, *dir_couplers_amount;
 } dt_iop_filmemulation_gui_data_t;
 
 // ---------------------------------------------------------------------------
@@ -167,6 +173,20 @@ typedef struct dt_iop_filmemulation_gui_data_t
 // couple of small interpolations/closed-form evaluations.
 // ---------------------------------------------------------------------------
 #define FE_MAX_STAGES 3
+
+// DIR-coupler spatial diffusion constants -- global across all stocks
+// (spektrafilm's DirCouplersParams defaults; no stock overrides these).
+// Gaussian core + a second, wider Gaussian standing in for the exponential
+// long-range tail, blended by weight (same Gaussian-mixture-for-exponential
+// approximation as the halation task).
+#define FE_DIRC_DIFFUSION_UM 20.0f
+#define FE_DIRC_DIFFUSION_TAIL_UM 200.0f
+#define FE_DIRC_DIFFUSION_TAIL_WEIGHT 0.06f
+// Assumed 35mm-film physical width (in microns) mapped to the image width,
+// used to convert the _UM constants above into pixel-space sigmas so the
+// diffusion radius scales with output resolution rather than being a fixed
+// pixel count.
+#define FE_FILM_WIDTH_UM 36000.0f
 
 typedef struct dt_iop_filmemulation_stage_data_t
 {
@@ -195,6 +215,14 @@ typedef struct dt_iop_filmemulation_data_t
   int n_layers; // 1 (B&W) or 3 (color)
   dt_iop_filmemulation_layer_data_t layer[3];
   gboolean use_hk;
+
+  // DIR-coupler (dye coupler inter-layer crosstalk) state -- only ever
+  // active for n_layers == 3 (color). See _fe_setup_dir_couplers() and
+  // the spatial diffusion pass in process().
+  gboolean dir_couplers_active;
+  gboolean dir_couplers_positive; // TRUE for reversal (any route), FALSE for negative
+  float dir_couplers_matrix[3][3]; // [donor][receiver], pre-scaled by the amount slider
+  float dir_couplers_density_max[3]; // per-layer stage-0 max density (for the positive/silver term)
 } dt_iop_filmemulation_data_t;
 
 // ---------------------------------------------------------------------------
@@ -478,7 +506,114 @@ static inline float _fe_eval_stage(const dt_iop_filmemulation_layer_data_t *L, c
   return _fe_lerp_clamped(L->stage[stage_idx].pts, L->stage[stage_idx].n, x);
 }
 
-// Full cascade transfer function E (linear exposure) -> reflectance --
+// ---------------------------------------------------------------------------
+// DIR-coupler (dye coupler inter-layer crosstalk) setup -- direct port of
+// Python's compute_dir_couplers_matrix() plus a darktable-specific
+// grey-anchor fixed-point correction (see task 02's task file for the
+// derivation) that keeps a flat 18% grey field's rendering exactly
+// unaffected by the coupler correction -- the same invariant Python's
+// compute_density_curves_before_dir_couplers() enforces via a curve
+// resample, reformulated here as a fixed point on na0 so it works
+// uniformly whether stage 0 is the analytically-fitted "corrected" stage
+// (negative, reversal-direct) or a plain interpolated curve (reversal
+// internegative route), since both go through the same _fe_eval_stage().
+// ---------------------------------------------------------------------------
+static void _fe_build_dir_couplers_matrix(const dt_film_dir_couplers_t *c, const float amount, float M[3][3])
+{
+  for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++) M[i][j] = 0.f;
+  M[0][0] = c->gamma_samelayer_rgb[0];
+  M[1][1] = c->gamma_samelayer_rgb[1];
+  M[2][2] = c->gamma_samelayer_rgb[2];
+  M[0][1] = c->gamma_interlayer_r_to_gb[0]; // R -> G
+  M[0][2] = c->gamma_interlayer_r_to_gb[1]; // R -> B
+  M[1][0] = c->gamma_interlayer_g_to_rb[0]; // G -> R
+  M[1][2] = c->gamma_interlayer_g_to_rb[1]; // G -> B
+  M[2][0] = c->gamma_interlayer_b_to_rg[0]; // B -> R
+  M[2][1] = c->gamma_interlayer_b_to_rg[1]; // B -> G
+  for(int i = 0; i < 3; i++) for(int j = 0; j < 3; j++) M[i][j] *= amount;
+}
+
+// Max density of a layer's stage-0 curve -- the analytic split-gauss fit's
+// own asymptote when stage 0 is the print-gamma-corrected stage (negative,
+// reversal-direct), or the digitized curve's own max y otherwise (reversal
+// internegative route).
+static float _fe_stage0_max_density(const dt_iop_filmemulation_layer_data_t *L)
+{
+  if(L->corrected_stage == 0)
+    return fmaxf(L->fit.d_lo, L->fit.d_hi);
+  const dt_film_curve_point_t *pts = L->stage[0].pts;
+  const int n = L->stage[0].n;
+  float m = pts[0].y;
+  for(int i = 1; i < n; i++) if(pts[i].y > m) m = pts[i].y;
+  return m;
+}
+
+// Re-derive each layer's na0 (the grey-exposure anchor -- see
+// _fe_setup_layer()) so that a spatially-uniform 18% grey field renders
+// identically whether DIR couplers are active or not: on a flat field the
+// spatial diffusion in process() is a no-op, so the per-pixel correction
+// there reduces to exactly the matrix term computed here. Fixed-point
+// iterated (a handful of iterations is enough given gammas < 1 and smooth,
+// bounded stage-0 responses) rather than solved in closed form, since it
+// has to hold across all three cross-coupled layers at once.
+static void _fe_setup_dir_couplers_anchor(dt_iop_filmemulation_data_t *d)
+{
+  float na0_base[3];
+  for(int li = 0; li < 3; li++) na0_base[li] = d->layer[li].na0;
+
+  float na0_new[3];
+  for(int li = 0; li < 3; li++) na0_new[li] = na0_base[li];
+
+  for(int iter = 0; iter < 8; iter++)
+  {
+    float D0[3];
+    for(int li = 0; li < 3; li++)
+      D0[li] = _fe_eval_stage(&d->layer[li], 0, na0_new[li]);
+
+    float silver[3];
+    for(int li = 0; li < 3; li++)
+      silver[li] = d->dir_couplers_positive ? (d->dir_couplers_density_max[li] - D0[li]) : D0[li];
+
+    float correction[3] = { 0.f, 0.f, 0.f };
+    for(int receiver = 0; receiver < 3; receiver++)
+      for(int donor = 0; donor < 3; donor++)
+        correction[receiver] += silver[donor] * d->dir_couplers_matrix[donor][receiver];
+
+    for(int li = 0; li < 3; li++) na0_new[li] = na0_base[li] + correction[li];
+  }
+
+  for(int li = 0; li < 3; li++) d->layer[li].na0 = na0_new[li];
+}
+
+// Called once per commit_params(), after all three layers' _fe_setup_layer()
+// have run, for the three color branches (negative, reversal-direct,
+// reversal-internegative) -- never for B&W, which has no inter-layer
+// crosstalk to model.
+static void _fe_configure_dir_couplers(dt_iop_filmemulation_data_t *d,
+                                       const dt_iop_filmemulation_params_t *p,
+                                       const dt_film_dir_couplers_t *couplers,
+                                       const gboolean positive)
+{
+  d->dir_couplers_active = p->dir_couplers_active;
+  d->dir_couplers_positive = positive;
+  if(!d->dir_couplers_active) return;
+
+  _fe_build_dir_couplers_matrix(couplers, p->dir_couplers_amount, d->dir_couplers_matrix);
+  for(int li = 0; li < 3; li++)
+    d->dir_couplers_density_max[li] = _fe_stage0_max_density(&d->layer[li]);
+  _fe_setup_dir_couplers_anchor(d);
+}
+
+// Linear exposure E -> the log-position "lh" fed to stage 0 -- split out
+// of _fe_xfer() so DIR-coupler handling (below) can compute this once,
+// look at stage 0's first-pass density, then re-run the cascade from a
+// corrected lh without duplicating the E->lh formula.
+static inline float _fe_lh_from_E(const dt_iop_filmemulation_layer_data_t *L, const float E)
+{
+  return (E <= 1e-9f) ? L->x0_sentinel : (L->na0 + log10f(E / fe_grey));
+}
+
+// Full cascade transfer function starting from an already-computed lh --
 // matches Python's build_print_cascade()'s inner xfer() closure exactly.
 // Deliberately NOT clamped to [0,1] here: a highlight can legitimately
 // reconstruct to a reflectance above 1 (or, per-channel, produce an
@@ -486,14 +621,18 @@ static inline float _fe_eval_stage(const dt_iop_filmemulation_layer_data_t *L, c
 // chopping each channel independently right here is exactly the naive
 // per-channel clamp _fe_gamut_map() below replaces with a hue-preserving
 // gamut compression once all three layers are assembled.
-static inline float _fe_xfer(const dt_iop_filmemulation_layer_data_t *L, const float E)
+static inline float _fe_xfer_from_lh(const dt_iop_filmemulation_layer_data_t *L, const float lh)
 {
-  const float lh = (E <= 1e-9f) ? L->x0_sentinel : (L->na0 + log10f(E / fe_grey));
   float D = _fe_eval_stage(L, 0, lh);
   for(int i = 1; i < L->n_stages; i++)
     D = _fe_eval_stage(L, i, L->pls[i - 1] - D);
   const float v = powf(10.f, -(D - L->fdm));
   return fmaxf(v, 0.f);
+}
+
+static inline float _fe_xfer(const dt_iop_filmemulation_layer_data_t *L, const float E)
+{
+  return _fe_xfer_from_lh(L, _fe_lh_from_E(L, E));
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +805,7 @@ void commit_params(dt_iop_module_t *self,
   if(p->type == DT_FE_TYPE_BW)
   {
     d->n_layers = 1;
+    d->dir_couplers_active = FALSE; // no inter-layer crosstalk with a single layer
     const dt_film_curve_t *filter = (p->bw_filter == DT_FE_FILTER_NONE) ? NULL : &fe_filters[p->bw_filter];
     const dt_film_curve_t *stages[FE_MAX_STAGES] = { &fe_trix_dev7, &fe_poly_curves[FE_POLY_GRADE_NORMAL], NULL };
     const gboolean increasing[FE_MAX_STAGES] = { TRUE, TRUE, FALSE };
@@ -684,6 +824,7 @@ void commit_params(dt_iop_module_t *self,
       const float ref_d[FE_MAX_STAGES] = { film->ref_d[li], 0.f, 0.f };
       _fe_setup_layer(&d->layer[li], &film->sens[li], NULL, 2, stages, increasing, ref_d, &film->fit[li], p->print_gamma);
     }
+    _fe_configure_dir_couplers(d, p, &film->dir_couplers, FALSE);
   }
   else if(p->route == DT_FE_ROUTE_DIRECT)
   {
@@ -697,6 +838,7 @@ void commit_params(dt_iop_module_t *self,
       const float ref_d[FE_MAX_STAGES] = { film->ref_d[li], 0.f, 0.f };
       _fe_setup_layer(&d->layer[li], &film->sens[li], NULL, 2, stages, increasing, ref_d, &film->fit[li], p->print_gamma);
     }
+    _fe_configure_dir_couplers(d, p, &film->dir_couplers, TRUE);
   }
   else // reversal, internegative route
   {
@@ -711,6 +853,7 @@ void commit_params(dt_iop_module_t *self,
       _fe_setup_layer(&d->layer[li], &film->sens[li], NULL, 3, stages, increasing, ref_d,
                       &fe_internegative_fits[li], p->print_gamma);
     }
+    _fe_configure_dir_couplers(d, p, &film->dir_couplers, TRUE);
   }
 }
 
@@ -720,10 +863,220 @@ void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe
 }
 
 // ---------------------------------------------------------------------------
+// process helpers
+// ---------------------------------------------------------------------------
+
+// pipe RGB -> linear Adobe RGB primaries -> spectral reconstruction ->
+// optional HK -> per-layer linear exposure. Shared by both process() paths
+// below so the spectral-reconstruction code exists exactly once.
+static inline void _fe_compute_layer_exposures(const dt_iop_filmemulation_data_t *d,
+                                               const float *const restrict pix_in,
+                                               const dt_colormatrix_t pipe_to_adobergb,
+                                               float E[3])
+{
+  dt_aligned_pixel_t rgb;
+  dt_apply_transposed_color_matrix(pix_in, pipe_to_adobergb, rgb);
+
+  float coeffs[3];
+  _fe_rgb_to_sigmoid_coeffs(rgb[0], rgb[1], rgb[2], coeffs);
+  float spectrum[FE_N_WAVELENGTHS];
+  _fe_sigmoid_spectrum(coeffs, spectrum);
+
+  const float hk = d->use_hk ? _fe_hk_mul(rgb[0], rgb[1], rgb[2]) : 1.f;
+
+  for(int layer = 0; layer < d->n_layers; layer++)
+  {
+    float e = 0.f;
+    for(int w = 0; w < FE_N_WAVELENGTHS; w++) e += spectrum[w] * d->layer[layer].weight[w];
+    E[layer] = e * hk;
+  }
+}
+
+// result (linear Adobe RGB reflectance, alpha already in result[3]) ->
+// gamut-mapped pipe RGB. Shared tail end of both process() paths.
+static inline void _fe_finish_pixel(dt_aligned_pixel_t result,
+                                    const gboolean has_gamut_matrices,
+                                    const dt_colormatrix_t yrg_input_matrix_trans,
+                                    const dt_colormatrix_t yrg_output_matrix,
+                                    const dt_colormatrix_t yrg_output_matrix_trans,
+                                    const dt_colormatrix_t adobergb_to_pipe,
+                                    float *const restrict pix_out)
+{
+  if(has_gamut_matrices)
+    _fe_gamut_map(result, yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
+  else
+    for(int c = 0; c < 3; c++) result[c] = fminf(fmaxf(result[c], 0.f), 1.f);
+
+  dt_apply_transposed_color_matrix(result, adobergb_to_pipe, pix_out);
+}
+
+// The original, single-pass per-pixel path (no DIR-coupler spatial
+// diffusion): every pixel is independent, exactly as before task 02.
+// Used whenever DIR couplers are inactive, and as the fallback if the
+// buffered path below fails to allocate its scratch buffers.
+static void _fe_process_simple(const dt_iop_filmemulation_data_t *d,
+                               const float *const in, float *const out,
+                               const size_t npixels,
+                               const dt_colormatrix_t pipe_to_adobergb,
+                               const dt_colormatrix_t adobergb_to_pipe,
+                               const gboolean has_gamut_matrices,
+                               const dt_colormatrix_t yrg_input_matrix_trans,
+                               const dt_colormatrix_t yrg_output_matrix,
+                               const dt_colormatrix_t yrg_output_matrix_trans)
+{
+  const int n_layers = d->n_layers;
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+    float *const restrict pix_out = out + k;
+
+    float E[3] = { 0.f, 0.f, 0.f };
+    _fe_compute_layer_exposures(d, pix_in, pipe_to_adobergb, E);
+
+    dt_aligned_pixel_t result = { 0.f, 0.f, 0.f, 0.f };
+    for(int layer = 0; layer < n_layers; layer++)
+      result[layer] = _fe_xfer(&d->layer[layer], E[layer]);
+    if(n_layers == 1)
+    {
+      result[1] = result[0];
+      result[2] = result[0];
+    }
+    result[3] = pix_in[3];
+
+    _fe_finish_pixel(result, has_gamut_matrices, yrg_input_matrix_trans, yrg_output_matrix,
+                     yrg_output_matrix_trans, adobergb_to_pipe, pix_out);
+  }
+}
+
+// DIR-coupler path: a first pixel pass computes, per pixel, the log-
+// exposure position "lh" fed to stage 0 and that stage's first-pass
+// density (used as the "silver density" the coupler matrix acts on); the
+// resulting per-receiver-layer correction term is spatially diffused
+// (Gaussian core + a second, wider Gaussian standing in for the
+// exponential tail) exactly like real inhibitor diffusion in the emulsion;
+// a second pixel pass subtracts the (blurred) correction from lh and
+// re-runs the cascade from there. See task 02's task file for the full
+// derivation. Returns FALSE (having freed everything) if scratch-buffer
+// allocation fails, so the caller can fall back to _fe_process_simple().
+static gboolean _fe_process_dir_couplers(const dt_iop_filmemulation_data_t *d,
+                                         const float *const in, float *const out,
+                                         const dt_iop_roi_t *const roi_in,
+                                         const dt_colormatrix_t pipe_to_adobergb,
+                                         const dt_colormatrix_t adobergb_to_pipe,
+                                         const gboolean has_gamut_matrices,
+                                         const dt_colormatrix_t yrg_input_matrix_trans,
+                                         const dt_colormatrix_t yrg_output_matrix,
+                                         const dt_colormatrix_t yrg_output_matrix_trans)
+{
+  const size_t npixels = (size_t)roi_in->width * roi_in->height;
+
+  float *const restrict lh_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict correction_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict blur_core_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict blur_tail_buf = dt_alloc_align_float(4 * npixels);
+
+  if(!lh_buf || !correction_buf || !blur_core_buf || !blur_tail_buf)
+  {
+    dt_free_align(lh_buf);
+    dt_free_align(correction_buf);
+    dt_free_align(blur_core_buf);
+    dt_free_align(blur_tail_buf);
+    return FALSE;
+  }
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+
+    float E[3] = { 0.f, 0.f, 0.f };
+    _fe_compute_layer_exposures(d, pix_in, pipe_to_adobergb, E);
+
+    float D0[3];
+    for(int layer = 0; layer < 3; layer++)
+    {
+      const float lh = _fe_lh_from_E(&d->layer[layer], E[layer]);
+      lh_buf[k + layer] = lh;
+      D0[layer] = _fe_eval_stage(&d->layer[layer], 0, lh);
+    }
+    lh_buf[k + 3] = 0.f;
+
+    float silver[3];
+    for(int layer = 0; layer < 3; layer++)
+      silver[layer] = d->dir_couplers_positive ? (d->dir_couplers_density_max[layer] - D0[layer]) : D0[layer];
+
+    for(int receiver = 0; receiver < 3; receiver++)
+    {
+      float c = 0.f;
+      for(int donor = 0; donor < 3; donor++) c += silver[donor] * d->dir_couplers_matrix[donor][receiver];
+      correction_buf[k + receiver] = c;
+    }
+    correction_buf[k + 3] = 0.f;
+  }
+
+  // pixel_size_um assumes the image width maps to a 35mm-film-format
+  // physical width, so the diffusion radius scales with output resolution
+  // rather than being a fixed pixel count (same convention the halation
+  // task uses).
+  const float pixel_size_um = FE_FILM_WIDTH_UM / (float)roi_in->width;
+  const float sigma_core_px = FE_DIRC_DIFFUSION_UM / pixel_size_um;
+  const float sigma_tail_px = FE_DIRC_DIFFUSION_TAIL_UM / pixel_size_um;
+  const dt_aligned_pixel_t blur_max = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t blur_min = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+  dt_gaussian_t *g_core
+      = dt_gaussian_init(roi_in->width, roi_in->height, 4, blur_max, blur_min, sigma_core_px, DT_IOP_GAUSSIAN_ZERO);
+  dt_gaussian_t *g_tail
+      = dt_gaussian_init(roi_in->width, roi_in->height, 4, blur_max, blur_min, sigma_tail_px, DT_IOP_GAUSSIAN_ZERO);
+  if(g_core && g_tail)
+  {
+    dt_gaussian_blur_4c(g_core, correction_buf, blur_core_buf);
+    dt_gaussian_blur_4c(g_tail, correction_buf, blur_tail_buf);
+  }
+  else
+  {
+    // Extremely unlikely allocation failure inside dt_gaussian_init();
+    // fall back to the unblurred (pointwise-only) correction rather than
+    // crash or leave the buffers uninitialized.
+    memcpy(blur_core_buf, correction_buf, sizeof(float) * 4 * npixels);
+    memcpy(blur_tail_buf, correction_buf, sizeof(float) * 4 * npixels);
+  }
+  if(g_core) dt_gaussian_free(g_core);
+  if(g_tail) dt_gaussian_free(g_tail);
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+    float *const restrict pix_out = out + k;
+
+    dt_aligned_pixel_t result = { 0.f, 0.f, 0.f, 0.f };
+    for(int layer = 0; layer < 3; layer++)
+    {
+      const float correction = (1.f - FE_DIRC_DIFFUSION_TAIL_WEIGHT) * blur_core_buf[k + layer]
+                              + FE_DIRC_DIFFUSION_TAIL_WEIGHT * blur_tail_buf[k + layer];
+      result[layer] = _fe_xfer_from_lh(&d->layer[layer], lh_buf[k + layer] - correction);
+    }
+    result[3] = pix_in[3];
+
+    _fe_finish_pixel(result, has_gamut_matrices, yrg_input_matrix_trans, yrg_output_matrix,
+                     yrg_output_matrix_trans, adobergb_to_pipe, pix_out);
+  }
+
+  dt_free_align(lh_buf);
+  dt_free_align(correction_buf);
+  dt_free_align(blur_core_buf);
+  dt_free_align(blur_tail_buf);
+  return TRUE;
+}
+
+// ---------------------------------------------------------------------------
 // process: pipe RGB -> linear Adobe RGB primaries -> spectral reconstruction
-// -> exposure integration per layer -> optional HK -> cascade -> hue-
-// preserving gamut mapping (_fe_gamut_map()) -> linear Adobe RGB primaries
-// -> pipe RGB.
+// -> exposure integration per layer -> optional HK -> optional DIR-coupler
+// spatial diffusion -> cascade -> hue-preserving gamut mapping
+// (_fe_gamut_map()) -> linear Adobe RGB primaries -> pipe RGB.
 // ---------------------------------------------------------------------------
 void process(dt_iop_module_t *self,
             dt_dev_pixelpipe_iop_t *piece,
@@ -775,46 +1128,14 @@ void process(dt_iop_module_t *self,
     dt_colormatrix_transpose(yrg_output_matrix_trans, yrg_output_matrix);
   }
 
-  const int n_layers = d->n_layers;
-  const gboolean use_hk = d->use_hk;
+  const gboolean use_dir_couplers = d->dir_couplers_active && d->n_layers == 3;
 
-  DT_OMP_FOR()
-  for(size_t k = 0; k < 4 * npixels; k += 4)
+  if(!use_dir_couplers
+     || !_fe_process_dir_couplers(d, in, out, roi_in, pipe_to_adobergb, adobergb_to_pipe, has_gamut_matrices,
+                                  yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans))
   {
-    const float *const restrict pix_in = in + k;
-    float *const restrict pix_out = out + k;
-
-    dt_aligned_pixel_t rgb;
-    dt_apply_transposed_color_matrix(pix_in, pipe_to_adobergb, rgb);
-
-    float coeffs[3];
-    _fe_rgb_to_sigmoid_coeffs(rgb[0], rgb[1], rgb[2], coeffs);
-    float spectrum[FE_N_WAVELENGTHS];
-    _fe_sigmoid_spectrum(coeffs, spectrum);
-
-    const float hk = use_hk ? _fe_hk_mul(rgb[0], rgb[1], rgb[2]) : 1.f;
-
-    dt_aligned_pixel_t result = { 0.f, 0.f, 0.f, 0.f };
-    for(int layer = 0; layer < n_layers; layer++)
-    {
-      float E = 0.f;
-      for(int w = 0; w < FE_N_WAVELENGTHS; w++) E += spectrum[w] * d->layer[layer].weight[w];
-      E *= hk;
-      result[layer] = _fe_xfer(&d->layer[layer], E);
-    }
-    if(n_layers == 1)
-    {
-      result[1] = result[0];
-      result[2] = result[0];
-    }
-    result[3] = pix_in[3];
-
-    if(has_gamut_matrices)
-      _fe_gamut_map(result, yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
-    else
-      for(int c = 0; c < 3; c++) result[c] = fminf(fmaxf(result[c], 0.f), 1.f);
-
-    dt_apply_transposed_color_matrix(result, adobergb_to_pipe, pix_out);
+    _fe_process_simple(d, in, out, npixels, pipe_to_adobergb, adobergb_to_pipe, has_gamut_matrices,
+                       yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
   }
 }
 
@@ -869,6 +1190,15 @@ void gui_init(dt_iop_module_t *self)
 
   g->box_color = self->widget = dt_gui_vbox();
   g->process = dt_bauhaus_combobox_from_params(self, "process");
+
+  g->dir_couplers_active = dt_bauhaus_toggle_from_params(self, "dir_couplers_active");
+  gtk_widget_set_tooltip_text(g->dir_couplers_active,
+                              _("simulate DIR (development-inhibitor-releasing) coupler crosstalk\n"
+                                "between the R/G/B emulsion layers -- the real film chemistry behind\n"
+                                "color negative/reversal film's characteristic saturation and\n"
+                                "local-contrast response"));
+  g->dir_couplers_amount = dt_bauhaus_slider_from_params(self, "dir_couplers_amount");
+  gtk_widget_set_tooltip_text(g->dir_couplers_amount, _("strength of the dye coupler interaction"));
 
   g->box_negative = self->widget = dt_gui_vbox();
   g->negative_film = dt_bauhaus_combobox_from_params(self, "negative_film");

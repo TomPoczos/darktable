@@ -51,12 +51,30 @@ typedef struct dt_film_splitgauss_t
   float x0, d_lo, d_hi, sigma_lo, sigma_hi;
 } dt_film_splitgauss_t;
 
+// DIR-coupler (development-inhibitor-releasing coupler) inter-layer
+// gammas for the camera film's own emulsion -- how much developed density
+// in a donor layer releases inhibitor toward each receiver layer. Row is
+// the donor, per Python's compute_dir_couplers_matrix() convention:
+// gamma_samelayer_rgb is the diagonal (self-inhibition, local contrast);
+// gamma_interlayer_x_to_yz are the two off-diagonal entries a donor layer
+// x sends to the other two receivers y,z. Ported from spektrafilm's
+// DirCouplersParams per-process/per-stock defaults -- see task 02's task
+// file for the physical rationale and provenance.
+typedef struct dt_film_dir_couplers_t
+{
+  float gamma_samelayer_rgb[3];
+  float gamma_interlayer_r_to_gb[2];
+  float gamma_interlayer_g_to_rb[2];
+  float gamma_interlayer_b_to_rg[2];
+} dt_film_dir_couplers_t;
+
 typedef struct dt_film_reversal_t
 {
   dt_film_curve_t sens[3];
   dt_film_curve_t curves[3];
   float ref_d[3];
   dt_film_splitgauss_t fit[3];
+  dt_film_dir_couplers_t dir_couplers;
 } dt_film_reversal_t;
 
 typedef struct dt_film_negative_t
@@ -65,6 +83,7 @@ typedef struct dt_film_negative_t
   dt_film_curve_t curves[3];
   float ref_d[3];
   dt_film_splitgauss_t fit[3];
+  dt_film_dir_couplers_t dir_couplers;
 } dt_film_negative_t;
 
 typedef struct dt_film_paper_t
@@ -1403,11 +1422,22 @@ static const dt_film_curve_point_t fe_rev_ektachrome100d_curve2_pts[] = { //
 static const dt_film_splitgauss_t fe_rev_ektachrome100d_fit_0 = { -1.33196f, 3.2784f, 0.09f, 0.62819f, 0.84399f };
 static const dt_film_splitgauss_t fe_rev_ektachrome100d_fit_1 = { -1.46142f, 3.65243f, 0.14364f, 0.54266f, 0.74537f };
 static const dt_film_splitgauss_t fe_rev_ektachrome100d_fit_2 = { -1.58608f, 3.87044f, 0.14325f, 0.54257f, 0.74311f };
+
+// Generic reversal (positive) DIR-coupler gammas -- spektrafilm's
+// is_positive default (params_builder.py _apply_film_specifics()), used
+// for any reversal stock without its own stock-specific override below.
+static const dt_film_dir_couplers_t fe_dir_couplers_reversal_generic =
+  { { 0.12f, 0.08f, 0.06f }, { 0.12f, 0.06f }, { 0.08f, 0.06f }, { 0.06f, 0.06f } };
+// Fuji Provia 100F stock-specific override (params_builder.py, stock ==
+// "fujifilm_provia_100f").
+static const dt_film_dir_couplers_t fe_dir_couplers_reversal_provia100f =
+  { { 0.156f, 0.104f, 0.078f }, { 0.156f, 0.078f }, { 0.104f, 0.078f }, { 0.078f, 0.078f } };
+
 static const dt_film_reversal_t fe_reversal_films[4] = {
-  { { { fe_rev_velvia_sens0_pts, 21 }, { fe_rev_velvia_sens1_pts, 20 }, { fe_rev_velvia_sens2_pts, 21 } }, { { fe_rev_velvia_curve0_pts, 20 }, { fe_rev_velvia_curve1_pts, 21 }, { fe_rev_velvia_curve2_pts, 25 } }, { 2.0296058f, 2.1354904f, 2.0995658f }, { fe_rev_velvia_fit_0, fe_rev_velvia_fit_1, fe_rev_velvia_fit_2 } },
-  { { { fe_rev_kodachrome64_sens0_pts, 27 }, { fe_rev_kodachrome64_sens1_pts, 24 }, { fe_rev_kodachrome64_sens2_pts, 21 } }, { { fe_rev_kodachrome64_curve0_pts, 44 }, { fe_rev_kodachrome64_curve1_pts, 40 }, { fe_rev_kodachrome64_curve2_pts, 40 } }, { 1.9803717f, 1.8986926f, 1.8629561f }, { fe_rev_kodachrome64_fit_0, fe_rev_kodachrome64_fit_1, fe_rev_kodachrome64_fit_2 } },
-  { { { fe_rev_provia100f_sens0_pts, 19 }, { fe_rev_provia100f_sens1_pts, 22 }, { fe_rev_provia100f_sens2_pts, 19 } }, { { fe_rev_provia100f_curve0_pts, 20 }, { fe_rev_provia100f_curve1_pts, 24 }, { fe_rev_provia100f_curve2_pts, 22 } }, { 1.6760039f, 1.8075283f, 1.7398733f }, { fe_rev_provia100f_fit_0, fe_rev_provia100f_fit_1, fe_rev_provia100f_fit_2 } },
-  { { { fe_rev_ektachrome100d_sens0_pts, 13 }, { fe_rev_ektachrome100d_sens1_pts, 16 }, { fe_rev_ektachrome100d_sens2_pts, 19 } }, { { fe_rev_ektachrome100d_curve0_pts, 20 }, { fe_rev_ektachrome100d_curve1_pts, 21 }, { fe_rev_ektachrome100d_curve2_pts, 18 } }, { 1.7589658f, 2.0295048f, 2.1537392f }, { fe_rev_ektachrome100d_fit_0, fe_rev_ektachrome100d_fit_1, fe_rev_ektachrome100d_fit_2 } },
+  { { { fe_rev_velvia_sens0_pts, 21 }, { fe_rev_velvia_sens1_pts, 20 }, { fe_rev_velvia_sens2_pts, 21 } }, { { fe_rev_velvia_curve0_pts, 20 }, { fe_rev_velvia_curve1_pts, 21 }, { fe_rev_velvia_curve2_pts, 25 } }, { 2.0296058f, 2.1354904f, 2.0995658f }, { fe_rev_velvia_fit_0, fe_rev_velvia_fit_1, fe_rev_velvia_fit_2 }, fe_dir_couplers_reversal_generic },
+  { { { fe_rev_kodachrome64_sens0_pts, 27 }, { fe_rev_kodachrome64_sens1_pts, 24 }, { fe_rev_kodachrome64_sens2_pts, 21 } }, { { fe_rev_kodachrome64_curve0_pts, 44 }, { fe_rev_kodachrome64_curve1_pts, 40 }, { fe_rev_kodachrome64_curve2_pts, 40 } }, { 1.9803717f, 1.8986926f, 1.8629561f }, { fe_rev_kodachrome64_fit_0, fe_rev_kodachrome64_fit_1, fe_rev_kodachrome64_fit_2 }, fe_dir_couplers_reversal_generic },
+  { { { fe_rev_provia100f_sens0_pts, 19 }, { fe_rev_provia100f_sens1_pts, 22 }, { fe_rev_provia100f_sens2_pts, 19 } }, { { fe_rev_provia100f_curve0_pts, 20 }, { fe_rev_provia100f_curve1_pts, 24 }, { fe_rev_provia100f_curve2_pts, 22 } }, { 1.6760039f, 1.8075283f, 1.7398733f }, { fe_rev_provia100f_fit_0, fe_rev_provia100f_fit_1, fe_rev_provia100f_fit_2 }, fe_dir_couplers_reversal_provia100f },
+  { { { fe_rev_ektachrome100d_sens0_pts, 13 }, { fe_rev_ektachrome100d_sens1_pts, 16 }, { fe_rev_ektachrome100d_sens2_pts, 19 } }, { { fe_rev_ektachrome100d_curve0_pts, 20 }, { fe_rev_ektachrome100d_curve1_pts, 21 }, { fe_rev_ektachrome100d_curve2_pts, 18 } }, { 1.7589658f, 2.0295048f, 2.1537392f }, { fe_rev_ektachrome100d_fit_0, fe_rev_ektachrome100d_fit_1, fe_rev_ektachrome100d_fit_2 }, fe_dir_couplers_reversal_generic },
 };
 
 // ---- Camera color negative films ----
@@ -1788,13 +1818,21 @@ static const dt_film_curve_point_t fe_neg_superiaxtra400_curve2_pts[] = { //
 static const dt_film_splitgauss_t fe_neg_superiaxtra400_fit_0 = { -0.87916f, -0.02129f, 2.69236f, 1.60197f, 1.68601f };
 static const dt_film_splitgauss_t fe_neg_superiaxtra400_fit_1 = { -1.0027f, 0.28678f, 3.06989f, 1.47399f, 1.57426f };
 static const dt_film_splitgauss_t fe_neg_superiaxtra400_fit_2 = { -1.07883f, 0.59911f, 3.28507f, 1.30548f, 1.48051f };
+
+// Generic negative DIR-coupler gammas -- spektrafilm's is_negative default
+// (params_builder.py _apply_film_specifics()), used uniformly across all
+// six negative stocks below (matches spektrafilm: no per-negative-stock
+// override exists there either).
+static const dt_film_dir_couplers_t fe_dir_couplers_negative_generic =
+  { { 0.336f, 0.319f, 0.273f }, { 0.353f, 0.302f }, { 0.154f, 0.353f }, { 0.168f, 0.226f } };
+
 static const dt_film_negative_t fe_negative_films[6] = {
-  { { { fe_neg_portra400_sens0_pts, 45 }, { fe_neg_portra400_sens1_pts, 42 }, { fe_neg_portra400_sens2_pts, 39 } }, { { fe_neg_portra400_curve0_pts, 31 }, { fe_neg_portra400_curve1_pts, 31 }, { fe_neg_portra400_curve2_pts, 31 } }, { 1.1402903f, 1.580413f, 1.9823531f }, { fe_neg_portra400_fit_0, fe_neg_portra400_fit_1, fe_neg_portra400_fit_2 } },
-  { { { fe_neg_ektar100_sens0_pts, 27 }, { fe_neg_ektar100_sens1_pts, 36 }, { fe_neg_ektar100_sens2_pts, 26 } }, { { fe_neg_ektar100_curve0_pts, 13 }, { fe_neg_ektar100_curve1_pts, 11 }, { fe_neg_ektar100_curve2_pts, 17 } }, { 1.1104188f, 1.5607574f, 1.9906433f }, { fe_neg_ektar100_fit_0, fe_neg_ektar100_fit_1, fe_neg_ektar100_fit_2 } },
-  { { { fe_neg_gold200_sens0_pts, 40 }, { fe_neg_gold200_sens1_pts, 34 }, { fe_neg_gold200_sens2_pts, 29 } }, { { fe_neg_gold200_curve0_pts, 30 }, { fe_neg_gold200_curve1_pts, 30 }, { fe_neg_gold200_curve2_pts, 28 } }, { 1.0740772f, 1.5099817f, 1.7893293f }, { fe_neg_gold200_fit_0, fe_neg_gold200_fit_1, fe_neg_gold200_fit_2 } },
-  { { { fe_neg_ultramax400_sens0_pts, 36 }, { fe_neg_ultramax400_sens1_pts, 34 }, { fe_neg_ultramax400_sens2_pts, 22 } }, { { fe_neg_ultramax400_curve0_pts, 31 }, { fe_neg_ultramax400_curve1_pts, 31 }, { fe_neg_ultramax400_curve2_pts, 31 } }, { 1.1293643f, 1.5798622f, 1.9989558f }, { fe_neg_ultramax400_fit_0, fe_neg_ultramax400_fit_1, fe_neg_ultramax400_fit_2 } },
-  { { { fe_neg_superiareala_sens0_pts, 30 }, { fe_neg_superiareala_sens1_pts, 37 }, { fe_neg_superiareala_sens2_pts, 28 } }, { { fe_neg_superiareala_curve0_pts, 29 }, { fe_neg_superiareala_curve1_pts, 32 }, { fe_neg_superiareala_curve2_pts, 33 } }, { 1.2577839f, 1.5181897f, 1.9030107f }, { fe_neg_superiareala_fit_0, fe_neg_superiareala_fit_1, fe_neg_superiareala_fit_2 } },
-  { { { fe_neg_superiaxtra400_sens0_pts, 28 }, { fe_neg_superiaxtra400_sens1_pts, 32 }, { fe_neg_superiaxtra400_sens2_pts, 23 } }, { { fe_neg_superiaxtra400_curve0_pts, 25 }, { fe_neg_superiaxtra400_curve1_pts, 24 }, { fe_neg_superiaxtra400_curve2_pts, 24 } }, { 1.1763277f, 1.5274064f, 1.8180307f }, { fe_neg_superiaxtra400_fit_0, fe_neg_superiaxtra400_fit_1, fe_neg_superiaxtra400_fit_2 } },
+  { { { fe_neg_portra400_sens0_pts, 45 }, { fe_neg_portra400_sens1_pts, 42 }, { fe_neg_portra400_sens2_pts, 39 } }, { { fe_neg_portra400_curve0_pts, 31 }, { fe_neg_portra400_curve1_pts, 31 }, { fe_neg_portra400_curve2_pts, 31 } }, { 1.1402903f, 1.580413f, 1.9823531f }, { fe_neg_portra400_fit_0, fe_neg_portra400_fit_1, fe_neg_portra400_fit_2 }, fe_dir_couplers_negative_generic },
+  { { { fe_neg_ektar100_sens0_pts, 27 }, { fe_neg_ektar100_sens1_pts, 36 }, { fe_neg_ektar100_sens2_pts, 26 } }, { { fe_neg_ektar100_curve0_pts, 13 }, { fe_neg_ektar100_curve1_pts, 11 }, { fe_neg_ektar100_curve2_pts, 17 } }, { 1.1104188f, 1.5607574f, 1.9906433f }, { fe_neg_ektar100_fit_0, fe_neg_ektar100_fit_1, fe_neg_ektar100_fit_2 }, fe_dir_couplers_negative_generic },
+  { { { fe_neg_gold200_sens0_pts, 40 }, { fe_neg_gold200_sens1_pts, 34 }, { fe_neg_gold200_sens2_pts, 29 } }, { { fe_neg_gold200_curve0_pts, 30 }, { fe_neg_gold200_curve1_pts, 30 }, { fe_neg_gold200_curve2_pts, 28 } }, { 1.0740772f, 1.5099817f, 1.7893293f }, { fe_neg_gold200_fit_0, fe_neg_gold200_fit_1, fe_neg_gold200_fit_2 }, fe_dir_couplers_negative_generic },
+  { { { fe_neg_ultramax400_sens0_pts, 36 }, { fe_neg_ultramax400_sens1_pts, 34 }, { fe_neg_ultramax400_sens2_pts, 22 } }, { { fe_neg_ultramax400_curve0_pts, 31 }, { fe_neg_ultramax400_curve1_pts, 31 }, { fe_neg_ultramax400_curve2_pts, 31 } }, { 1.1293643f, 1.5798622f, 1.9989558f }, { fe_neg_ultramax400_fit_0, fe_neg_ultramax400_fit_1, fe_neg_ultramax400_fit_2 }, fe_dir_couplers_negative_generic },
+  { { { fe_neg_superiareala_sens0_pts, 30 }, { fe_neg_superiareala_sens1_pts, 37 }, { fe_neg_superiareala_sens2_pts, 28 } }, { { fe_neg_superiareala_curve0_pts, 29 }, { fe_neg_superiareala_curve1_pts, 32 }, { fe_neg_superiareala_curve2_pts, 33 } }, { 1.2577839f, 1.5181897f, 1.9030107f }, { fe_neg_superiareala_fit_0, fe_neg_superiareala_fit_1, fe_neg_superiareala_fit_2 }, fe_dir_couplers_negative_generic },
+  { { { fe_neg_superiaxtra400_sens0_pts, 28 }, { fe_neg_superiaxtra400_sens1_pts, 32 }, { fe_neg_superiaxtra400_sens2_pts, 23 } }, { { fe_neg_superiaxtra400_curve0_pts, 25 }, { fe_neg_superiaxtra400_curve1_pts, 24 }, { fe_neg_superiaxtra400_curve2_pts, 24 } }, { 1.1763277f, 1.5274064f, 1.8180307f }, { fe_neg_superiaxtra400_fit_0, fe_neg_superiaxtra400_fit_1, fe_neg_superiaxtra400_fit_2 }, fe_dir_couplers_negative_generic },
 };
 
 // ---- Direct-print papers (reversal, no internegative) ----
