@@ -31,7 +31,9 @@
  */
 
 #include "bauhaus/bauhaus.h"
+#include "common/chromatic_adaptation.h"
 #include "common/colorspaces.h"
+#include "common/gamut_mapping.h"
 #include "common/imagebuf.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
@@ -476,8 +478,14 @@ static inline float _fe_eval_stage(const dt_iop_filmemulation_layer_data_t *L, c
   return _fe_lerp_clamped(L->stage[stage_idx].pts, L->stage[stage_idx].n, x);
 }
 
-// Full cascade transfer function E (linear exposure) -> reflectance [0,1] --
+// Full cascade transfer function E (linear exposure) -> reflectance --
 // matches Python's build_print_cascade()'s inner xfer() closure exactly.
+// Deliberately NOT clamped to [0,1] here: a highlight can legitimately
+// reconstruct to a reflectance above 1 (or, per-channel, produce an
+// out-of-gamut chromaticity once the three layers are recombined) and
+// chopping each channel independently right here is exactly the naive
+// per-channel clamp _fe_gamut_map() below replaces with a hue-preserving
+// gamut compression once all three layers are assembled.
 static inline float _fe_xfer(const dt_iop_filmemulation_layer_data_t *L, const float E)
 {
   const float lh = (E <= 1e-9f) ? L->x0_sentinel : (L->na0 + log10f(E / fe_grey));
@@ -485,7 +493,7 @@ static inline float _fe_xfer(const dt_iop_filmemulation_layer_data_t *L, const f
   for(int i = 1; i < L->n_stages; i++)
     D = _fe_eval_stage(L, i, L->pls[i - 1] - D);
   const float v = powf(10.f, -(D - L->fdm));
-  return fminf(fmaxf(v, 0.f), 1.f);
+  return fmaxf(v, 0.f);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +614,42 @@ static float _fe_hk_mul(const float R, const float G, const float B)
 }
 
 // ---------------------------------------------------------------------------
+// Output gamut mapping -- replaces a naive per-channel [0,1] clamp with the
+// same hue-preserving Ych/Yrg compression darktable's own filmicrgb.c uses
+// (common/gamut_mapping.h), gamut-mapped against the module's own working
+// space (linear Adobe RGB) rather than a foreign perceptual library: clip
+// luminance to the valid reflectance range, then pull chroma in toward the
+// Adobe RGB primaries' cube at constant hue, only falling back to a
+// per-channel clamp as a final catch-all for whatever residual the chroma
+// step (a "brute-force" bound, see Ych_max_chroma()'s own comment) leaves.
+// ---------------------------------------------------------------------------
+static inline void _fe_gamut_map(dt_aligned_pixel_t rgb,
+                                 const dt_colormatrix_t input_matrix_trans,
+                                 const dt_colormatrix_t output_matrix,
+                                 const dt_colormatrix_t output_matrix_trans)
+{
+  for(int c = 0; c < 3; c++) rgb[c] = fmaxf(rgb[c], 0.f);
+
+  dt_aligned_pixel_t Ych = { 0.f };
+  RGB_to_Ych(rgb, input_matrix_trans, Ych);
+
+  // Reflectance is defined on [0,1]; clip luminance to that range before
+  // deriving the chroma bound below (which is only valid inside it).
+  Ych[0] = CLAMPF(Ych[0], CIE_Y_1931_to_CIE_Y_2006(0.f), CIE_Y_1931_to_CIE_Y_2006(1.f));
+
+  const float cos_h = Ych[2];
+  const float sin_h = Ych[3];
+  Ych[1] = fminf(Ych[1], Ych_max_chroma(output_matrix, 1.f, Ych[0], cos_h, sin_h));
+
+  Ych_to_RGB(Ych, output_matrix_trans, rgb);
+
+  // Final catch-all: chroma clipping above is a per-channel bound derived
+  // independently for R, G, B (see Ych_max_chroma()'s own "brute-force"
+  // comment), so one channel can still land a hair outside [0,1].
+  for(int c = 0; c < 3; c++) rgb[c] = CLAMPF(rgb[c], 0.f, 1.f);
+}
+
+// ---------------------------------------------------------------------------
 // commit_params: resolve the GUI selection into a fully-calibrated cascade
 // per layer.
 // ---------------------------------------------------------------------------
@@ -677,8 +721,9 @@ void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe
 
 // ---------------------------------------------------------------------------
 // process: pipe RGB -> linear Adobe RGB primaries -> spectral reconstruction
-// -> exposure integration per layer -> optional HK -> cascade -> linear
-// Adobe RGB primaries -> pipe RGB.
+// -> exposure integration per layer -> optional HK -> cascade -> hue-
+// preserving gamut mapping (_fe_gamut_map()) -> linear Adobe RGB primaries
+// -> pipe RGB.
 // ---------------------------------------------------------------------------
 void process(dt_iop_module_t *self,
             dt_dev_pixelpipe_iop_t *piece,
@@ -711,6 +756,23 @@ void process(dt_iop_module_t *self,
         pipe_to_adobergb[i][j] = (i == j && i < 3) ? 1.f : 0.f;
         adobergb_to_pipe[i][j] = pipe_to_adobergb[i][j];
       }
+  }
+
+  // Matrices for the output gamut mapping (_fe_gamut_map()), gamut-mapped
+  // against Adobe RGB since that is the space `result` is assembled in,
+  // below, before the adobergb_to_pipe conversion. Falls back to the old
+  // per-channel clamp in the vanishingly unlikely case the built-in Adobe
+  // RGB profile info failed to generate.
+  dt_colormatrix_t yrg_input_matrix_trans = { { 0.f } };
+  dt_colormatrix_t yrg_output_matrix = { { 0.f } };
+  dt_colormatrix_t yrg_output_matrix_trans = { { 0.f } };
+  const gboolean has_gamut_matrices = (adobergb_profile != NULL);
+  if(has_gamut_matrices)
+  {
+    dt_colormatrix_t yrg_input_matrix = { { 0.f } };
+    prepare_RGB_Yrg_matrices(adobergb_profile, yrg_input_matrix, yrg_output_matrix);
+    dt_colormatrix_transpose(yrg_input_matrix_trans, yrg_input_matrix);
+    dt_colormatrix_transpose(yrg_output_matrix_trans, yrg_output_matrix);
   }
 
   const int n_layers = d->n_layers;
@@ -746,6 +808,11 @@ void process(dt_iop_module_t *self,
       result[2] = result[0];
     }
     result[3] = pix_in[3];
+
+    if(has_gamut_matrices)
+      _fe_gamut_map(result, yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
+    else
+      for(int c = 0; c < 3; c++) result[c] = fminf(fmaxf(result[c], 0.f), 1.f);
 
     dt_apply_transposed_color_matrix(result, adobergb_to_pipe, pix_out);
   }
