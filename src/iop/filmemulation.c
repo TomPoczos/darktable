@@ -51,12 +51,75 @@
 #include <string.h>
 
 #include "external/filmemulation_data.c"
+#include "external/filmemulation_data_spektrafilm.c"
 
-DT_MODULE_INTROSPECTION(1, dt_iop_filmemulation_params_t)
+DT_MODULE_INTROSPECTION(2, dt_iop_filmemulation_params_t)
 
 // ---------------------------------------------------------------------------
 // Params enums
 // ---------------------------------------------------------------------------
+
+// Which film/paper data set this instance of the module draws from. The
+// "initial version" data set (fe_* tables in external/filmemulation_data.c)
+// is darktable's own port, built around a live gamma-correction fit; the
+// "spektrafilm" data set (dt_sf_* tables in
+// external/filmemulation_data_spektrafilm.c) is a straight port of the
+// spektrafilm project's (https://github.com/andreavolpato/spektrafilm)
+// own film/paper profiles *and* its own rendering algorithm (per-stock
+// Hanatos2025 spectral-sensitivity adaptation, direct H&D curve lookup,
+// a real film->paper spectral printing cascade through an enlarger
+// illuminant, and its parametric print density-curve model) -- see that
+// project's own README for the darkroom/color-science rationale.
+typedef enum dt_iop_filmemulation_dataset_t
+{
+  DT_FE_DATASET_INITIAL = 0,     // $DESCRIPTION: "initial version"
+  DT_FE_DATASET_SPEKTRAFILM = 1, // $DESCRIPTION: "spektrafilm"
+} dt_iop_filmemulation_dataset_t;
+
+// Film/paper stock selectors for spektrafilm mode -- one enum constant per
+// bundled profile (see dt_sf_films/dt_sf_papers in
+// external/filmemulation_data_spektrafilm.c), values 0..19/0..7 matching
+// those arrays' order exactly. Defined here rather than in that #include'd
+// data file because darktable's introspection generator (tools/
+// introspection/*.pl) doesn't pick up enum typedefs from files this one
+// #include's -- dt_bauhaus_combobox_from_params() needs these visible
+// directly in filmemulation.c, like every other params enum here.
+typedef enum dt_iop_filmemulation_sf_film_t
+{
+  DT_SF_FILM_FUJIFILM_C200 = 0, // $DESCRIPTION: "Fujifilm C200"
+  DT_SF_FILM_FUJIFILM_PRO_400H = 1, // $DESCRIPTION: "Fujifilm Pro 400H"
+  DT_SF_FILM_FUJIFILM_PROVIA_100F = 2, // $DESCRIPTION: "Fujifilm Provia 100F"
+  DT_SF_FILM_FUJIFILM_VELVIA_100 = 3, // $DESCRIPTION: "Fujifilm Velvia 100"
+  DT_SF_FILM_FUJIFILM_XTRA_400 = 4, // $DESCRIPTION: "Fujifilm X-Tra 400"
+  DT_SF_FILM_KODAK_EKTACHROME_100 = 5, // $DESCRIPTION: "Kodak Ektachrome 100"
+  DT_SF_FILM_KODAK_EKTAR_100 = 6, // $DESCRIPTION: "Kodak Ektar 100"
+  DT_SF_FILM_KODAK_GOLD_200 = 7, // $DESCRIPTION: "Kodak Gold 200"
+  DT_SF_FILM_KODAK_KODACHROME_64 = 8, // $DESCRIPTION: "Kodak Kodachrome 64"
+  DT_SF_FILM_KODAK_PORTRA_160 = 9, // $DESCRIPTION: "Kodak Portra 160"
+  DT_SF_FILM_KODAK_PORTRA_400 = 10, // $DESCRIPTION: "Kodak Portra 400"
+  DT_SF_FILM_KODAK_PORTRA_800 = 11, // $DESCRIPTION: "Kodak Portra 800"
+  DT_SF_FILM_KODAK_PORTRA_800_PUSH1 = 12, // $DESCRIPTION: "Kodak Portra 800 (Push 1)"
+  DT_SF_FILM_KODAK_PORTRA_800_PUSH2 = 13, // $DESCRIPTION: "Kodak Portra 800 (Push 2)"
+  DT_SF_FILM_KODAK_ULTRAMAX_400 = 14, // $DESCRIPTION: "Kodak Ultramax 400"
+  DT_SF_FILM_KODAK_VERITA_200D = 15, // $DESCRIPTION: "Kodak Verita 200D"
+  DT_SF_FILM_KODAK_VISION3_200T = 16, // $DESCRIPTION: "Kodak Vision3 200T"
+  DT_SF_FILM_KODAK_VISION3_250D = 17, // $DESCRIPTION: "Kodak Vision3 250D"
+  DT_SF_FILM_KODAK_VISION3_500T = 18, // $DESCRIPTION: "Kodak Vision3 500T"
+  DT_SF_FILM_KODAK_VISION3_50D = 19, // $DESCRIPTION: "Kodak Vision3 50D"
+} dt_iop_filmemulation_sf_film_t;
+
+typedef enum dt_iop_filmemulation_sf_paper_t
+{
+  DT_SF_PAPER_FUJIFILM_CRYSTAL_ARCHIVE_TYPEII = 0, // $DESCRIPTION: "Fujifilm Crystal Archive Type II"
+  DT_SF_PAPER_KODAK_2383 = 1, // $DESCRIPTION: "Kodak Vision 2383"
+  DT_SF_PAPER_KODAK_2393 = 2, // $DESCRIPTION: "Kodak Vision Premier 2393"
+  DT_SF_PAPER_KODAK_EKTACOLOR_EDGE = 3, // $DESCRIPTION: "Kodak Ektacolor Edge"
+  DT_SF_PAPER_KODAK_ENDURA_PREMIER = 4, // $DESCRIPTION: "Kodak Professional Endura Premier"
+  DT_SF_PAPER_KODAK_PORTRA_ENDURA = 5, // $DESCRIPTION: "Kodak Professional Portra Endura"
+  DT_SF_PAPER_KODAK_SUPRA_ENDURA = 6, // $DESCRIPTION: "Kodak Professional Supra Endura"
+  DT_SF_PAPER_KODAK_ULTRA_ENDURA = 7, // $DESCRIPTION: "Kodak Professional Ultra Endura"
+} dt_iop_filmemulation_sf_paper_t;
+
 typedef enum dt_iop_filmemulation_type_t
 {
   DT_FE_TYPE_BW = 0,    // $DESCRIPTION: "black & white"
@@ -149,6 +212,8 @@ typedef enum dt_iop_filmemulation_ladder_paper_t
 
 typedef struct dt_iop_filmemulation_params_t
 {
+  dt_iop_filmemulation_dataset_t dataset; // $DEFAULT: DT_FE_DATASET_INITIAL $DESCRIPTION: "data set"
+
   dt_iop_filmemulation_type_t type; // $DEFAULT: DT_FE_TYPE_COLOR $DESCRIPTION: "type"
 
   dt_iop_filmemulation_bw_film_t bw_film;     // $DEFAULT: DT_FE_BW_TRIX400 $DESCRIPTION: "film"
@@ -171,10 +236,114 @@ typedef struct dt_iop_filmemulation_params_t
 
   gboolean dir_couplers_active; // $DEFAULT: TRUE $DESCRIPTION: "dye coupler interaction"
   float dir_couplers_amount; // $MIN: 0.0 $MAX: 1.5 $DEFAULT: 1.0 $DESCRIPTION: "amount"
+
+  // spektrafilm data set only (dataset == DT_FE_DATASET_SPEKTRAFILM); the
+  // dir_couplers_* fields above are shared with the initial-version data
+  // set and apply here too (same dye-coupler-crosstalk knob, different
+  // underlying matrix -- see dt_sf_film_t.couplers_matrix).
+  dt_iop_filmemulation_sf_film_t sf_film;   // $DEFAULT: DT_SF_FILM_KODAK_PORTRA_400 $DESCRIPTION: "film"
+  dt_iop_filmemulation_sf_paper_t sf_paper; // $DEFAULT: DT_SF_PAPER_KODAK_PORTRA_ENDURA $DESCRIPTION: "paper"
+  float sf_camera_ev; // $MIN: -3.0 $MAX: 3.0 $DEFAULT: 0.0 $DESCRIPTION: "camera exposure"
+  float sf_print_exposure; // $MIN: 0.1 $MAX: 4.0 $DEFAULT: 1.0 $DESCRIPTION: "print exposure"
+  float sf_print_gamma; // $MIN: 0.5 $MAX: 2.0 $DEFAULT: 1.0 $DESCRIPTION: "print gamma"
+  gboolean sf_hanatos_surface; // $DEFAULT: FALSE $DESCRIPTION: "per-stock spectral correction"
 } dt_iop_filmemulation_params_t;
+
+// v1 -> v2: added the spektrafilm data set (the "dataset" selector plus its
+// own sf_* fields). dataset was inserted as the new struct's first member,
+// so this is a field-by-field remap rather than a simple memcpy-prefix.
+int legacy_params(dt_iop_module_t *self,
+                  const void *const old_params,
+                  const int old_version,
+                  void **new_params,
+                  int32_t *new_params_size,
+                  int *new_version)
+{
+  typedef struct dt_iop_filmemulation_params_v2_t
+  {
+    dt_iop_filmemulation_dataset_t dataset;
+    dt_iop_filmemulation_type_t type;
+    dt_iop_filmemulation_bw_film_t bw_film;
+    dt_iop_filmemulation_bw_filter_t bw_filter;
+    dt_iop_filmemulation_process_t process;
+    dt_iop_filmemulation_reversal_film_t reversal_film;
+    dt_iop_filmemulation_route_t route;
+    dt_iop_filmemulation_direct_paper_t direct_paper;
+    dt_iop_filmemulation_ladder_paper_t internegative_paper;
+    dt_iop_filmemulation_negative_film_t negative_film;
+    dt_iop_filmemulation_ladder_paper_t negative_paper;
+    dt_iop_filmemulation_spectral_method_t spectral_method;
+    float print_gamma;
+    gboolean use_hk;
+    gboolean dir_couplers_active;
+    float dir_couplers_amount;
+    dt_iop_filmemulation_sf_film_t sf_film;
+    dt_iop_filmemulation_sf_paper_t sf_paper;
+    float sf_camera_ev;
+    float sf_print_exposure;
+    float sf_print_gamma;
+    gboolean sf_hanatos_surface;
+  } dt_iop_filmemulation_params_v2_t;
+
+  if(old_version == 1)
+  {
+    typedef struct dt_iop_filmemulation_params_v1_t
+    {
+      dt_iop_filmemulation_type_t type;
+      dt_iop_filmemulation_bw_film_t bw_film;
+      dt_iop_filmemulation_bw_filter_t bw_filter;
+      dt_iop_filmemulation_process_t process;
+      dt_iop_filmemulation_reversal_film_t reversal_film;
+      dt_iop_filmemulation_route_t route;
+      dt_iop_filmemulation_direct_paper_t direct_paper;
+      dt_iop_filmemulation_ladder_paper_t internegative_paper;
+      dt_iop_filmemulation_negative_film_t negative_film;
+      dt_iop_filmemulation_ladder_paper_t negative_paper;
+      dt_iop_filmemulation_spectral_method_t spectral_method;
+      float print_gamma;
+      gboolean use_hk;
+      gboolean dir_couplers_active;
+      float dir_couplers_amount;
+    } dt_iop_filmemulation_params_v1_t;
+
+    const dt_iop_filmemulation_params_v1_t *old = (const dt_iop_filmemulation_params_v1_t *)old_params;
+    dt_iop_filmemulation_params_v2_t *new = calloc(1, sizeof(dt_iop_filmemulation_params_v2_t));
+
+    new->dataset = DT_FE_DATASET_INITIAL;
+    new->type = old->type;
+    new->bw_film = old->bw_film;
+    new->bw_filter = old->bw_filter;
+    new->process = old->process;
+    new->reversal_film = old->reversal_film;
+    new->route = old->route;
+    new->direct_paper = old->direct_paper;
+    new->internegative_paper = old->internegative_paper;
+    new->negative_film = old->negative_film;
+    new->negative_paper = old->negative_paper;
+    new->spectral_method = old->spectral_method;
+    new->print_gamma = old->print_gamma;
+    new->use_hk = old->use_hk;
+    new->dir_couplers_active = old->dir_couplers_active;
+    new->dir_couplers_amount = old->dir_couplers_amount;
+    new->sf_film = DT_SF_FILM_KODAK_PORTRA_400;
+    new->sf_paper = DT_SF_PAPER_KODAK_PORTRA_ENDURA;
+    new->sf_camera_ev = 0.0f;
+    new->sf_print_exposure = 1.0f;
+    new->sf_print_gamma = 1.0f;
+    new->sf_hanatos_surface = FALSE;
+
+    *new_params = new;
+    *new_params_size = sizeof(dt_iop_filmemulation_params_v2_t);
+    *new_version = 2;
+    return 0;
+  }
+  return 1;
+}
 
 typedef struct dt_iop_filmemulation_gui_data_t
 {
+  GtkWidget *dataset;
+  GtkWidget *box_initial; // everything from the "initial version" data set
   GtkWidget *type;
   GtkWidget *box_bw, *bw_film, *bw_filter;
   GtkWidget *box_color, *process;
@@ -184,7 +353,10 @@ typedef struct dt_iop_filmemulation_gui_data_t
   GtkWidget *box_internegative, *internegative_paper;
   GtkWidget *spectral_method;
   GtkWidget *print_gamma, *use_hk;
-  GtkWidget *dir_couplers_active, *dir_couplers_amount;
+  GtkWidget *box_spektrafilm; // everything from the "spektrafilm" data set
+  GtkWidget *sf_film, *sf_paper;
+  GtkWidget *sf_camera_ev, *sf_print_exposure, *sf_print_gamma, *sf_hanatos_surface;
+  GtkWidget *dir_couplers_active, *dir_couplers_amount; // shared by both data sets
 } dt_iop_filmemulation_gui_data_t;
 
 // ---------------------------------------------------------------------------
@@ -232,6 +404,57 @@ typedef struct dt_iop_filmemulation_layer_data_t
   float fdm;
 } dt_iop_filmemulation_layer_data_t;
 
+// ---------------------------------------------------------------------------
+// spektrafilm-mode resolved state (dataset == DT_FE_DATASET_SPEKTRAFILM) --
+// a from-scratch port of spektrafilm's own SimulationPipeline: RGB -> per-
+// stock Hanatos2025 spectral upsampling -> film exposure/density (direct
+// H&D curve lookup, DIR-coupler correction) -> film->paper printing
+// cascade through an enlarger illuminant -> paper's parametric print
+// density-curve model -> paper density -> viewing-illuminant spectral scan
+// -> display RGB. Everything here is resolved once in commit_params()
+// (_sf_commit_params()); process()'s per-pixel path (_sf_process_*()) is
+// pure evaluation of already-baked film/paper data (filmemulation_data_
+// spektrafilm.c) plus this struct's setup-time-only derived constants.
+// ---------------------------------------------------------------------------
+typedef struct dt_iop_filmemulation_sf_data_t
+{
+  gboolean active; // dataset == DT_FE_DATASET_SPEKTRAFILM
+  const dt_sf_film_t *film;
+  const dt_sf_paper_t *paper;
+  gboolean surface_active; // apply the per-stock Hanatos2025 "surface" log-exposure correction
+  float camera_exposure_mul; // 2^sf_camera_ev
+  float print_exposure; // sf_print_exposure slider
+  float print_gamma; // sf_print_gamma slider -- s023 print-curve morph's (uniform) gamma_factor
+
+  gboolean dir_couplers_active;
+  float dir_couplers_matrix[3][3]; // film->couplers_matrix scaled by dir_couplers_amount
+  // Curves the film would need to have, before DIR-coupler self/cross-
+  // inhibition, to reproduce its own real (measured) density_curves after
+  // the coupler correction is applied -- see
+  // _sf_setup_dir_couplers_curves()/compute_density_curves_before_dir_
+  // couplers(). Only populated (and only used) when dir_couplers_active.
+  float density_curves_0[SF_N_LOG_EXPOSURE][3];
+
+  float enlarger_light[SF_N_WAVELENGTHS]; // TH-KG3 lamp, filtered by this film+paper pair's neutral CC dichroics
+  float exposure_factor; // print-exposure normalizer: 1/geomean(film-midgray raw through enlarger+paper sensitivity)
+
+  const float *view_illuminant; // paper's own viewing illuminant spectrum (sf_view_illuminants[paper->viewing_illuminant])
+  float view_norm; // sum(view_illuminant * ybar) -- scanning-stage XYZ normalization
+  const float (*view_to_adobergb)[3]; // sf_view_illuminant_to_adobergb[paper->viewing_illuminant]
+
+  // Positive (reversal/slide) film only: real photography views a
+  // developed transparency directly rather than printing it onto
+  // negative-working paper (which would invert it) -- matches
+  // spektrafilm's io.scan_film branch in SimulationPipeline._build_
+  // topology(), specialized here to always scan when the film itself is
+  // positive rather than exposing it as a separate user setting. Same
+  // trio of fields as above, sourced from the film's own viewing
+  // illuminant/density response instead of the paper's.
+  const float *film_view_illuminant;
+  float film_view_norm;
+  const float (*film_view_to_adobergb)[3];
+} dt_iop_filmemulation_sf_data_t;
+
 typedef struct dt_iop_filmemulation_data_t
 {
   int n_layers; // 1 (B&W) or 3 (color)
@@ -253,6 +476,8 @@ typedef struct dt_iop_filmemulation_data_t
   gboolean dir_couplers_positive; // TRUE for reversal (any route), FALSE for negative
   float dir_couplers_matrix[3][3]; // [donor][receiver], pre-scaled by the amount slider
   float dir_couplers_density_max[3]; // per-layer stage-0 max density (for the positive/silver term)
+
+  dt_iop_filmemulation_sf_data_t sf;
 } dt_iop_filmemulation_data_t;
 
 // ---------------------------------------------------------------------------
@@ -927,6 +1152,408 @@ static inline void _fe_gamut_map(dt_aligned_pixel_t rgb,
 }
 
 // ---------------------------------------------------------------------------
+// spektrafilm mode -- a from-scratch port of spektrafilm's own algorithm
+// (see external/filmemulation_data_spektrafilm.c's own header for what was
+// ported and why). Uses its own helper functions below rather than the
+// "initial version" split-gauss cascade machinery above; the only things
+// shared with it are _fe_tri2quad()/_fe_hanatos_fetch_coeffs() (both
+// stock-independent physics of the shared Hanatos spectra basis) and
+// _fe_finish_pixel() (gamut mapping + working-space conversion tail,
+// identical for both data sets).
+// ---------------------------------------------------------------------------
+
+// Per-stock Hanatos-2025 spectral reconstruction (see _fe_hanatos_reconstruct()
+// for the shared closed-form basis this specializes): the fixed Adobe-RGB-
+// >XYZ matrix is replaced by this film's own CAT16-adapted matrix (Adobe
+// RGB D65 white -> XYZ adapted to the film's reference illuminant -- see
+// dt_sf_film_t.cat16_matrix's own comment), and the reconstruction is
+// evaluated at spektrafilm's native 81-wavelength (380-780nm/5nm) grid
+// instead of the "initial version"'s 31-point one. Also returns the tc
+// (chromaticity-square) coordinate used, for the optional per-stock
+// "surface" log-exposure correction below.
+static inline void _sf_hanatos_reconstruct(const dt_sf_film_t *film, const float rgb_in[3],
+                                            float spectrum[SF_N_WAVELENGTHS], float *tx_out, float *ty_out)
+{
+  const float r = fmaxf(rgb_in[0], 0.f), g = fmaxf(rgb_in[1], 0.f), b = fmaxf(rgb_in[2], 0.f);
+  const float X = film->cat16_matrix[0][0] * r + film->cat16_matrix[0][1] * g + film->cat16_matrix[0][2] * b;
+  const float Y = film->cat16_matrix[1][0] * r + film->cat16_matrix[1][1] * g + film->cat16_matrix[1][2] * b;
+  const float Z = film->cat16_matrix[2][0] * r + film->cat16_matrix[2][1] * g + film->cat16_matrix[2][2] * b;
+  const float sum = fmaxf(X + Y + Z, 1e-9f);
+
+  float tx, ty;
+  _fe_tri2quad(X / sum, Y / sum, &tx, &ty);
+  *tx_out = tx;
+  *ty_out = ty;
+
+  float coeffs[4];
+  _fe_hanatos_fetch_coeffs(tx, ty, coeffs);
+  const float c3 = fmaxf(coeffs[3], 1e-6f);
+
+  for(int i = 0; i < SF_N_WAVELENGTHS; i++)
+  {
+    const float wl = sf_wavelengths[i];
+    const float x = (coeffs[0] * wl + coeffs[1]) * wl + coeffs[2];
+    const float y = 1.f / sqrtf(x * x + 1.f);
+    spectrum[i] = ((0.5f * x * y + 0.5f) / c3) * sum;
+  }
+}
+
+// spektrafilm's poly2d_deg4() + hanika_sigmoid(): a degree-4 2D polynomial
+// in tc-space, algebraically soft-clamped to +-2 stops -- see
+// dt_sf_film_t.surface_poly's own comment.
+static inline float _sf_eval_surface_poly(const float poly[14], const float dx, const float dy)
+{
+  const float x2 = dx * dx, y2 = dy * dy, xy = dx * dy;
+  const float x3 = x2 * dx, y3 = y2 * dy;
+  const float raw = poly[0] * dx + poly[1] * dy + poly[2] * x2 + poly[3] * y2 + poly[4] * xy
+                   + poly[5] * x3 + poly[6] * y3 + poly[7] * (x2 * dy) + poly[8] * (dx * y2)
+                   + poly[9] * (x2 * x2) + poly[10] * (y2 * y2) + poly[11] * (x3 * dy)
+                   + poly[12] * (x2 * y2) + poly[13] * (dx * y3);
+  const float max_val = 2.f;
+  return raw / sqrtf(1.f + (raw / max_val) * (raw / max_val));
+}
+
+// RGB -> per-layer raw exposure: spectral reconstruction, dot with the
+// film's (already Hanatos2025-window-adapted) sensitivity, optional
+// per-stock "surface" correction -- matches spektrafilm's
+// FilmingStage._rgb_to_film_raw() (the camera UV/IR band-pass filter, and
+// the DIR-coupler-unrelated highlight-boost/diffusion-filter/halation
+// steps of FilmingStage.expose(), are out of scope -- see this feature's
+// commit message for why).
+static inline void _sf_compute_raw_exposure(const dt_sf_film_t *film, const gboolean surface_active,
+                                            const float rgb[3], float raw[3])
+{
+  float spectrum[SF_N_WAVELENGTHS];
+  float tx, ty;
+  _sf_hanatos_reconstruct(film, rgb, spectrum, &tx, &ty);
+
+  for(int c = 0; c < 3; c++)
+  {
+    float e = 0.f;
+    for(int w = 0; w < SF_N_WAVELENGTHS; w++) e += spectrum[w] * film->sensitivity[w][c];
+    raw[c] = e;
+  }
+
+  if(surface_active)
+  {
+    const float dx = tx - film->tc_center[0];
+    const float dy = ty - film->tc_center[1];
+    for(int c = 0; c < 3; c++)
+      raw[c] *= exp2f(_sf_eval_surface_poly(film->surface_poly[c], dx, dy));
+  }
+}
+
+// Linear interpolation of a baked (log_exposure, density) curve against
+// spektrafilm's shared 256-point log-exposure axis (sf_log_exposure) --
+// clamps to the endpoint value outside range, matching spektrafilm's own
+// fast_interp(). "curve" is any [SF_N_LOG_EXPOSURE][3] table (a film's own
+// density_curves, or its DIR-coupler-precorrected variant).
+static inline float _sf_interp_shared_axis(const float (*curve)[3], const int channel, const float x)
+{
+  const int n = SF_N_LOG_EXPOSURE;
+  if(x <= sf_log_exposure[0]) return curve[0][channel];
+  if(x >= sf_log_exposure[n - 1]) return curve[n - 1][channel];
+  int lo = 0, hi = n - 1;
+  while(hi - lo > 1)
+  {
+    const int mid = (lo + hi) / 2;
+    if(sf_log_exposure[mid] <= x) lo = mid; else hi = mid;
+  }
+  const float t = (x - sf_log_exposure[lo]) / (sf_log_exposure[hi] - sf_log_exposure[lo]);
+  return curve[lo][channel] * (1.f - t) + curve[hi][channel] * t;
+}
+
+// Linear interpolation against an arbitrary (not necessarily
+// sf_log_exposure-aligned) ascending x-axis, one column of a
+// [SF_N_LOG_EXPOSURE][3] pair of tables -- used only to precompute the
+// DIR-coupler curve correction below (setup time, not per pixel).
+static inline float _sf_interp_column(const float (*x_axis)[3], const float (*y_axis)[3], const int channel,
+                                      const int n, const float x)
+{
+  if(x <= x_axis[0][channel]) return y_axis[0][channel];
+  if(x >= x_axis[n - 1][channel]) return y_axis[n - 1][channel];
+  int lo = 0, hi = n - 1;
+  while(hi - lo > 1)
+  {
+    const int mid = (lo + hi) / 2;
+    if(x_axis[mid][channel] <= x) lo = mid; else hi = mid;
+  }
+  const float t = (x - x_axis[lo][channel]) / (x_axis[hi][channel] - x_axis[lo][channel]);
+  return y_axis[lo][channel] * (1.f - t) + y_axis[hi][channel] * t;
+}
+
+// Beer-Lambert spectral density compositing (film or paper, same formula):
+// each dye channel's density weighted by its own spectral absorption,
+// plus the base/fog spectral density -- matches spektrafilm's
+// compute_density_spectral().
+static inline void _sf_density_spectral(const float (*channel_density)[3], const float *base_density,
+                                        const float density_cmy[3], float spectral[SF_N_WAVELENGTHS])
+{
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+    spectral[l] = density_cmy[0] * channel_density[l][0] + density_cmy[1] * channel_density[l][1]
+                + density_cmy[2] * channel_density[l][2] + base_density[l];
+}
+
+// Density -> transmitted light, zeroing wavelengths outside the profile's
+// own measured spectral range (spectral_valid) instead of propagating the
+// NaNs spektrafilm's own density_to_light() would produce there -- see
+// dt_sf_film_t.spectral_valid's own comment.
+static inline void _sf_density_to_light(const float *spectral, const float *illuminant, const float *valid,
+                                        float light[SF_N_WAVELENGTHS])
+{
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+    light[l] = (valid[l] > 0.5f) ? (powf(10.f, -spectral[l]) * illuminant[l]) : 0.f;
+}
+
+// spektrafilm's default enlarger dichroic color-head filter
+// (color_filters.create_combined_dichroic_filter(), the "custom" closed-
+// form erf filter set that color_enlarger() uses by default -- no measured
+// brand CSV needed) applied to the TH-KG3 lamp spectrum at a given
+// (c, m, y) Kodak-CC-unit filter setting.
+static void _sf_enlarger_filtered_illuminant(const float cc[3], float out[SF_N_WAVELENGTHS])
+{
+  const float tc = powf(10.f, -cc[0] / 100.f);
+  const float tm = powf(10.f, -cc[1] / 100.f);
+  const float ty = powf(10.f, -cc[2] / 100.f);
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+  {
+    const float wl = sf_wavelengths[l];
+    const float y_pure = 0.5f * (1.f + erff((wl - 516.f) / 12.f));
+    const float m_pure = (wl <= 550.f) ? 0.5f * (1.f - erff((wl - 500.f) / 8.f)) : 0.5f * (1.f + erff((wl - 610.f) / 8.f));
+    const float c_pure = 0.5f * (1.f - erff((wl - 607.f) / 8.f));
+    const float dim_c = 1.f - (1.f - c_pure) * (1.f - tc);
+    const float dim_m = 1.f - (1.f - m_pure) * (1.f - tm);
+    const float dim_y = 1.f - (1.f - y_pure) * (1.f - ty);
+    out[l] = sf_enlarger_illuminant[l] * dim_c * dim_m * dim_y;
+  }
+}
+
+// Film density -> print exposure: spectral density -> transmitted enlarger
+// light -> paper's own spectral sensitivity -> exposure-factor-normalized
+// raw -> log10 -- matches spektrafilm's PrintingStage._film_cmy_to_print_
+// log_raw() (preflash is out of scope: off by default upstream too).
+static inline void _sf_film_to_print_log_raw(const dt_sf_film_t *film, const dt_sf_paper_t *paper,
+                                             const float enlarger_light[SF_N_WAVELENGTHS],
+                                             const float exposure_factor, const float print_exposure,
+                                             const float density_cmy_film[3], float log_raw_print[3])
+{
+  float spectral[SF_N_WAVELENGTHS];
+  _sf_density_spectral(film->channel_density, film->base_density, density_cmy_film, spectral);
+  float light[SF_N_WAVELENGTHS];
+  _sf_density_to_light(spectral, enlarger_light, film->spectral_valid, light);
+
+  float raw[3] = { 0.f, 0.f, 0.f };
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+    for(int c = 0; c < 3; c++)
+      raw[c] += light[l] * paper->sensitivity[l][c];
+
+  for(int c = 0; c < 3; c++)
+  {
+    raw[c] *= exposure_factor * print_exposure;
+    log_raw_print[c] = log10f(fmaxf(raw[c], 0.f) + 1e-10f);
+  }
+}
+
+// Paper's parametric print density-curve model ("cdfs": a sum of scaled
+// normal CDFs per sub-layer) -- matches spektrafilm's utils.morph_curves
+// _evaluate_channel_density()/apply_print_curves_morph(), specialized to
+// a single uniform gamma_factor (this module's "print gamma" slider) in
+// place of spektrafilm's 6 independent fast/slow/RGB gamma knobs and its
+// optional developer-exhaustion Gumbel blend (out of scope: a creative
+// refinement of an already-creative control, off by default upstream too).
+// All bundled papers are profile type "negative" (sign = +1); see
+// dt_sf_paper_t's own comment.
+static inline void _sf_print_develop(const dt_sf_paper_t *paper, const float gamma,
+                                     const float log_raw_print[3], float density_cmy_print[3])
+{
+  for(int c = 0; c < 3; c++)
+  {
+    float d = 0.f;
+    for(int i = 0; i < 3; i++)
+    {
+      const float z = (gamma * log_raw_print[c] - paper->cdfs_centers[c][i]) / paper->cdfs_sigmas[c][i];
+      d += paper->cdfs_amplitudes[c][i] * _fe_norm_cdf(z);
+    }
+    density_cmy_print[c] = d;
+  }
+}
+
+// Density -> display RGB: spectral density -> transmitted viewing-
+// illuminant light -> CIE XYZ -> linear Adobe RGB (D65) via a viewing-
+// illuminant-adapted matrix (see sf_view_illuminant_to_adobergb's own
+// comment) -- matches spektrafilm's ScanningStage.scan(). Takes the
+// channel_density/base_density/spectral_valid trio directly (rather than a
+// dt_sf_paper_t *) so the same function serves both the paper-print path
+// (paper's own density response) and reversal/positive film viewed
+// directly (film's own density response, no paper stage at all -- see
+// _sf_process_simple()'s own comment on why). Glare and output gamut
+// compression are out of scope: darktable's own bloom/hazeremoval and
+// colorbalancergb modules cover similar ground; _fe_finish_pixel()'s
+// hue-preserving gamut mapping handles the final [0,1] clamp instead of
+// spektrafilm's own chroma/lightness compression.
+static inline void _sf_scan_to_rgb(const float (*channel_density)[3], const float *base_density,
+                                   const float *spectral_valid, const float *view_illuminant,
+                                   const float view_norm, const float (*view_to_adobergb)[3],
+                                   const float density_cmy[3], float rgb_adobergb[3])
+{
+  float spectral[SF_N_WAVELENGTHS];
+  _sf_density_spectral(channel_density, base_density, density_cmy, spectral);
+  float light[SF_N_WAVELENGTHS];
+  _sf_density_to_light(spectral, view_illuminant, spectral_valid, light);
+
+  float xyz[3] = { 0.f, 0.f, 0.f };
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+    for(int k = 0; k < 3; k++)
+      xyz[k] += light[l] * sf_cmfs[l][k];
+  const float inv_norm = 1.f / fmaxf(view_norm, 1e-9f);
+  for(int k = 0; k < 3; k++) xyz[k] *= inv_norm;
+
+  for(int c = 0; c < 3; c++)
+    rgb_adobergb[c] = view_to_adobergb[c][0] * xyz[0] + view_to_adobergb[c][1] * xyz[1]
+                    + view_to_adobergb[c][2] * xyz[2];
+}
+
+// Film density -> final display RGB: for positive (reversal/slide) film,
+// scan the film's own density directly under its own viewing illuminant
+// (see dt_iop_filmemulation_sf_data_t.film_view_illuminant's own comment
+// for why); for negative film, run the full film->paper printing cascade
+// and scan the resulting paper density instead.
+static inline void _sf_film_density_to_rgb(const dt_sf_film_t *film, const dt_sf_paper_t *paper,
+                                           const dt_iop_filmemulation_sf_data_t *sf,
+                                           const float density_cmy_film[3], float rgb_adobergb[3])
+{
+  if(film->positive)
+  {
+    _sf_scan_to_rgb(film->channel_density, film->base_density, film->spectral_valid,
+                    sf->film_view_illuminant, sf->film_view_norm, sf->film_view_to_adobergb,
+                    density_cmy_film, rgb_adobergb);
+    return;
+  }
+
+  float log_raw_print[3];
+  _sf_film_to_print_log_raw(film, paper, sf->enlarger_light, sf->exposure_factor, sf->print_exposure,
+                            density_cmy_film, log_raw_print);
+
+  float density_cmy_print[3];
+  _sf_print_develop(paper, sf->print_gamma, log_raw_print, density_cmy_print);
+
+  _sf_scan_to_rgb(paper->channel_density, paper->base_density, paper->spectral_valid,
+                  sf->view_illuminant, sf->view_norm, sf->view_to_adobergb,
+                  density_cmy_print, rgb_adobergb);
+}
+
+// Setup-time-only (commit_params) print-exposure normalizer: exposes a
+// spatially-uniform 18% grey scene patch through the film and enlarger,
+// onto the paper's own sensitivity, and returns the reciprocal of the
+// geometric-mean raw response -- so the print stage's absolute exposure
+// tracks the film+paper pairing's own midgray reproduction regardless of
+// the camera-exposure slider (spektrafilm's "print_exposure_compensation"
+// + "normalize_print_exposure", both on by default) -- matches
+// PrintingStage._compute_exposure_factor_midgray()/_exposure_factor().
+static float _sf_compute_exposure_factor(const dt_sf_film_t *film, const dt_sf_paper_t *paper,
+                                         const float enlarger_light[SF_N_WAVELENGTHS],
+                                         const float camera_exposure_mul, const gboolean surface_active)
+{
+  const float grey = 0.184f * camera_exposure_mul;
+  const float rgb_mid[3] = { grey, grey, grey };
+  float raw[3];
+  _sf_compute_raw_exposure(film, surface_active, rgb_mid, raw);
+
+  float density_cmy[3];
+  for(int c = 0; c < 3; c++)
+    density_cmy[c] = _sf_interp_shared_axis(film->density_curves, c, log10f(raw[c] + 1e-10f));
+
+  float spectral[SF_N_WAVELENGTHS];
+  _sf_density_spectral(film->channel_density, film->base_density, density_cmy, spectral);
+  float light[SF_N_WAVELENGTHS];
+  _sf_density_to_light(spectral, enlarger_light, film->spectral_valid, light);
+
+  float raw_mid[3] = { 0.f, 0.f, 0.f };
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++)
+    for(int c = 0; c < 3; c++)
+      raw_mid[c] += light[l] * paper->sensitivity[l][c];
+
+  float logsum = 0.f;
+  for(int c = 0; c < 3; c++) logsum += logf(fmaxf(raw_mid[c], 1e-10f));
+  const float geomean = expf(logsum / 3.f);
+  return 1.f / fmaxf(geomean, 1e-10f);
+}
+
+// Setup-time-only (commit_params): the density curves a film would need to
+// have, before DIR-coupler self/cross-inhibition, to reproduce its own
+// real (measured) density_curves after the correction is applied -- so a
+// spatially-uniform field's gray-ramp reproduction is exactly invariant to
+// whether DIR couplers are active. Matches spektrafilm's
+// compute_density_curves_before_dir_couplers() (its positive/negative
+// sign-flip branch is a no-op once negation is distributed through linear
+// interpolation on both sides, so this implements just the one formula).
+static void _sf_setup_dir_couplers_curves(const dt_sf_film_t *film, const float matrix[3][3],
+                                          float density_curves_0[SF_N_LOG_EXPOSURE][3])
+{
+  const int n = SF_N_LOG_EXPOSURE;
+  float log_exposure_0[SF_N_LOG_EXPOSURE][3];
+
+  for(int i = 0; i < n; i++)
+  {
+    float silver[3];
+    for(int c = 0; c < 3; c++)
+      silver[c] = film->positive ? (film->dmax[c] - film->density_curves[i][c]) : film->density_curves[i][c];
+
+    for(int recv = 0; recv < 3; recv++)
+    {
+      float acc = 0.f;
+      for(int donor = 0; donor < 3; donor++) acc += silver[donor] * matrix[donor][recv];
+      log_exposure_0[i][recv] = sf_log_exposure[i] - acc;
+    }
+  }
+
+  for(int c = 0; c < 3; c++)
+    for(int i = 0; i < n; i++)
+      density_curves_0[i][c] = _sf_interp_column(log_exposure_0, film->density_curves, c, n, sf_log_exposure[i]);
+}
+
+// commit_params() dispatch target for dataset == DT_FE_DATASET_SPEKTRAFILM.
+static void _sf_commit_params(const dt_iop_filmemulation_params_t *p, dt_iop_filmemulation_data_t *d)
+{
+  dt_iop_filmemulation_sf_data_t *sf = &d->sf;
+  sf->active = TRUE;
+  sf->film = &dt_sf_films[p->sf_film];
+  sf->paper = &dt_sf_papers[p->sf_paper];
+  sf->surface_active = p->sf_hanatos_surface;
+  sf->camera_exposure_mul = exp2f(p->sf_camera_ev);
+  sf->print_exposure = p->sf_print_exposure;
+  sf->print_gamma = p->sf_print_gamma;
+
+  sf->dir_couplers_active = p->dir_couplers_active;
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+      sf->dir_couplers_matrix[i][j] = sf->film->couplers_matrix[i][j] * p->dir_couplers_amount;
+  if(sf->dir_couplers_active)
+    _sf_setup_dir_couplers_curves(sf->film, sf->dir_couplers_matrix, sf->density_curves_0);
+
+  const float *nf = sf_neutral_filters[(int)p->sf_paper][(int)p->sf_film];
+  float cc[3];
+  if(nf[0] >= 0.f) { cc[0] = nf[0]; cc[1] = nf[1]; cc[2] = nf[2]; }
+  else { cc[0] = 0.f; cc[1] = 65.f; cc[2] = 55.f; } // EnlargerParams generic defaults
+  _sf_enlarger_filtered_illuminant(cc, sf->enlarger_light);
+
+  sf->exposure_factor = _sf_compute_exposure_factor(sf->film, sf->paper, sf->enlarger_light,
+                                                    sf->camera_exposure_mul, sf->surface_active);
+
+  sf->view_illuminant = sf_view_illuminants[sf->paper->viewing_illuminant];
+  float norm = 0.f;
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++) norm += sf->view_illuminant[l] * sf_cmfs[l][1];
+  sf->view_norm = norm;
+  sf->view_to_adobergb = sf_view_illuminant_to_adobergb[sf->paper->viewing_illuminant];
+
+  sf->film_view_illuminant = sf_view_illuminants[sf->film->viewing_illuminant];
+  float film_norm = 0.f;
+  for(int l = 0; l < SF_N_WAVELENGTHS; l++) film_norm += sf->film_view_illuminant[l] * sf_cmfs[l][1];
+  sf->film_view_norm = film_norm;
+  sf->film_view_to_adobergb = sf_view_illuminant_to_adobergb[sf->film->viewing_illuminant];
+}
+
+// ---------------------------------------------------------------------------
 // commit_params: resolve the GUI selection into a fully-calibrated cascade
 // per layer.
 // ---------------------------------------------------------------------------
@@ -937,6 +1564,13 @@ void commit_params(dt_iop_module_t *self,
 {
   const dt_iop_filmemulation_params_t *p = (dt_iop_filmemulation_params_t *)p1;
   dt_iop_filmemulation_data_t *d = piece->data;
+
+  d->sf.active = FALSE;
+  if(p->dataset == DT_FE_DATASET_SPEKTRAFILM)
+  {
+    _sf_commit_params(p, d);
+    return;
+  }
 
   d->use_hk = p->use_hk;
 
@@ -1231,11 +1865,187 @@ static gboolean _fe_process_dir_couplers(const dt_iop_filmemulation_data_t *d,
   return TRUE;
 }
 
+// spektrafilm mode's per-pixel path (no DIR-coupler spatial diffusion):
+// pipe RGB -> Adobe RGB -> per-stock spectral reconstruction -> film
+// exposure/density -> film->paper printing cascade -> paper density-curve
+// model -> viewing-illuminant scan -> Adobe RGB -> gamut-mapped pipe RGB.
+static void _sf_process_simple(const dt_iop_filmemulation_data_t *d,
+                               const float *const in, float *const out,
+                               const size_t npixels,
+                               const dt_colormatrix_t pipe_to_adobergb,
+                               const dt_colormatrix_t adobergb_to_pipe,
+                               const gboolean has_gamut_matrices,
+                               const dt_colormatrix_t yrg_input_matrix_trans,
+                               const dt_colormatrix_t yrg_output_matrix,
+                               const dt_colormatrix_t yrg_output_matrix_trans)
+{
+  const dt_iop_filmemulation_sf_data_t *sf = &d->sf;
+  const dt_sf_film_t *film = sf->film;
+  const dt_sf_paper_t *paper = sf->paper;
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+    float *const restrict pix_out = out + k;
+
+    dt_aligned_pixel_t rgb;
+    dt_apply_transposed_color_matrix(pix_in, pipe_to_adobergb, rgb);
+
+    float raw[3];
+    _sf_compute_raw_exposure(film, sf->surface_active, rgb, raw);
+    for(int c = 0; c < 3; c++) raw[c] *= sf->camera_exposure_mul;
+
+    float log_raw[3];
+    for(int c = 0; c < 3; c++) log_raw[c] = log10f(fmaxf(raw[c], 0.f) + 1e-10f);
+
+    float density_cmy_film[3];
+    for(int c = 0; c < 3; c++) density_cmy_film[c] = _sf_interp_shared_axis(film->density_curves, c, log_raw[c]);
+
+    dt_aligned_pixel_t result = { 0.f, 0.f, 0.f, 0.f };
+    _sf_film_density_to_rgb(film, paper, sf, density_cmy_film, result);
+    result[3] = pix_in[3];
+
+    _fe_finish_pixel(result, has_gamut_matrices, yrg_input_matrix_trans, yrg_output_matrix,
+                     yrg_output_matrix_trans, adobergb_to_pipe, pix_out);
+  }
+}
+
+// spektrafilm mode's DIR-coupler path -- same two-pass/spatial-diffusion
+// structure as _fe_process_dir_couplers() (first pass: uncorrected film
+// density as the "silver" proxy, matrix-multiply into a per-receiver
+// correction, spatially diffuse it; second pass: re-develop from the
+// corrected log-exposure against the DIR-coupler-precorrected curves),
+// then the same film->paper->scan cascade as _sf_process_simple() above.
+// Returns FALSE (having freed everything) if scratch-buffer allocation
+// fails, so the caller can fall back to _sf_process_simple().
+static gboolean _sf_process_dir_couplers(const dt_iop_filmemulation_data_t *d,
+                                         const float *const in, float *const out,
+                                         const dt_iop_roi_t *const roi_in,
+                                         const dt_colormatrix_t pipe_to_adobergb,
+                                         const dt_colormatrix_t adobergb_to_pipe,
+                                         const gboolean has_gamut_matrices,
+                                         const dt_colormatrix_t yrg_input_matrix_trans,
+                                         const dt_colormatrix_t yrg_output_matrix,
+                                         const dt_colormatrix_t yrg_output_matrix_trans)
+{
+  const dt_iop_filmemulation_sf_data_t *sf = &d->sf;
+  const dt_sf_film_t *film = sf->film;
+  const dt_sf_paper_t *paper = sf->paper;
+  const size_t npixels = (size_t)roi_in->width * roi_in->height;
+
+  float *const restrict log_raw_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict correction_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict blur_core_buf = dt_alloc_align_float(4 * npixels);
+  float *const restrict blur_tail_buf = dt_alloc_align_float(4 * npixels);
+
+  if(!log_raw_buf || !correction_buf || !blur_core_buf || !blur_tail_buf)
+  {
+    dt_free_align(log_raw_buf);
+    dt_free_align(correction_buf);
+    dt_free_align(blur_core_buf);
+    dt_free_align(blur_tail_buf);
+    return FALSE;
+  }
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+
+    dt_aligned_pixel_t rgb;
+    dt_apply_transposed_color_matrix(pix_in, pipe_to_adobergb, rgb);
+
+    float raw[3];
+    _sf_compute_raw_exposure(film, sf->surface_active, rgb, raw);
+    for(int c = 0; c < 3; c++) raw[c] *= sf->camera_exposure_mul;
+
+    float log_raw[3];
+    for(int c = 0; c < 3; c++) log_raw[c] = log10f(fmaxf(raw[c], 0.f) + 1e-10f);
+    log_raw_buf[k + 0] = log_raw[0];
+    log_raw_buf[k + 1] = log_raw[1];
+    log_raw_buf[k + 2] = log_raw[2];
+    log_raw_buf[k + 3] = 0.f;
+
+    float D0[3], silver[3];
+    for(int c = 0; c < 3; c++)
+    {
+      D0[c] = _sf_interp_shared_axis(film->density_curves, c, log_raw[c]);
+      silver[c] = film->positive ? (film->dmax[c] - D0[c]) : D0[c];
+    }
+
+    for(int recv = 0; recv < 3; recv++)
+    {
+      float acc = 0.f;
+      for(int donor = 0; donor < 3; donor++) acc += silver[donor] * sf->dir_couplers_matrix[donor][recv];
+      correction_buf[k + recv] = acc;
+    }
+    correction_buf[k + 3] = 0.f;
+  }
+
+  const float pixel_size_um = FE_FILM_WIDTH_UM / (float)roi_in->width;
+  const float sigma_core_px = FE_DIRC_DIFFUSION_UM / pixel_size_um;
+  const float sigma_tail_px = FE_DIRC_DIFFUSION_TAIL_UM / pixel_size_um;
+  const dt_aligned_pixel_t blur_max = { FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX };
+  const dt_aligned_pixel_t blur_min = { -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+  dt_gaussian_t *g_core
+      = dt_gaussian_init(roi_in->width, roi_in->height, 4, blur_max, blur_min, sigma_core_px, DT_IOP_GAUSSIAN_ZERO);
+  dt_gaussian_t *g_tail
+      = dt_gaussian_init(roi_in->width, roi_in->height, 4, blur_max, blur_min, sigma_tail_px, DT_IOP_GAUSSIAN_ZERO);
+  if(g_core && g_tail)
+  {
+    dt_gaussian_blur_4c(g_core, correction_buf, blur_core_buf);
+    dt_gaussian_blur_4c(g_tail, correction_buf, blur_tail_buf);
+  }
+  else
+  {
+    memcpy(blur_core_buf, correction_buf, sizeof(float) * 4 * npixels);
+    memcpy(blur_tail_buf, correction_buf, sizeof(float) * 4 * npixels);
+  }
+  if(g_core) dt_gaussian_free(g_core);
+  if(g_tail) dt_gaussian_free(g_tail);
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < 4 * npixels; k += 4)
+  {
+    const float *const restrict pix_in = in + k;
+    float *const restrict pix_out = out + k;
+
+    float log_raw_corrected[3];
+    for(int c = 0; c < 3; c++)
+    {
+      const float correction = (1.f - FE_DIRC_DIFFUSION_TAIL_WEIGHT) * blur_core_buf[k + c]
+                              + FE_DIRC_DIFFUSION_TAIL_WEIGHT * blur_tail_buf[k + c];
+      log_raw_corrected[c] = log_raw_buf[k + c] - correction;
+    }
+
+    float density_cmy_film[3];
+    for(int c = 0; c < 3; c++)
+      density_cmy_film[c] = _sf_interp_shared_axis(sf->density_curves_0, c, log_raw_corrected[c]);
+
+    dt_aligned_pixel_t result = { 0.f, 0.f, 0.f, 0.f };
+    _sf_film_density_to_rgb(film, paper, sf, density_cmy_film, result);
+    result[3] = pix_in[3];
+
+    _fe_finish_pixel(result, has_gamut_matrices, yrg_input_matrix_trans, yrg_output_matrix,
+                     yrg_output_matrix_trans, adobergb_to_pipe, pix_out);
+  }
+
+  dt_free_align(log_raw_buf);
+  dt_free_align(correction_buf);
+  dt_free_align(blur_core_buf);
+  dt_free_align(blur_tail_buf);
+  return TRUE;
+}
+
 // ---------------------------------------------------------------------------
 // process: pipe RGB -> linear Adobe RGB primaries -> spectral reconstruction
 // -> exposure integration per layer -> optional HK -> optional DIR-coupler
 // spatial diffusion -> cascade -> hue-preserving gamut mapping
 // (_fe_gamut_map()) -> linear Adobe RGB primaries -> pipe RGB.
+// (dataset == DT_FE_DATASET_SPEKTRAFILM dispatches to _sf_process_simple()/
+// _sf_process_dir_couplers() instead -- see dt_iop_filmemulation_sf_data_t.)
 // ---------------------------------------------------------------------------
 void process(dt_iop_module_t *self,
             dt_dev_pixelpipe_iop_t *piece,
@@ -1287,6 +2097,18 @@ void process(dt_iop_module_t *self,
     dt_colormatrix_transpose(yrg_output_matrix_trans, yrg_output_matrix);
   }
 
+  if(d->sf.active)
+  {
+    if(!d->sf.dir_couplers_active
+       || !_sf_process_dir_couplers(d, in, out, roi_in, pipe_to_adobergb, adobergb_to_pipe, has_gamut_matrices,
+                                    yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans))
+    {
+      _sf_process_simple(d, in, out, npixels, pipe_to_adobergb, adobergb_to_pipe, has_gamut_matrices,
+                         yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
+    }
+    return;
+  }
+
   const gboolean use_dir_couplers = d->dir_couplers_active && d->n_layers == 3;
 
   if(!use_dir_couplers
@@ -1295,6 +2117,25 @@ void process(dt_iop_module_t *self,
   {
     _fe_process_simple(d, in, out, npixels, pipe_to_adobergb, adobergb_to_pipe, has_gamut_matrices,
                        yrg_input_matrix_trans, yrg_output_matrix, yrg_output_matrix_trans);
+  }
+}
+
+// Marks the selected film's own real-world companion paper (dt_sf_film_t.
+// default_paper, from spektrafilm's target_print) with a trailing "*" in
+// the paper combobox -- darktable has no standard "recommended entry"
+// convention (dt_bauhaus_combobox_set_entry_label(), used elsewhere for
+// denoiseprofile.c's auto-profile name, is the closest building block).
+static void _sf_mark_companion_paper(const dt_iop_filmemulation_gui_data_t *g, const int film_idx)
+{
+  const int default_paper = dt_sf_films[film_idx].default_paper;
+  for(int i = 0; i < SF_N_PAPERS; i++)
+  {
+    char label[128];
+    if(i == default_paper)
+      g_snprintf(label, sizeof(label), "%s *", dt_sf_papers[i].display_name);
+    else
+      g_strlcpy(label, dt_sf_papers[i].display_name, sizeof(label));
+    dt_bauhaus_combobox_set_entry_label(g->sf_paper, i, label);
   }
 }
 
@@ -1310,6 +2151,24 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
   const dt_iop_filmemulation_gui_data_t *g = self->gui_data;
   const dt_iop_filmemulation_params_t *p = self->params;
 
+  if(!w || w == g->dataset || w == g->sf_film)
+    _sf_mark_companion_paper(g, (int)p->sf_film);
+
+  if(!w || w == g->dataset)
+  {
+    gtk_widget_set_visible(g->box_initial, p->dataset == DT_FE_DATASET_INITIAL);
+    gtk_widget_set_visible(g->box_spektrafilm, p->dataset == DT_FE_DATASET_SPEKTRAFILM);
+  }
+  if(!w || w == g->dataset || w == g->type)
+  {
+    // dye-coupler crosstalk is shared by both data sets, but only makes
+    // sense with 3 emulsion layers -- the initial-version data set's B&W
+    // stock has just one.
+    const gboolean show_dir_couplers = (p->dataset == DT_FE_DATASET_SPEKTRAFILM)
+                                      || (p->dataset == DT_FE_DATASET_INITIAL && p->type == DT_FE_TYPE_COLOR);
+    gtk_widget_set_visible(g->dir_couplers_active, show_dir_couplers);
+    gtk_widget_set_visible(g->dir_couplers_amount, show_dir_couplers);
+  }
   if(!w || w == g->type)
   {
     gtk_widget_set_visible(g->box_bw, p->type == DT_FE_TYPE_BW);
@@ -1336,28 +2195,29 @@ void gui_init(dt_iop_module_t *self)
 {
   dt_iop_filmemulation_gui_data_t *g = IOP_GUI_ALLOC(filmemulation);
 
-  g->type = dt_bauhaus_combobox_from_params(self, "type");
+  g->dataset = dt_bauhaus_combobox_from_params(self, "dataset");
+  gtk_widget_set_tooltip_text(g->dataset,
+                              _("initial version: darktable's own film/paper data and cascade.\n"
+                                "spektrafilm: a straight port of the spektrafilm project's own film/\n"
+                                "paper profiles and rendering algorithm (per-stock spectral-sensitivity\n"
+                                "calibration, a real film->paper spectral printing cascade through an\n"
+                                "enlarger, and its own parametric print response model)."));
   // self->widget is lazily created (as a vbox) by the first
   // dt_bauhaus_*_from_params() call above -- capture it only now.
   GtkWidget *main_box = self->widget;
+
+  g->box_initial = self->widget = dt_gui_vbox();
+
+  g->type = dt_bauhaus_combobox_from_params(self, "type");
 
   g->box_bw = self->widget = dt_gui_vbox();
   g->bw_film = dt_bauhaus_combobox_from_params(self, "bw_film");
   g->bw_filter = dt_bauhaus_combobox_from_params(self, "bw_filter");
   gtk_widget_set_tooltip_text(g->bw_filter, _("Wratten glass filter -- folded into the film's spectral response"));
-  dt_gui_box_add(main_box, g->box_bw);
+  dt_gui_box_add(g->box_initial, g->box_bw);
 
   g->box_color = self->widget = dt_gui_vbox();
   g->process = dt_bauhaus_combobox_from_params(self, "process");
-
-  g->dir_couplers_active = dt_bauhaus_toggle_from_params(self, "dir_couplers_active");
-  gtk_widget_set_tooltip_text(g->dir_couplers_active,
-                              _("simulate DIR (development-inhibitor-releasing) coupler crosstalk\n"
-                                "between the R/G/B emulsion layers -- the real film chemistry behind\n"
-                                "color negative/reversal film's characteristic saturation and\n"
-                                "local-contrast response"));
-  g->dir_couplers_amount = dt_bauhaus_slider_from_params(self, "dir_couplers_amount");
-  gtk_widget_set_tooltip_text(g->dir_couplers_amount, _("strength of the dye coupler interaction"));
 
   g->box_negative = self->widget = dt_gui_vbox();
   g->negative_film = dt_bauhaus_combobox_from_params(self, "negative_film");
@@ -1381,9 +2241,9 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(g->box_reversal, g->box_internegative);
 
   dt_gui_box_add(g->box_color, g->box_reversal);
-  dt_gui_box_add(main_box, g->box_color);
+  dt_gui_box_add(g->box_initial, g->box_color);
 
-  self->widget = main_box;
+  self->widget = g->box_initial;
 
   g->spectral_method = dt_bauhaus_combobox_from_params(self, "spectral_method");
   gtk_widget_set_tooltip_text(g->spectral_method,
@@ -1401,6 +2261,40 @@ void gui_init(dt_iop_module_t *self)
   g->use_hk = dt_bauhaus_toggle_from_params(self, "use_hk");
   gtk_widget_set_tooltip_text(g->use_hk, _("account for saturated colors appearing brighter than their\n"
                                            "measured luminance (Helmholtz-Kohlrausch effect)"));
+
+  dt_gui_box_add(main_box, g->box_initial);
+
+  g->box_spektrafilm = self->widget = dt_gui_vbox();
+  g->sf_film = dt_bauhaus_combobox_from_params(self, "sf_film");
+  g->sf_paper = dt_bauhaus_combobox_from_params(self, "sf_paper");
+  gtk_widget_set_tooltip_text(g->sf_paper, _("the paper the selected film was actually calibrated/printed\n"
+                                          "against is marked with a trailing *, but any pairing works"));
+  g->sf_camera_ev = dt_bauhaus_slider_from_params(self, "sf_camera_ev");
+  gtk_widget_set_tooltip_text(g->sf_camera_ev, _("camera exposure compensation, in stops -- the print stage\n"
+                                          "auto-compensates so the film+paper pairing's own midgray stays put"));
+  g->sf_print_exposure = dt_bauhaus_slider_from_params(self, "sf_print_exposure");
+  gtk_widget_set_tooltip_text(g->sf_print_exposure, _("enlarger exposure onto the paper"));
+  g->sf_print_gamma = dt_bauhaus_slider_from_params(self, "sf_print_gamma");
+  gtk_widget_set_tooltip_text(g->sf_print_gamma, _("print contrast (\"punchiness\"): rescales the paper's own\n"
+                                          "fitted density-curve model. 1.0 matches the paper's real response."));
+  g->sf_hanatos_surface = dt_bauhaus_toggle_from_params(self, "sf_hanatos_surface");
+  gtk_widget_set_tooltip_text(g->sf_hanatos_surface,
+                              _("apply this film's own fitted correction to the shared spectral-\n"
+                                "upsampling basis (spektrafilm's Hanatos2025 \"surface\" adaptation,\n"
+                                "off by default upstream too) -- a small additional per-chromaticity\n"
+                                "refinement, most visible on saturated colors"));
+  dt_gui_box_add(main_box, g->box_spektrafilm);
+
+  self->widget = main_box;
+
+  g->dir_couplers_active = dt_bauhaus_toggle_from_params(self, "dir_couplers_active");
+  gtk_widget_set_tooltip_text(g->dir_couplers_active,
+                              _("simulate DIR (development-inhibitor-releasing) coupler crosstalk\n"
+                                "between the R/G/B emulsion layers -- the real film chemistry behind\n"
+                                "color negative/reversal film's characteristic saturation and\n"
+                                "local-contrast response"));
+  g->dir_couplers_amount = dt_bauhaus_slider_from_params(self, "dir_couplers_amount");
+  gtk_widget_set_tooltip_text(g->dir_couplers_amount, _("strength of the dye coupler interaction"));
 }
 
 // modelines: These editor modelines have been set for all relevant files by tools/update_modelines.sh
