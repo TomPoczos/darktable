@@ -49,6 +49,7 @@ typedef struct dt_iop_blackwhite_params_t
 typedef struct dt_iop_blackwhite_gui_data_t
 {
   GtkWidget *filter;
+  GtkWidget *swatch;
   GtkWidget *hue;
   GtkWidget *chroma;
 } dt_iop_blackwhite_gui_data_t;
@@ -281,6 +282,47 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
+// same shape as commit_params' grey[] computation, but clamped to a displayable
+// [0, 1] range instead of normalized to sum=1 -- so the swatch reads as neutral
+// grey at chroma=0 and grows more saturated as chroma increases, the way an
+// actual colored filter would look.
+static void _hue_chroma_to_rgb(const float hue_deg, const float chroma, dt_aligned_pixel_t RGB)
+{
+  const float hue = deg2radf(hue_deg);
+  for(int c = 0; c < 3; c++)
+    RGB[c] = CLAMP(1.f / 3.f + chroma * cosf(hue - c * (2.f * M_PI_F / 3.f)), 0.f, 1.f);
+}
+
+static gboolean _filter_color_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
+{
+  const dt_iop_blackwhite_params_t *p = self->params;
+
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+  int width = allocation.width;
+  int height = allocation.height;
+  cairo_surface_t *cst = dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+  cairo_t *cr = cairo_create(cst);
+
+  const double INNER_PADDING = 4.0;
+  const float margin = 2. * DT_PIXEL_APPLY_DPI(1.5);
+  width -= 2 * INNER_PADDING;
+  height -= 2 * margin;
+
+  dt_aligned_pixel_t RGB = { 0 };
+  _hue_chroma_to_rgb(p->hue, p->chroma, RGB);
+  cairo_set_source_rgb(cr, RGB[0], RGB[1], RGB[2]);
+  cairo_rectangle(cr, INNER_PADDING, margin, width, height);
+  cairo_fill(cr);
+
+  cairo_stroke(cr);
+  cairo_destroy(cr);
+  cairo_set_source_surface(crf, cst, 0, 0);
+  cairo_paint(crf);
+  cairo_surface_destroy(cst);
+  return TRUE;
+}
+
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_blackwhite_params_t *p = self->params;
@@ -288,9 +330,13 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 
   if(!w || w == g->filter)
   {
+    gtk_widget_set_visible(g->swatch, p->filter);
     gtk_widget_set_visible(g->hue, p->filter);
     gtk_widget_set_visible(g->chroma, p->filter);
   }
+
+  if(!w || w == g->hue || w == g->chroma)
+    gtk_widget_queue_draw(g->swatch);
 }
 
 void gui_init(dt_iop_module_t *self)
@@ -304,16 +350,22 @@ void gui_init(dt_iop_module_t *self)
        "lightens tones close to the filter hue, darkens tones far from it,\n"
        "the way red/orange/yellow/green filters work on black & white film."));
 
+  g->swatch = GTK_WIDGET(gtk_drawing_area_new());
+  gtk_widget_set_size_request
+    (g->swatch, 2 * DT_PIXEL_APPLY_DPI(darktable.bauhaus->quad_width),
+     DT_PIXEL_APPLY_DPI(darktable.bauhaus->quad_width));
+  gtk_widget_set_tooltip_text(g->swatch, _("preview of the current filter color"));
+  g_signal_connect(G_OBJECT(g->swatch), "draw", G_CALLBACK(_filter_color_draw), self);
+  dt_gui_box_add(self->widget, g->swatch);
+
   g->hue = dt_bauhaus_slider_from_params(self, "hue");
   dt_bauhaus_slider_set_format(g->hue, "°");
   gtk_widget_set_tooltip_text(g->hue, _("hue of the virtual color filter"));
   for(int i = 0; i <= 6; i++)
   {
     const float stop = i / 6.0f;
-    dt_aligned_pixel_t rgb = { 1.f / 3.f, 1.f / 3.f, 1.f / 3.f, 0.f };
-    const float hue = deg2radf(stop * 360.f);
-    for(int c = 0; c < 3; c++)
-      rgb[c] = CLAMP(1.f / 3.f + (2.f / 3.f) * cosf(hue - c * (2.f * M_PI_F / 3.f)), 0.f, 1.f);
+    dt_aligned_pixel_t rgb = { 0 };
+    _hue_chroma_to_rgb(stop * 360.f, 2.f / 3.f, rgb);
     dt_bauhaus_slider_set_stop(g->hue, stop, rgb[0], rgb[1], rgb[2]);
   }
 
