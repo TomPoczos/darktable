@@ -141,6 +141,7 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {43.0f }, "colorzones", 0},
   { {44.0f }, "lowlight", 0},
   { {45.0f }, "monochrome", 0},
+  { {45.2f }, "blackwhite", 0},
   { {45.3f }, "sigmoid", 0},
   { {45.5f }, "agx", 0},
   { {46.0f }, "filmic", 0},
@@ -257,6 +258,7 @@ const dt_iop_order_entry_t v30_order[] = {
   { {44.0f }, "basecurve", 0},       // conversion from scene-referred to display referred, reverse-engineered
                                   //    on camera JPEG default look
   { {45.0f }, "filmic", 0},          // same, but different (parametric) approach
+  { {45.2f }, "blackwhite", 0},
   { {45.3f }, "sigmoid", 0},
   { {45.5f }, "agx", 0},
   { {46.0f }, "filmicrgb", 0},       // same, upgraded
@@ -377,6 +379,7 @@ const dt_iop_order_entry_t v50_order[] = {
   { {44.0f }, "basecurve", 0},       // conversion from scene-referred to display referred, reverse-engineered
                                   //    on camera JPEG default look
   { {45.0f }, "filmic", 0},          // same, but different (parametric) approach
+  { {45.2f }, "blackwhite", 0},
   { {45.3f }, "sigmoid", 0},
   { {45.5f }, "agx", 0},
   { {46.0f }, "filmicrgb", 0},       // same, upgraded
@@ -499,6 +502,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
                                      //    on camera JPEG default look
   { { 45.0f }, "filmic", 0 },        // same, but different (parametric) approach
   { {45.5f }, "agx", 0},
+  { { 45.2f }, "blackwhite", 0 },
   { { 45.3f }, "sigmoid", 0},
   { { 46.0f }, "filmicrgb", 0 },     // same, upgraded
   { { 36.0f }, "lut3d", 0 },         // apply a creative style or film emulation, possibly non-linear
@@ -621,6 +625,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   { { 44.0f }, "basecurve", 0 },     // conversion from scene-referred to display referred, reverse-engineered
                                      //    on camera JPEG default look
   { { 45.0f }, "filmic", 0 },        // same, but different (parametric) approach
+  { { 45.2f }, "blackwhite", 0 },
   { { 45.3f }, "sigmoid", 0},
   { {45.5f }, "agx", 0},
   { { 46.0f }, "filmicrgb", 0 },     // same, upgraded
@@ -744,6 +749,7 @@ void dt_ioppr_migrate_legacy_iop_order_list(GList *iop_order_list)
   _insert_before(iop_order_list, "colorbalancergb", "colorequal");
   _insert_before(iop_order_list, "highlights", "rasterfile");
   _insert_before(iop_order_list, "colorbalance", "colorharmonizer");
+  _insert_before(iop_order_list, "sigmoid", "blackwhite");
 }
 
 static dt_iop_order_t _ioppr_get_default_iop_order_version(const dt_imgid_t imgid)
