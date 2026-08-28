@@ -55,8 +55,9 @@ typedef struct dt_iop_blackwhite_params_t
   float chroma;           // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "chroma"
   float chroma_contrast;  // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "strength"
   float eye_response;     // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "human vision"
-  // radius in pixels at 1:1, scaled to whatever resolution the pipe runs at
-  float detail_radius;    // $MIN: 1.0 $MAX: 500.0 $DEFAULT: 8.0 $DESCRIPTION: "detail radius"
+  // as a percentage of the image diagonal, so it means the same thing whatever
+  // the camera's resolution and survives being carried across in a preset
+  float detail_radius;    // $MIN: 0.05 $MAX: 10.0 $DEFAULT: 1.0 $DESCRIPTION: "detail radius"
 } dt_iop_blackwhite_params_t;
 
 typedef struct dt_iop_blackwhite_gui_data_t
@@ -194,7 +195,7 @@ void init_presets(dt_iop_module_so_t *self)
 {
   dt_iop_blackwhite_params_t p = { .filter = FALSE, .hue = 0.f, .chroma = 0.f,
                                    .chroma_contrast = 0.f, .eye_response = 0.f,
-                                   .detail_radius = 8.f };
+                                   .detail_radius = 1.f };
   dt_gui_presets_add_generic(_("panchromatic (no filter)"), self->op,
                              self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -371,14 +372,19 @@ void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelp
   piece->data = NULL;
 }
 
-// box radius of the chroma contrast low-pass, scaled from the 1:1 reference
-// radius to whatever resolution this piece of the pipe actually runs at
+// box radius of the chroma contrast low-pass: a percentage of the image
+// diagonal, converted to pixels at whatever resolution this piece of the pipe
+// actually runs at. same convention as soften, so a setting means the same
+// thing on any camera rather than being tied to a pixel count.
 static int _chroma_contrast_radius(const dt_dev_pixelpipe_iop_t *const piece,
                                    const dt_iop_roi_t *const roi)
 {
   const dt_iop_blackwhite_data_t *const d = piece->data;
+  const float w = piece->iwidth * piece->iscale;
+  const float h = piece->iheight * piece->iscale;
+  const float full = dt_fast_hypotf(w, h) * d->detail_radius / 100.f;
   const int radius =
-    MAX(1, (int)ceilf(d->detail_radius * roi->scale / piece->iscale));
+    MAX(1, (int)ceilf(full * roi->scale / piece->iscale));
   // a box filter wider than the image itself buys nothing and only risks
   // upsetting the filter's internal scanline handling
   return MIN(radius, (int)MAX(1, MIN(roi->width, roi->height) / 2));
@@ -487,12 +493,11 @@ static double _axis_variogram(const float *const restrict in,
 static double _axis_correlation_length(const float *const restrict in,
                                        const size_t width,
                                        const size_t height,
-                                       const dt_aligned_pixel_t axis)
+                                       const dt_aligned_pixel_t axis,
+                                       const double variance)
 {
   const size_t max_lag = MAX(1, MIN(width, height) / 4);
 
-  // the ladder always ends exactly on max_lag, so its last entry is a usable
-  // estimate of the plateau however max_lag falls relative to powers of two
   double lags[32], gamma[32];
   int n = 0;
   for(size_t lag = 1; n < 32; lag *= 2)
@@ -504,26 +509,38 @@ static double _axis_correlation_length(const float *const restrict in,
     if(l >= max_lag) break;
   }
 
-  // the plateau has to be read off the variogram itself rather than taken from
-  // the image's total variance. an image whose color drifts across the whole
-  // frame -- a sky gradient, lighting falloff -- never fully decorrelates within
-  // the distances we can sample, so 2*variance is a target that is simply never
-  // reached and every such image falls through to the largest lag. measuring
-  // the crossing against the plateau we did reach always yields an answer, and
-  // yields the same one whenever the field does decorrelate properly.
-  const double sill = gamma[n - 1];
+  if(n < 2 || !(variance > 0.0)) return 0.0;
+
+  // chroma noise is uncorrelated between neighbouring pixels, so it shows up as
+  // a step the variogram already has at the shortest lags -- geostatistics
+  // calls it the nugget. left in, it makes a noisy frame look as though its
+  // color decorrelates within one pixel: measured on a sample of real raws it
+  // reached 80% of the total on the worst of them, collapsing the estimate to
+  // the minimum. extrapolate the first two lags back to h -> 0 and subtract it.
+  const double nugget = fmax(2.0 * gamma[0] - gamma[1], 0.0);
+  const double sill = 2.0 * variance - nugget;
   if(!(sill > 0.0)) return 0.0;
 
-  const double target = 0.5 * sill;
+  // a quarter of the structured variance. the more usual half-decorrelation
+  // point would be a longer, equally valid length, but on real photographs the
+  // variogram frequently has not risen that far within the distances we can
+  // sample -- their color keeps drifting out to frame scale -- and every such
+  // image would fall through to the window edge, which measures our window
+  // rather than the picture. a quarter is reached by essentially all of them.
+  const double target = 0.25 * sill;
+
   for(int i = 0; i < n; i++)
   {
-    if(gamma[i] < target) continue;
+    const double g = fmax(gamma[i] - nugget, 0.0);
+    if(g < target) continue;
     if(i == 0) return lags[0];
 
-    const double t = (target - gamma[i - 1]) / fmax(gamma[i] - gamma[i - 1], 1e-12);
+    const double prev = fmax(gamma[i - 1] - nugget, 0.0);
+    const double t = (target - prev) / fmax(g - prev, 1e-12);
     return lags[i - 1] * pow(lags[i] / lags[i - 1], CLAMP(t, 0.0, 1.0));
   }
 
+  // color structure coarser than anything we can measure here
   return lags[n - 1];
 }
 
@@ -553,7 +570,6 @@ static void _auto_compute(dt_iop_module_t *self,
                           const float *const restrict in,
                           const size_t width,
                           const size_t height,
-                          const float scale,
                           const dt_iop_order_iccprofile_info_t *const work_profile)
 {
   const size_t npixels = width * height;
@@ -670,24 +686,26 @@ static void _auto_compute(dt_iop_module_t *self,
 
     // and how big that leftover color structure is, which is what the detail
     // radius has to match. only worth measuring if there is something there.
-    if(var_blind > 1e-8 * lref * lref && scale > 0.f)
+    if(var_blind > 1e-8 * lref * lref)
     {
       dt_aligned_pixel_t axis;
       _chroma_axis_weights((float)phi, axis);
 
-      const double len = _axis_correlation_length(in, width, height, axis);
+      const double len = _axis_correlation_length(in, width, height, axis, var_blind);
 
-      // calibration, measured on non-periodic random color fields of known
-      // structure size from 2 to 64 px: the returned range tracks the field's
-      // correlation half-length to within a few percent, so a blob spans about
-      // 2*len. dt_box_mean()'s BOX_ITERATIONS passes give an effective sigma of
-      // some 1.63 radii, so 1.5*len puts the low-pass at roughly 1.3 blob
-      // widths -- wide enough that whole patches survive into the local term
-      // rather than just a band along their edges, without drifting so far that
-      // the effect turns global, which is the color filter's job and not this
-      // one's. finally divide out the preview's downscaling to get 1:1 pixels.
+      // both the measured length and the diagonal are in pixels of this same
+      // preview, so their ratio is already the frame-relative quantity the
+      // parameter wants -- no conversion through the pipe's scaling, and hence
+      // no dependence on how large a preview we happened to be handed.
+      //
+      // the 1.5 is the one taste constant here: it sets how far above the
+      // measured structure size the low-pass sits, and so whether whole patches
+      // or only bands along their edges end up in the local term.
       if(len > 0.0)
-        dp->detail_radius = (float)CLAMP(1.5 * len / scale, 2.0, 500.0);
+      {
+        const double diag = hypot((double)width, (double)height);
+        dp->detail_radius = (float)CLAMP(1.5 * 100.0 * len / diag, 0.05, 10.0);
+      }
     }
   }
 
@@ -735,8 +753,7 @@ void process(dt_iop_module_t *self,
       dt_iop_gui_leave_critical_section(self);
 
       if(auto_state == 1)
-        _auto_compute(self, g, in, width, height,
-                      roi_in->scale / piece->iscale, work_profile);
+        _auto_compute(self, g, in, width, height, work_profile);
     }
   }
 
@@ -1040,12 +1057,22 @@ void gui_init(dt_iop_module_t *self)
        "with or without a color filter."));
 
   g->detail_radius = dt_bauhaus_slider_from_params(self, "detail_radius");
-  dt_bauhaus_slider_set_soft_range(g->detail_radius, 2.0, 200.0);
-  dt_bauhaus_slider_set_format(g->detail_radius, " px");
+  // the whole hard range is usable: 8 box passes turn a radius of 10% of the
+  // diagonal into a sigma of about a third of the frame height, which is as
+  // close to a global mean as this is worth taking. auto reaches that ceiling
+  // on any image whose color only decorrelates at frame scale, so dragging has
+  // to be able to get there too. only the very bottom is trimmed.
+  dt_bauhaus_slider_set_soft_range(g->detail_radius, 0.1, 10.0);
+  dt_bauhaus_slider_set_format(g->detail_radius, " %");
+  // the parameter already is a percentage, but a "%" format on a slider whose
+  // hard max is <= 10 makes bauhaus assume a 0..1 fraction and rescale by 100
+  // (and drop two digits), so undo both after setting the format.
+  dt_bauhaus_slider_set_factor(g->detail_radius, 1.0f);
+  dt_bauhaus_slider_set_digits(g->detail_radius, 2);
   gtk_widget_set_tooltip_text
     (g->detail_radius,
-     _("size of the detail chroma contrast works on, in pixels of the full\n"
-       "resolution image. anything coarser than this is left to the sliders\n"
+     _("size of the detail chroma contrast works on, as a percentage of the\n"
+       "image diagonal. anything coarser than this is left to the sliders\n"
        "above: small values separate fine texture, large values whole subjects.\n"
        "auto measures how large this image's patches of color actually are."));
 }
