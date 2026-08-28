@@ -23,7 +23,9 @@
 #include <gtk/gtk.h>
 
 #include "bauhaus/bauhaus.h"
+#include "common/box_filters.h"
 #include "common/imagebuf.h"
+#include "common/iop_profile.h"
 #include "common/math.h"
 #include "common/opencl.h"
 #include "control/control.h"
@@ -31,19 +33,30 @@
 #include "develop/imageop.h"
 #include "develop/imageop_math.h"
 #include "develop/imageop_gui.h"
+#include "develop/tiling.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+
+// gain applied to the local chroma detail before it is added to the grey mix.
+// that detail is a projection of the very same RGB pixel the grey mix is made
+// of, so it carries the same units and this is a plain dimensionless factor --
+// no dependency on exposure or on the working profile's scaling.
+#define BLACKWHITE_CHROMA_CONTRAST_GAIN 0.5f
 
 
 DT_MODULE_INTROSPECTION(1, dt_iop_blackwhite_params_t)
 
 typedef struct dt_iop_blackwhite_params_t
 {
-  gboolean filter; // $DEFAULT: FALSE $DESCRIPTION: "color filter"
-  float hue;       // $MIN: 0.0 $MAX: 360.0 $DEFAULT: 0.0 $DESCRIPTION: "hue"
-  float chroma;    // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "chroma"
+  gboolean filter;        // $DEFAULT: FALSE $DESCRIPTION: "color filter"
+  float hue;              // $MIN: 0.0 $MAX: 360.0 $DEFAULT: 0.0 $DESCRIPTION: "hue"
+  float chroma;           // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "chroma"
+  float chroma_contrast;  // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "strength"
+  float eye_response;     // $MIN: 0.0 $MAX: 2.0 $DEFAULT: 0.0 $DESCRIPTION: "human vision"
+  // radius in pixels at 1:1, scaled to whatever resolution the pipe runs at
+  float detail_radius;    // $MIN: 1.0 $MAX: 500.0 $DEFAULT: 8.0 $DESCRIPTION: "detail radius"
 } dt_iop_blackwhite_params_t;
 
 typedef struct dt_iop_blackwhite_gui_data_t
@@ -52,12 +65,27 @@ typedef struct dt_iop_blackwhite_gui_data_t
   GtkWidget *swatch;
   GtkWidget *hue;
   GtkWidget *chroma;
+  GtkWidget *chroma_contrast;
+  GtkWidget *detail_radius;
+  GtkWidget *eye_response;
+  GtkWidget *auto_button;
+
+  // cross-thread hand-off for the "auto" button: process() fills in auto_params
+  // and flips auto_state to 2 when it sees state 1 on the preview pipe; the
+  // preview-pipe-finished signal handler (GUI thread) then applies auto_params
+  // and resets state to 0. protected by dt_iop_gui_enter/leave_critical_section.
+  int auto_state; // 0: idle, 1: computation requested, 2: result ready to apply
+  dt_iop_blackwhite_params_t auto_params;
 } dt_iop_blackwhite_gui_data_t;
 
 typedef struct dt_iop_blackwhite_data_t
 {
   gboolean filter;
-  dt_aligned_pixel_t grey; // normalized R/G/B mix weights, 4th component always 0
+  float hue;
+  float chroma;
+  float chroma_contrast;
+  float eye_response;
+  float detail_radius;
 } dt_iop_blackwhite_data_t;
 
 typedef struct dt_iop_blackwhite_global_data_t
@@ -164,7 +192,9 @@ static const _bw_filter_preset_t _bw_filter_presets[] = {
 
 void init_presets(dt_iop_module_so_t *self)
 {
-  dt_iop_blackwhite_params_t p = { .filter = FALSE, .hue = 0.f, .chroma = 0.f };
+  dt_iop_blackwhite_params_t p = { .filter = FALSE, .hue = 0.f, .chroma = 0.f,
+                                   .chroma_contrast = 0.f, .eye_response = 0.f,
+                                   .detail_radius = 8.f };
   dt_gui_presets_add_generic(_("panchromatic (no filter)"), self->op,
                              self->version(), &p, sizeof(p), TRUE, DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -188,21 +218,146 @@ void commit_params(dt_iop_module_t *self,
   dt_iop_blackwhite_data_t *d = piece->data;
 
   d->filter = p->filter;
+  d->hue = p->hue;
+  d->chroma = p->chroma;
+  d->chroma_contrast = p->chroma_contrast;
+  d->eye_response = p->eye_response;
+  d->detail_radius = p->detail_radius;
 
-  dt_aligned_pixel_t grey = { 1.f / 3.f, 1.f / 3.f, 1.f / 3.f, 0.f };
-  if(p->filter)
+  // the chroma contrast pass needs a neighborhood that only the CPU path
+  // implements, so don't let the pipe try OpenCL for it in the first place
+  // (returning an error from process_cl would work too, but only after
+  // needlessly shuffling the buffers to the GPU and back).
+  if(d->chroma_contrast > 0.f)
+    piece->process_cl_ready = FALSE;
+}
+
+// R/G/B weights of a color filter of the given hue in our R=0/G=120/B=240
+// model, without the 1/3 pedestal. these sum to exactly zero, so applied on
+// their own they extract a pure chrominance signal: any neutral pixel, at any
+// brightness, projects to 0.
+static inline void _chroma_axis_weights(const float hue_rad, dt_aligned_pixel_t axis)
+{
+  for(int c = 0; c < 3; c++)
+    axis[c] = cosf(hue_rad - c * (2.f * M_PI_F / 3.f));
+  axis[3] = 0.f;
+}
+
+// the eye's photopic luminance sensitivity, i.e. the Y row of the working
+// profile's RGB->XYZ matrix (matrix_in[1]) -- the same construction Rec.709
+// "luma" comes from, evaluated for whatever profile the pipe actually runs in.
+// renormalized to sum to 1 so it stays a pure re-weighting of the panchromatic
+// mix and never changes overall brightness; falls back to a flat average for
+// profiles without a usable matrix.
+static void _luminance_weights(const dt_iop_order_iccprofile_info_t *const work_profile,
+                               dt_aligned_pixel_t lum)
+{
+  lum[0] = lum[1] = lum[2] = 1.f / 3.f;
+  lum[3] = 0.f;
+
+  if(!work_profile) return;
+
+  const float sum = work_profile->matrix_in[1][0]
+                  + work_profile->matrix_in[1][1]
+                  + work_profile->matrix_in[1][2];
+  if(!isfinite(sum) || sum < 0.1f) return;
+
+  for(int c = 0; c < 3; c++)
+    lum[c] = work_profile->matrix_in[1][c] / sum;
+}
+
+// the base panchromatic response (flat 1/3, 1/3, 1/3) blended toward the eye's
+// actual photopic luminance sensitivity, then perturbed by the color filter on
+// top of that -- so filter presets stay layerable regardless of how much "human
+// vision" weighting is dialed in.
+//
+// both perturbations are sum-preserving by construction (the luminance weights
+// are renormalized to 1, the filter weights sum to 0), so the mix always maps a
+// neutral input to itself; the final normalization is only a guard against a
+// degenerate profile.
+static void _compute_grey_mix(const dt_iop_blackwhite_data_t *const d,
+                              const dt_iop_order_iccprofile_info_t *const work_profile,
+                              dt_aligned_pixel_t grey)
+{
+  grey[0] = grey[1] = grey[2] = 1.f / 3.f;
+  grey[3] = 0.f;
+
+  if(d->eye_response > 0.f)
   {
-    const float hue = deg2radf(p->hue);
-    const float chroma = p->chroma;
+    dt_aligned_pixel_t lum;
+    _luminance_weights(work_profile, lum);
     for(int c = 0; c < 3; c++)
-      grey[c] = 1.f / 3.f + chroma * cosf(hue - c * (2.f * M_PI_F / 3.f));
+      grey[c] += d->eye_response * (lum[c] - grey[c]);
   }
 
-  float norm = grey[0] + grey[1] + grey[2];
-  if(norm == 0.f) norm = 1.f;
+  if(d->filter)
+  {
+    dt_aligned_pixel_t axis;
+    _chroma_axis_weights(deg2radf(d->hue), axis);
+    for(int c = 0; c < 3; c++)
+      grey[c] += d->chroma * axis[c];
+  }
 
-  for(int c = 0; c < 3; c++) d->grey[c] = grey[c] / norm;
-  d->grey[3] = 0.f;
+  const float norm = grey[0] + grey[1] + grey[2];
+  if(isfinite(norm) && fabsf(norm - 1.f) > 1e-6f && fabsf(norm) > 1e-6f)
+  {
+    for(int c = 0; c < 3; c++) grey[c] /= norm;
+  }
+}
+
+// the color direction a grey conversion is mathematically blind to.
+//
+// a mix is a set of weights w with sum(w) == 1. feed it a pure chrominance
+// difference d -- a color difference with sum(d) == 0 -- and it returns
+// sum(w*d), which in the (x, y) chroma plane of our R=0/G=120/B=240 model is
+// the linear functional
+//
+//     sum_c w[c]*d[c] = (2/3) * (x*G_x + y*G_y),
+//     G_x = (3*w[0] - 1)/2,   G_y = (sqrt(3)/2) * (w[1] - w[2])
+//
+// so the mix responds only to the component along G, and maps *every* color
+// difference perpendicular to G to exactly zero. that perpendicular is what
+// chroma contrast has to work on. it follows from the colorimetry alone: no
+// user setting, no image statistic, no measurement pass.
+//
+// G is taken from the eye's own luminance response, rotated by the color filter
+// when one is active -- never from the module's actual mix. a flat 1/3 average
+// is a technical default rather than a model of vision, and being blind to the
+// whole chroma plane it expresses no preference at all; "which color
+// differences look different but render the same" is a perceptual question, so
+// photopic luminance is what answers it. that also means the axis is always
+// well defined, whatever the filter and human vision sliders are set to.
+//
+// of the two perpendicular directions we take the warmer one, so a patch warmer
+// than its surroundings renders lighter. that agrees both with the classic
+// red/orange filter look and with the Helmholtz-Kohlrausch effect, which makes
+// reds read lighter than their luminance while cyans stay put.
+static float _blind_axis_hue(const dt_iop_blackwhite_data_t *const d,
+                             const dt_iop_order_iccprofile_info_t *const work_profile)
+{
+  dt_aligned_pixel_t w;
+  _luminance_weights(work_profile, w);
+
+  // a profile we could not read luminance weights from leaves a flat average,
+  // which has no gradient to rotate -- fall back on Rec.709
+  if(fabsf(w[0] - w[1]) < 1e-6f && fabsf(w[1] - w[2]) < 1e-6f)
+  {
+    w[0] = 0.2126f;
+    w[1] = 0.7152f;
+    w[2] = 0.0722f;
+  }
+
+  if(d->filter)
+  {
+    dt_aligned_pixel_t f;
+    _chroma_axis_weights(deg2radf(d->hue), f);
+    for(int c = 0; c < 3; c++) w[c] += d->chroma * f[c];
+  }
+
+  const float gx = 0.5f * (3.f * w[0] - 1.f);
+  const float gy = 0.5f * sqrtf(3.f) * (w[1] - w[2]);
+
+  return atan2f(gy, gx) - M_PI_F / 2.f;
 }
 
 void init_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelpipe_iop_t *piece)
@@ -214,6 +369,332 @@ void cleanup_pipe(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe, dt_dev_pixelp
 {
   free(piece->data);
   piece->data = NULL;
+}
+
+// box radius of the chroma contrast low-pass, scaled from the 1:1 reference
+// radius to whatever resolution this piece of the pipe actually runs at
+static int _chroma_contrast_radius(const dt_dev_pixelpipe_iop_t *const piece,
+                                   const dt_iop_roi_t *const roi)
+{
+  const dt_iop_blackwhite_data_t *const d = piece->data;
+  const int radius =
+    MAX(1, (int)ceilf(d->detail_radius * roi->scale / piece->iscale));
+  // a box filter wider than the image itself buys nothing and only risks
+  // upsetting the filter's internal scanline handling
+  return MIN(radius, (int)MAX(1, MIN(roi->width, roi->height) / 2));
+}
+
+void tiling_callback(dt_iop_module_t *self,
+                     dt_dev_pixelpipe_iop_t *piece,
+                     const dt_iop_roi_t *roi_in,
+                     const dt_iop_roi_t *roi_out,
+                     dt_develop_tiling_t *tiling)
+{
+  const dt_iop_blackwhite_data_t *const d = piece->data;
+
+  int overlap = 0;
+  if(d->chroma_contrast > 0.f)
+  {
+    // dt_box_mean() applies BOX_ITERATIONS box passes, so a tile has to carry
+    // far more context than one radius: use the same box-to-gaussian
+    // equivalence the other box_mean users (highpass, soften) rely on.
+    const int radius = _chroma_contrast_radius(piece, roi_in);
+    const float sigma = sqrtf((radius * (radius + 1) * BOX_ITERATIONS + 2) / 3.0f);
+    overlap = (int)ceilf(3.0f * sigma);
+  }
+
+  tiling->factor = 2.0f + 0.25f + 0.05f; // in + out + detail buffer + slice for dt_box_mean
+  tiling->factor_cl = 2.0f; // OpenCL only ever runs the plain mix (see commit_params)
+  tiling->maxbuf = 1.0f;
+  tiling->overhead = 0;
+  tiling->overlap = overlap;
+  tiling->align = 1;
+}
+
+// mean squared difference of the blind-axis projection between pairs of pixels
+// a given distance apart, averaged over the horizontal and vertical directions.
+// note the projection weights sum to zero, so constant offsets drop out and
+// this measures purely how much the *color* changes over that distance.
+static double _axis_variogram(const float *const restrict in,
+                              const size_t width,
+                              const size_t height,
+                              const dt_aligned_pixel_t axis,
+                              const size_t lag)
+{
+  double sum = 0.0;
+  size_t count = 0;
+
+  if(width > lag)
+  {
+    double hsum = 0.0;
+    DT_OMP_FOR(reduction(+ : hsum))
+    for(size_t j = 0; j < height; j++)
+    {
+      const float *const row = in + 4 * j * width;
+      for(size_t i = 0; i + lag < width; i++)
+      {
+        const float *const a = row + 4 * i;
+        const float *const b = row + 4 * (i + lag);
+        const float d = (b[0] - a[0]) * axis[0]
+                      + (b[1] - a[1]) * axis[1]
+                      + (b[2] - a[2]) * axis[2];
+        hsum += (double)d * d;
+      }
+    }
+    sum += hsum;
+    count += height * (width - lag);
+  }
+
+  if(height > lag)
+  {
+    double vsum = 0.0;
+    const size_t rows = height - lag; // OpenMP needs a loop-invariant bound
+    DT_OMP_FOR(reduction(+ : vsum))
+    for(size_t j = 0; j < rows; j++)
+    {
+      const float *const ra = in + 4 * j * width;
+      const float *const rb = in + 4 * (j + lag) * width;
+      for(size_t i = 0; i < width; i++)
+      {
+        const float *const a = ra + 4 * i;
+        const float *const b = rb + 4 * i;
+        const float d = (b[0] - a[0]) * axis[0]
+                      + (b[1] - a[1]) * axis[1]
+                      + (b[2] - a[2]) * axis[2];
+        vsum += (double)d * d;
+      }
+    }
+    sum += vsum;
+    count += (height - lag) * width;
+  }
+
+  return count ? sum / (double)count : 0.0;
+}
+
+// characteristic size of the image's color structure along the blind axis --
+// measured, not assumed.
+//
+// for a field of variance s2, the mean squared difference between two points a
+// distance h apart is 2*s2*(1 - rho(h)): zero at h = 0, rising to a 2*s2
+// plateau once the two points are far enough apart to be uncorrelated. the
+// distance at which it first reaches s2 is therefore where correlation has
+// dropped to one half -- the "range" of the variogram, and a well defined
+// length scale for how large this image's patches of color actually are.
+//
+// sampled on a geometric ladder and interpolated in log space. returns a length
+// in pixels of the buffer it was measured on, or 0 if there was nothing to
+// measure.
+static double _axis_correlation_length(const float *const restrict in,
+                                       const size_t width,
+                                       const size_t height,
+                                       const dt_aligned_pixel_t axis)
+{
+  const size_t max_lag = MAX(1, MIN(width, height) / 4);
+
+  // the ladder always ends exactly on max_lag, so its last entry is a usable
+  // estimate of the plateau however max_lag falls relative to powers of two
+  double lags[32], gamma[32];
+  int n = 0;
+  for(size_t lag = 1; n < 32; lag *= 2)
+  {
+    const size_t l = MIN(lag, max_lag);
+    lags[n] = (double)l;
+    gamma[n] = _axis_variogram(in, width, height, axis, l);
+    n++;
+    if(l >= max_lag) break;
+  }
+
+  // the plateau has to be read off the variogram itself rather than taken from
+  // the image's total variance. an image whose color drifts across the whole
+  // frame -- a sky gradient, lighting falloff -- never fully decorrelates within
+  // the distances we can sample, so 2*variance is a target that is simply never
+  // reached and every such image falls through to the largest lag. measuring
+  // the crossing against the plateau we did reach always yields an answer, and
+  // yields the same one whenever the field does decorrelate properly.
+  const double sill = gamma[n - 1];
+  if(!(sill > 0.0)) return 0.0;
+
+  const double target = 0.5 * sill;
+  for(int i = 0; i < n; i++)
+  {
+    if(gamma[i] < target) continue;
+    if(i == 0) return lags[0];
+
+    const double t = (target - gamma[i - 1]) / fmax(gamma[i] - gamma[i - 1], 1e-12);
+    return lags[i - 1] * pow(lags[i] / lags[i - 1], CLAMP(t, 0.0, 1.0));
+  }
+
+  return lags[n - 1];
+}
+
+// analyze the image's per-pixel chrominance and pick the (filter) hue/chroma
+// that maximizes tonal separation, plus a chroma_contrast setting for whatever
+// separation no single global hue can capture.
+//
+// per pixel, project the RGB deviation from its own mean onto the same
+// (cos, sin) basis the hue/chroma filter model uses for R/G/B at 0/120/240
+// degrees, giving a 2D chrominance vector (x, y). with the filter switched on
+// the output is exactly luminance + chroma * <(x, y), (cos hue, sin hue)>, so
+// the hue that adds the most tonal variation is the leading eigenvector of the
+// *covariance* matrix of the (x, y) distribution -- a small, classic PCA
+// problem (it has to be the covariance, not the raw second moments: an overall
+// color cast is a constant offset of (x, y) and carries no separation at all,
+// yet would dominate uncentered moments and drag the axis towards itself).
+//
+// once the filter is settled, the mix it produces has a definite blind
+// direction (see _blind_axis_hue()). the color variance that falls on *that*
+// axis, relative to the dominant one, is what chroma_contrast has to work with,
+// and sets its suggested strength.
+//
+// every quantity derived below is a ratio of same-unit values, so the result
+// does not change if the image is scaled (i.e. exposed) differently.
+static void _auto_compute(dt_iop_module_t *self,
+                          dt_iop_blackwhite_gui_data_t *g,
+                          const float *const restrict in,
+                          const size_t width,
+                          const size_t height,
+                          const float scale,
+                          const dt_iop_order_iccprofile_info_t *const work_profile)
+{
+  const size_t npixels = width * height;
+  dt_aligned_pixel_t lum;
+  _luminance_weights(work_profile, lum);
+
+  const float cos120 = cosf(2.f * M_PI_F / 3.f);
+  const float sin120 = sinf(2.f * M_PI_F / 3.f);
+  const float cos240 = cosf(4.f * M_PI_F / 3.f);
+  const float sin240 = sinf(4.f * M_PI_F / 3.f);
+
+  double sl = 0.0, sx = 0.0, sy = 0.0;
+  double sxx = 0.0, syy = 0.0, sxy = 0.0;
+  double slx = 0.0, sly = 0.0;
+
+  DT_OMP_FOR(reduction(+ : sl, sx, sy, sxx, syy, sxy, slx, sly))
+  for(size_t k = 0; k < npixels; k++)
+  {
+    const float *const px = in + 4 * k;
+    const float lgt = px[0] * lum[0] + px[1] * lum[1] + px[2] * lum[2];
+    const float mean = (px[0] + px[1] + px[2]) / 3.f;
+    const float dR = px[0] - mean;
+    const float dG = px[1] - mean;
+    const float dB = px[2] - mean;
+
+    const float x = dR + dG * cos120 + dB * cos240;
+    const float y = dG * sin120 + dB * sin240;
+
+    sl += lgt;
+    sx += x;
+    sy += y;
+    sxx += (double)x * x;
+    syy += (double)y * y;
+    sxy += (double)x * y;
+    slx += (double)lgt * x;
+    sly += (double)lgt * y;
+  }
+
+  // auto_params was seeded with the current settings by _auto_callback(), so
+  // anything not derived below (notably the detail radius, which is a matter of
+  // taste and subject size rather than something measurable) is left alone.
+  dt_iop_blackwhite_params_t *dp = &g->auto_params;
+  dp->filter = FALSE;
+  dp->hue = 0.f;
+  dp->chroma = 0.f;
+  dp->chroma_contrast = 0.f;
+  // unlike the other three, this isn't derived from image content -- there's no
+  // per-image "optimal" amount of human vision weighting, it's simply never
+  // worse than a flat R/G/B average, so auto always turns it fully on.
+  dp->eye_response = 1.f;
+
+  if(npixels == 0) goto done;
+
+  {
+    const double n = (double)npixels;
+    const double ml = sl / n, mx = sx / n, my = sy / n;
+    // centered second moments: the covariance of the chrominance distribution
+    const double cxx = fmax(sxx / n - mx * mx, 0.0);
+    const double cyy = fmax(syy / n - my * my, 0.0);
+    const double cxy = sxy / n - mx * my;
+    // covariance of each chrominance axis with luminance, used to resolve the
+    // eigenvector's sign below
+    const double clx = slx / n - ml * mx;
+    const double cly = sly / n - ml * my;
+
+    const double avg = 0.5 * (cxx + cyy);
+    const double spread = hypot(0.5 * (cxx - cyy), cxy);
+    const double var_major = avg + spread;
+
+    // the only scale reference we have: the image's own luminance level. all
+    // comparisons are made against it so nothing depends on absolute exposure.
+    const double lref = fmax(ml, 1e-6);
+
+    // essentially neutral image: no hue can separate anything, leave the filter off
+    if(var_major <= 1e-8 * lref * lref) goto done;
+
+    double theta = 0.5 * atan2(2.0 * cxy, cxx - cyy);
+    // an eigenvector is only defined up to a 180 degree flip, and the two
+    // choices are *not* equivalent: the filtered result is luminance +
+    // chroma * projection, so the sign that correlates positively with
+    // luminance both maximizes the output's total variance and keeps the
+    // natural tonal ordering (whatever was brighter stays brighter) instead of
+    // inverting it.
+    if(clx * cos(theta) + cly * sin(theta) < 0.0) theta += M_PI;
+
+    double hue_deg = fmod(theta * 180.0 / M_PI, 360.0);
+    if(hue_deg < 0.0) hue_deg += 360.0;
+
+    const double sigma_major = sqrt(var_major);
+
+    dp->filter = TRUE;
+    dp->hue = (float)hue_deg;
+    // the filter adds chroma * projection on top of the luminance. pick the
+    // strength so that added swing stays a fixed fraction of the image's own
+    // luminance level -- strong enough to separate, gentle enough not to push
+    // large areas through the black clip. a strongly colored image therefore
+    // needs less filter than a nearly neutral one. clamped to the range the
+    // real Wratten filters above span.
+    dp->chroma = (float)CLAMP(0.5 * lref / sigma_major, 0.15, 0.6);
+
+    // now that the filter is decided, the mix it produces has a definite blind
+    // direction; measure how much of the image's color variation actually falls
+    // on it, relative to the dominant one, and suggest that as the strength.
+    // zero when there is nothing the mix cannot already see.
+    dt_iop_blackwhite_data_t mix = { .filter = dp->filter,
+                                     .hue = dp->hue,
+                                     .chroma = dp->chroma };
+    const double phi = _blind_axis_hue(&mix, work_profile);
+    const double cp = cos(phi), sp = sin(phi);
+    const double var_blind =
+      fmax(cxx * cp * cp + 2.0 * cxy * cp * sp + cyy * sp * sp, 0.0);
+
+    dp->chroma_contrast = (float)CLAMP(sqrt(var_blind) / sigma_major, 0.0, 1.0);
+
+    // and how big that leftover color structure is, which is what the detail
+    // radius has to match. only worth measuring if there is something there.
+    if(var_blind > 1e-8 * lref * lref && scale > 0.f)
+    {
+      dt_aligned_pixel_t axis;
+      _chroma_axis_weights((float)phi, axis);
+
+      const double len = _axis_correlation_length(in, width, height, axis);
+
+      // calibration, measured on non-periodic random color fields of known
+      // structure size from 2 to 64 px: the returned range tracks the field's
+      // correlation half-length to within a few percent, so a blob spans about
+      // 2*len. dt_box_mean()'s BOX_ITERATIONS passes give an effective sigma of
+      // some 1.63 radii, so 1.5*len puts the low-pass at roughly 1.3 blob
+      // widths -- wide enough that whole patches survive into the local term
+      // rather than just a band along their edges, without drifting so far that
+      // the effect turns global, which is the color filter's job and not this
+      // one's. finally divide out the preview's downscaling to get 1:1 pixels.
+      if(len > 0.0)
+        dp->detail_radius = (float)CLAMP(1.5 * len / scale, 2.0, 500.0);
+    }
+  }
+
+done:
+  dt_iop_gui_enter_critical_section(self);
+  g->auto_state = 2;
+  dt_iop_gui_leave_critical_section(self);
 }
 
 void process(dt_iop_module_t *self,
@@ -228,20 +709,105 @@ void process(dt_iop_module_t *self,
     return;
 
   const dt_iop_blackwhite_data_t *const d = piece->data;
-  const size_t npixels = (size_t)roi_out->width * roi_out->height;
+  const size_t width = roi_out->width;
+  const size_t height = roi_out->height;
+  const size_t npixels = width * height;
   const float *const restrict in = (const float *const)ivoid;
   float *const restrict out = (float *const)ovoid;
-  const dt_aligned_pixel_t grey = { d->grey[0], d->grey[1], d->grey[2], d->grey[3] };
+
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  dt_aligned_pixel_t grey;
+  _compute_grey_mix(d, work_profile, grey);
+
+  // the auto analysis needs to see the whole image at once, so skip it while
+  // the pipe hands us one tile at a time -- the request simply stays pending
+  // and is served by the next untiled preview run.
+  if(self->dev->gui_attached
+     && dt_pipe_is_preview(piece->pipe)
+     && !piece->pipe->tiling)
+  {
+    dt_iop_blackwhite_gui_data_t *g = self->gui_data;
+    if(g)
+    {
+      dt_iop_gui_enter_critical_section(self);
+      const int auto_state = g->auto_state;
+      dt_iop_gui_leave_critical_section(self);
+
+      if(auto_state == 1)
+        _auto_compute(self, g, in, width, height,
+                      roi_in->scale / piece->iscale, work_profile);
+    }
+  }
+
+  // chroma contrast: put back the color contrast the conversion is blind to.
+  // _blind_axis_hue() gives the one chroma direction that maps to exactly zero
+  // change in grey, so two regions differing only along it collapse onto the
+  // same shade no matter how the mix is set up.
+  //
+  // only the local part of that projection is added. its low-frequency part is
+  // not new information -- adding it globally is arithmetically the same as
+  // changing the mix weights, which is what the chroma and human vision sliders
+  // already do -- so the radius is precisely the boundary between what the
+  // global mix handles and what is left for the local term.
+  //
+  // this is a cheap, tileable stand-in for the goal of the Color2Gray/Decolorize
+  // family rather than an implementation of either -- those need a global solve
+  // or a considerably more elaborate perceptual pipeline.
+  float *detail = NULL;
+  gboolean local_pass = d->chroma_contrast > 0.f;
+  if(local_pass
+     && !dt_iop_alloc_image_buffers(self, roi_in, roi_out, 1, &detail, 0, NULL))
+  {
+    // out of memory: still deliver a correct black & white image, just without
+    // the local refinement
+    local_pass = FALSE;
+  }
+
+  if(!local_pass)
+  {
+    DT_OMP_FOR()
+    for(size_t k = 0; k < npixels; k++)
+    {
+      const float *const px = in + 4 * k;
+      float *const o = out + 4 * k;
+      const float grey_mix = fmaxf(px[0] * grey[0] + px[1] * grey[1] + px[2] * grey[2], 0.f);
+      o[0] = o[1] = o[2] = grey_mix;
+      o[3] = px[3];
+    }
+    return;
+  }
+
+  dt_aligned_pixel_t axis;
+  _chroma_axis_weights(_blind_axis_hue(d, work_profile), axis);
 
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
     const float *const px = in + 4 * k;
+    detail[k] = px[0] * axis[0] + px[1] * axis[1] + px[2] * axis[2];
+  }
+
+  // low-pass in place: 'detail' now holds the part of that projection which is
+  // redundant with the hue choice, and gets subtracted below
+  dt_box_mean(detail, height, width, 1, _chroma_contrast_radius(piece, roi_in), BOX_ITERATIONS);
+
+  const float strength = d->chroma_contrast * BLACKWHITE_CHROMA_CONTRAST_GAIN;
+
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npixels; k++)
+  {
+    const float *const px = in + 4 * k;
+    const float grey_mix = px[0] * grey[0] + px[1] * grey[1] + px[2] * grey[2];
+    const float projection = px[0] * axis[0] + px[1] * axis[1] + px[2] * axis[2];
+
     float *const o = out + 4 * k;
-    const float grey_mix = fmaxf(px[0] * grey[0] + px[1] * grey[1] + px[2] * grey[2], 0.f);
-    o[0] = o[1] = o[2] = grey_mix;
+    const float value = fmaxf(grey_mix + strength * (projection - detail[k]), 0.f);
+    o[0] = o[1] = o[2] = value;
     o[3] = px[3];
   }
+
+  dt_free_align(detail);
 }
 
 #ifdef HAVE_OPENCL
@@ -255,11 +821,19 @@ int process_cl(dt_iop_module_t *self,
   const dt_iop_blackwhite_data_t *const d = piece->data;
   dt_iop_blackwhite_global_data_t *gd = self->global_data;
 
+  // commit_params() already clears process_cl_ready in that case; belt and
+  // braces, since only the CPU path implements the local neighborhood pass
+  if(d->chroma_contrast > 0.f)
+    return DT_OPENCL_PROCESS_CL;
+
   const int devid = piece->pipe->devid;
   const int width = roi_in->width;
   const int height = roi_in->height;
 
-  const dt_aligned_pixel_t grey = { d->grey[0], d->grey[1], d->grey[2], d->grey[3] };
+  const dt_iop_order_iccprofile_info_t *const work_profile =
+    dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+  dt_aligned_pixel_t grey;
+  _compute_grey_mix(d, work_profile, grey);
 
   return dt_opencl_enqueue_kernel_2d_args(devid, gd->kernel_blackwhite, width, height,
     CLARG(dev_in), CLARG(dev_out), CLARG(width), CLARG(height), CLARG(grey));
@@ -282,7 +856,7 @@ void cleanup_global(dt_iop_module_so_t *self)
   self->data = NULL;
 }
 
-// same shape as commit_params' grey[] computation, but clamped to a displayable
+// same shape as _compute_grey_mix()'s filter term, but clamped to a displayable
 // [0, 1] range instead of normalized to sum=1 -- so the swatch reads as neutral
 // grey at chroma=0 and grows more saturated as chroma increases, the way an
 // actual colored filter would look.
@@ -323,6 +897,56 @@ static gboolean _filter_color_draw(GtkWidget *widget, cairo_t *crf, dt_iop_modul
   return TRUE;
 }
 
+static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *self)
+{
+  dt_iop_blackwhite_gui_data_t *g = self->gui_data;
+  if(!g) return;
+
+  dt_iop_gui_enter_critical_section(self);
+  const int state = g->auto_state;
+  dt_iop_gui_leave_critical_section(self);
+  if(state != 2) return;
+
+  dt_iop_gui_enter_critical_section(self);
+  const dt_iop_blackwhite_params_t dp = g->auto_params;
+  g->auto_state = 0;
+  dt_iop_gui_leave_critical_section(self);
+
+  // write directly into params and commit *before* refreshing the widgets:
+  // a bound bauhaus widget set while DT_ENTER/LEAVE_GUI_UPDATE is active only
+  // moves on screen, it deliberately skips writing the value back into params
+  // (that's the guard's whole point, it normally runs the other way around --
+  // syncing widgets to params that already changed). so the refresh below is
+  // purely cosmetic; the param write and the history commit have to happen here.
+  dt_iop_blackwhite_params_t *p = self->params;
+  *p = dp;
+
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+
+  dt_iop_gui_update(self); // pulls every bound widget back from params
+  gui_changed(self, NULL, NULL); // refresh swatch visibility/redraw for the new filter state
+}
+
+static void _auto_callback(GtkButton *button, dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+
+  dt_iop_blackwhite_gui_data_t *g = self->gui_data;
+
+  dt_iop_request_focus(self);
+  if(self->off && !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(self->off)))
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), TRUE);
+
+  dt_iop_gui_enter_critical_section(self);
+  // seed with the current settings so the analysis only has to overwrite what
+  // it actually derives, and leaves the rest untouched
+  g->auto_params = *(const dt_iop_blackwhite_params_t *)self->params;
+  g->auto_state = 1;
+  dt_iop_gui_leave_critical_section(self);
+
+  dt_dev_reprocess_preview(self->dev, self->iop_order);
+}
+
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_blackwhite_params_t *p = self->params;
@@ -343,6 +967,32 @@ void gui_init(dt_iop_module_t *self)
 {
   dt_iop_blackwhite_gui_data_t *g = IOP_GUI_ALLOC(blackwhite);
 
+  g->auto_state = 0;
+
+  // self->widget is lazily created as a vbox by the first dt_bauhaus_*_from_params
+  // call; the auto button is added before any of those, so it has to make sure
+  // that's happened first instead of handing dt_gui_box_add a NULL container.
+  if(!self->widget) self->widget = dt_gui_vbox();
+
+  g->auto_button = dt_action_button_new
+    (NULL, N_("auto"), _auto_callback, self,
+     _("analyze the image: pick the filter hue and chroma that maximize tonal\n"
+       "separation, measure how much color contrast is left over and at what\n"
+       "size, and switch on human vision weighting"), 0, 0);
+  gtk_widget_set_size_request(g->auto_button, -1, DT_PIXEL_APPLY_DPI(24));
+  dt_gui_box_add(self->widget, g->auto_button);
+
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _preview_pipe_finished_callback);
+
+  g->eye_response = dt_bauhaus_slider_from_params(self, "eye_response");
+  dt_bauhaus_slider_set_soft_range(g->eye_response, 0.0, 1.0);
+  gtk_widget_set_tooltip_text
+    (g->eye_response,
+     _("blend the base panchromatic mix toward the eye's actual color sensitivity\n"
+       "(the human eye is far more sensitive to green than to red or blue) instead\n"
+       "of a flat, equal-parts average of red, green and blue.\n"
+       "any color filter below is applied on top of this."));
+
   g->filter = dt_bauhaus_toggle_from_params(self, "filter");
   gtk_widget_set_tooltip_text
     (g->filter,
@@ -360,7 +1010,11 @@ void gui_init(dt_iop_module_t *self)
 
   g->hue = dt_bauhaus_slider_from_params(self, "hue");
   dt_bauhaus_slider_set_format(g->hue, "°");
-  gtk_widget_set_tooltip_text(g->hue, _("hue of the virtual color filter"));
+  gtk_widget_set_tooltip_text
+    (g->hue,
+     _("hue of the virtual color filter.\n"
+       "it also selects the color axis used by chroma contrast below,\n"
+       "which works on the colors perpendicular to this hue."));
   for(int i = 0; i <= 6; i++)
   {
     const float stop = i / 6.0f;
@@ -372,6 +1026,28 @@ void gui_init(dt_iop_module_t *self)
   g->chroma = dt_bauhaus_slider_from_params(self, "chroma");
   dt_bauhaus_slider_set_soft_range(g->chroma, 0.0, 1.0);
   gtk_widget_set_tooltip_text(g->chroma, _("strength of the virtual color filter"));
+
+  dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "chroma contrast")));
+
+  g->chroma_contrast = dt_bauhaus_slider_from_params(self, "chroma_contrast");
+  dt_bauhaus_slider_set_soft_range(g->chroma_contrast, 0.0, 1.0);
+  gtk_widget_set_tooltip_text
+    (g->chroma_contrast,
+     _("restore local contrast between colors that any black & white conversion\n"
+       "renders as the same shade -- keeps differently colored subjects of equal\n"
+       "lightness from blending together.\n"
+       "the colors it acts on follow from the conversion itself, so this works\n"
+       "with or without a color filter."));
+
+  g->detail_radius = dt_bauhaus_slider_from_params(self, "detail_radius");
+  dt_bauhaus_slider_set_soft_range(g->detail_radius, 2.0, 200.0);
+  dt_bauhaus_slider_set_format(g->detail_radius, " px");
+  gtk_widget_set_tooltip_text
+    (g->detail_radius,
+     _("size of the detail chroma contrast works on, in pixels of the full\n"
+       "resolution image. anything coarser than this is left to the sliders\n"
+       "above: small values separate fine texture, large values whole subjects.\n"
+       "auto measures how large this image's patches of color actually are."));
 }
 
 // clang-format off
