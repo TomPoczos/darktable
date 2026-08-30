@@ -144,6 +144,19 @@ typedef struct _bw_filter_preset_t
 // compute_channel_multipliers() in the reference generator at
 // ~/Pictures/LUTs/wratten filters/filters.py) onto our grey[c] = 1/3 +
 // chroma*cos(hue - hue_c) model -- not hand-guessed.
+//
+// the fit was made in sRGB primaries, which is precisely what this module's
+// reference space is (see _work_to_reference()), so these numbers are always
+// read in the space they were made in, whatever working profile the pipe runs.
+// a wider working space needs no refit either: weight triples summing to 1 are
+// a two-parameter family and (hue, chroma) covers all of them, so the fitted
+// mix is carried over exactly rather than approximated.
+//
+// the D65 here is the illuminant the transmission was integrated against -- a
+// property of the modeled filter ("what a Wratten 25 does to a daylight-lit
+// scene"), not of the pipe, and unrelated to the D50 connection space the
+// weights are transported through below. the weights are normalized to sum 1
+// in any case, so the illuminant only tilts their relative distribution.
 static const _bw_filter_preset_t _bw_filter_presets[] = {
   { N_("Wratten 3 light yellow"),        62.8f, 0.183f },
   { N_("Wratten 8 yellow"),              57.7f, 0.300f },
@@ -244,27 +257,82 @@ static inline void _chroma_axis_weights(const float hue_rad, dt_aligned_pixel_t 
   axis[3] = 0.f;
 }
 
-// the eye's photopic luminance sensitivity, i.e. the Y row of the working
-// profile's RGB->XYZ matrix (matrix_in[1]) -- the same construction Rec.709
-// "luma" comes from, evaluated for whatever profile the pipe actually runs in.
-// renormalized to sum to 1 so it stays a pure re-weighting of the panchromatic
-// mix and never changes overall brightness; falls back to a flat average for
-// profiles without a usable matrix.
-static void _luminance_weights(const dt_iop_order_iccprofile_info_t *const work_profile,
-                               dt_aligned_pixel_t lum)
+// the module's reference space: linear Rec.709 (sRGB primaries).
+//
+// a filter written as a set of R/G/B channel weights only means something
+// relative to a set of primaries -- the same numbers read against Rec.2020's,
+// which sit out on the edge of the spectral locus, describe a considerably
+// stronger filter than they do against Rec.709's. the presets above were
+// fitted in sRGB primaries, so that is what a (hue, chroma) pair means here,
+// and the working profile the user happens to have picked must not change it.
+//
+// no pixel is converted for this. everything this module does to a pixel is a
+// linear form w.RGB, and a linear form transforms as a covector,
+//
+//     w_ref . RGB_ref = w_ref . (M RGB_work) = (M^T w_ref) . RGB_work
+//
+// so the whole correction is one 3x3 applied to the weights, once per pipe
+// run: the per-pixel loops and the OpenCL kernel (which just takes the weights
+// as a uniform) never learn about it. Rec.709 coordinates are never
+// materialized either, so a color outside its gamut simply carries negative
+// components through the same linear form instead of being clipped into it.
+
+// M = (XYZ_D50 -> Rec.709) * (working RGB -> XYZ_D50), row major.
+//
+// both halves are D50-referenced -- darktable takes matrix_in from the ICC
+// colorant tags, which lcms has already Bradford-adapted to the D50 connection
+// space, and dt's own Rec.709 matrix is the D50-adapted one -- so M maps the
+// working space's white exactly onto Rec.709's white. that is why the D65
+// whitepoint of the primaries needs no adaptation step here, and why
+// sum(w) == 1 survives the transform: neutral in, neutral out still holds by
+// construction, whatever profile the pipe runs in.
+//
+// a profile we cannot read a matrix from falls back to the identity, i.e. to
+// taking the pipe to already be in the reference space.
+static void _work_to_reference(const dt_iop_order_iccprofile_info_t *const work_profile,
+                               dt_colormatrix_t M)
 {
-  lum[0] = lum[1] = lum[2] = 1.f / 3.f;
-  lum[3] = 0.f;
+  memset(M, 0, sizeof(dt_colormatrix_t));
+  M[0][0] = M[1][1] = M[2][2] = 1.f;
 
-  if(!work_profile) return;
+  if(!work_profile
+     || !dt_is_valid_colormatrix(work_profile->matrix_in[0][0]))
+    return;
 
-  const float sum = work_profile->matrix_in[1][0]
-                  + work_profile->matrix_in[1][1]
-                  + work_profile->matrix_in[1][2];
-  if(!isfinite(sum) || sum < 0.1f) return;
+  dt_colormatrix_t xyz_to_ref;
+  memset(xyz_to_ref, 0, sizeof(dt_colormatrix_t));
+  for(int i = 0; i < 3; i++)
+    for(int j = 0; j < 3; j++)
+      xyz_to_ref[i][j] = xyz_to_srgb_transposed[j][i];
 
+  mat3SSEmul(M, xyz_to_ref, work_profile->matrix_in);
+}
+
+// re-express channel weights given in the reference space so that they compute
+// the same thing from working-space pixels: w_work = M^T w_ref.
+static void _reference_to_work(const dt_colormatrix_t M,
+                               const dt_aligned_pixel_t w_ref,
+                               dt_aligned_pixel_t w_work)
+{
+  for(int j = 0; j < 3; j++)
+    w_work[j] = w_ref[0] * M[0][j] + w_ref[1] * M[1][j] + w_ref[2] * M[2][j];
+  w_work[3] = 0.f;
+}
+
+// the eye's photopic luminance sensitivity in the reference space: the Y row
+// of its RGB->XYZ matrix, which is the same construction Rec.709 "luma" comes
+// from, and sums to 1 by definition (white has Y = 1) so it stays a pure
+// re-weighting of the panchromatic mix and never changes overall brightness.
+//
+// this is the one quantity here that needed no anchoring: Y is Y in any space,
+// and carrying these weights through _reference_to_work() reproduces the
+// working profile's own matrix_in[1] exactly. it is the filter axis that had
+// to be pinned to a set of primaries.
+static inline void _reference_luminance(dt_aligned_pixel_t lum)
+{
   for(int c = 0; c < 3; c++)
-    lum[c] = work_profile->matrix_in[1][c] / sum;
+    lum[c] = sRGB_to_xyz_transposed[c][1];
+  lum[3] = 0.f;
 }
 
 // the base panchromatic response (flat 1/3, 1/3, 1/3) blended toward the eye's
@@ -272,23 +340,27 @@ static void _luminance_weights(const dt_iop_order_iccprofile_info_t *const work_
 // top of that -- so filter presets stay layerable regardless of how much "human
 // vision" weighting is dialed in.
 //
+// built entirely in the reference space, including the flat pedestal, and
+// handed back in working-space coordinates: the mix a given set of sliders
+// produces is then one and the same conversion whatever profile the pipe runs
+// in, rather than something that quietly changes with it.
+//
 // both perturbations are sum-preserving by construction (the luminance weights
-// are renormalized to 1, the filter weights sum to 0), so the mix always maps a
-// neutral input to itself; the final normalization is only a guard against a
-// degenerate profile.
+// sum to 1, the filter weights sum to 0), and so is the transform out of the
+// reference space, so the mix always maps a neutral input to itself; the
+// normalization is only a guard against a degenerate profile.
 static void _compute_grey_mix(const dt_iop_blackwhite_data_t *const d,
                               const dt_iop_order_iccprofile_info_t *const work_profile,
                               dt_aligned_pixel_t grey)
 {
-  grey[0] = grey[1] = grey[2] = 1.f / 3.f;
-  grey[3] = 0.f;
+  dt_aligned_pixel_t ref = { 1.f / 3.f, 1.f / 3.f, 1.f / 3.f, 0.f };
 
   if(d->eye_response > 0.f)
   {
     dt_aligned_pixel_t lum;
-    _luminance_weights(work_profile, lum);
+    _reference_luminance(lum);
     for(int c = 0; c < 3; c++)
-      grey[c] += d->eye_response * (lum[c] - grey[c]);
+      ref[c] += d->eye_response * (lum[c] - ref[c]);
   }
 
   if(d->filter)
@@ -296,14 +368,18 @@ static void _compute_grey_mix(const dt_iop_blackwhite_data_t *const d,
     dt_aligned_pixel_t axis;
     _chroma_axis_weights(deg2radf(d->hue), axis);
     for(int c = 0; c < 3; c++)
-      grey[c] += d->chroma * axis[c];
+      ref[c] += d->chroma * axis[c];
   }
 
-  const float norm = grey[0] + grey[1] + grey[2];
+  const float norm = ref[0] + ref[1] + ref[2];
   if(isfinite(norm) && fabsf(norm - 1.f) > 1e-6f && fabsf(norm) > 1e-6f)
   {
-    for(int c = 0; c < 3; c++) grey[c] /= norm;
+    for(int c = 0; c < 3; c++) ref[c] /= norm;
   }
+
+  dt_colormatrix_t M;
+  _work_to_reference(work_profile, M);
+  _reference_to_work(M, ref, grey);
 }
 
 // the color direction a grey conversion is mathematically blind to.
@@ -321,6 +397,11 @@ static void _compute_grey_mix(const dt_iop_blackwhite_data_t *const d,
 // chroma contrast has to work on. it follows from the colorimetry alone: no
 // user setting, no image statistic, no measurement pass.
 //
+// like the mix itself this is built in the reference space, and the hue it
+// returns is a reference-space hue: _chroma_axis_weights() turns it into
+// reference-space weights, which _reference_to_work() then carries into the
+// pipe's own coordinates.
+//
 // G is taken from the eye's own luminance response, rotated by the color filter
 // when one is active -- never from the module's actual mix. a flat 1/3 average
 // is a technical default rather than a model of vision, and being blind to the
@@ -333,20 +414,10 @@ static void _compute_grey_mix(const dt_iop_blackwhite_data_t *const d,
 // than its surroundings renders lighter. that agrees both with the classic
 // red/orange filter look and with the Helmholtz-Kohlrausch effect, which makes
 // reds read lighter than their luminance while cyans stay put.
-static float _blind_axis_hue(const dt_iop_blackwhite_data_t *const d,
-                             const dt_iop_order_iccprofile_info_t *const work_profile)
+static float _blind_axis_hue(const dt_iop_blackwhite_data_t *const d)
 {
   dt_aligned_pixel_t w;
-  _luminance_weights(work_profile, w);
-
-  // a profile we could not read luminance weights from leaves a flat average,
-  // which has no gradient to rotate -- fall back on Rec.709
-  if(fabsf(w[0] - w[1]) < 1e-6f && fabsf(w[1] - w[2]) < 1e-6f)
-  {
-    w[0] = 0.2126f;
-    w[1] = 0.7152f;
-    w[2] = 0.0722f;
-  }
+  _reference_luminance(w);
 
   if(d->filter)
   {
@@ -574,7 +645,13 @@ static void _auto_compute(dt_iop_module_t *self,
 {
   const size_t npixels = width * height;
   dt_aligned_pixel_t lum;
-  _luminance_weights(work_profile, lum);
+  _reference_luminance(lum);
+
+  // the hue this produces is fed straight back into the filter, so the analysis
+  // has to run in the space that hue will be read in -- the chrominance plane
+  // below is spanned by the reference primaries, not by the pipe's.
+  dt_colormatrix_t M;
+  _work_to_reference(work_profile, M);
 
   const float cos120 = cosf(2.f * M_PI_F / 3.f);
   const float sin120 = sinf(2.f * M_PI_F / 3.f);
@@ -589,11 +666,15 @@ static void _auto_compute(dt_iop_module_t *self,
   for(size_t k = 0; k < npixels; k++)
   {
     const float *const px = in + 4 * k;
-    const float lgt = px[0] * lum[0] + px[1] * lum[1] + px[2] * lum[2];
-    const float mean = (px[0] + px[1] + px[2]) / 3.f;
-    const float dR = px[0] - mean;
-    const float dG = px[1] - mean;
-    const float dB = px[2] - mean;
+    dt_aligned_pixel_t rgb;
+    for(int c = 0; c < 3; c++)
+      rgb[c] = px[0] * M[c][0] + px[1] * M[c][1] + px[2] * M[c][2];
+
+    const float lgt = rgb[0] * lum[0] + rgb[1] * lum[1] + rgb[2] * lum[2];
+    const float mean = (rgb[0] + rgb[1] + rgb[2]) / 3.f;
+    const float dR = rgb[0] - mean;
+    const float dG = rgb[1] - mean;
+    const float dB = rgb[2] - mean;
 
     const float x = dR + dG * cos120 + dB * cos240;
     const float y = dG * sin120 + dB * sin240;
@@ -677,7 +758,7 @@ static void _auto_compute(dt_iop_module_t *self,
     dt_iop_blackwhite_data_t mix = { .filter = dp->filter,
                                      .hue = dp->hue,
                                      .chroma = dp->chroma };
-    const double phi = _blind_axis_hue(&mix, work_profile);
+    const double phi = _blind_axis_hue(&mix);
     const double cp = cos(phi), sp = sin(phi);
     const double var_blind =
       fmax(cxx * cp * cp + 2.0 * cxy * cp * sp + cyy * sp * sp, 0.0);
@@ -688,8 +769,13 @@ static void _auto_compute(dt_iop_module_t *self,
     // radius has to match. only worth measuring if there is something there.
     if(var_blind > 1e-8 * lref * lref)
     {
-      dt_aligned_pixel_t axis;
-      _chroma_axis_weights((float)phi, axis);
+      // measured on the pipe's own pixels, so the weights have to be carried
+      // into its coordinates first. that projection is by construction the same
+      // number the reference-space one would give, so it is directly comparable
+      // to var_blind above.
+      dt_aligned_pixel_t axis_ref, axis;
+      _chroma_axis_weights((float)phi, axis_ref);
+      _reference_to_work(M, axis_ref, axis);
 
       const double len = _axis_correlation_length(in, width, height, axis, var_blind);
 
@@ -795,8 +881,11 @@ void process(dt_iop_module_t *self,
     return;
   }
 
-  dt_aligned_pixel_t axis;
-  _chroma_axis_weights(_blind_axis_hue(d, work_profile), axis);
+  dt_aligned_pixel_t axis_ref, axis;
+  _chroma_axis_weights(_blind_axis_hue(d), axis_ref);
+  dt_colormatrix_t M;
+  _work_to_reference(work_profile, M);
+  _reference_to_work(M, axis_ref, axis);
 
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
@@ -876,7 +965,9 @@ void cleanup_global(dt_iop_module_so_t *self)
 // same shape as _compute_grey_mix()'s filter term, but clamped to a displayable
 // [0, 1] range instead of normalized to sum=1 -- so the swatch reads as neutral
 // grey at chroma=0 and grows more saturated as chroma increases, the way an
-// actual colored filter would look.
+// actual colored filter would look. the model is anchored to Rec.709 primaries
+// and these are drawn as screen RGB, so the swatch is the filter's own color
+// rather than an approximation of it.
 static void _hue_chroma_to_rgb(const float hue_deg, const float chroma, dt_aligned_pixel_t RGB)
 {
   const float hue = deg2radf(hue_deg);
