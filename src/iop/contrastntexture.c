@@ -228,6 +228,18 @@ int legacy_params(dt_iop_module_t *self,
 //    energies that are directly comparable across octaves -- and costs 4/3 of
 //    a single full-resolution pass in total.
 //
+// what a picked area is short of is ladder. the hump is located by its flanks,
+// so the ladder has to reach past the texture on both sides, and every octave
+// of it costs the mirrored border twice over -- while a pyramid that decimates
+// costs, on top of that, the strip it crops and half of what is left. on a
+// full frame none of that is felt; on a box drawn over one sleeve it is the
+// whole budget, and the ladder used to run out while the texture was still
+// ahead of it, which reads back as a texture that is smaller than it is. so
+// the two economies are separated: decimate while decimating is free, and
+// after that keep the pixels and climb by doubling the ladder itself. that is
+// what lets a 24-pixel box be measured at all, and what keeps a 120-pixel one
+// honest about texture four times coarser than it could previously report.
+//
 // the whole thing runs on log2 luminance, which is the space the module's own
 // detail extraction works in, so the measurement sees exactly the signal that
 // will be boosted -- including the shadow-noise suppression from the noise
@@ -237,7 +249,7 @@ int legacy_params(dt_iop_module_t *self,
 #define CT_SIGMA_BASE 1.2f        // finest sigma of the ladder, in analysis pixels
 #define CT_MAX_OCTAVES 12
 #define CT_MAX_BANDS (CT_MAX_OCTAVES * CT_SCALES_PER_OCTAVE)
-#define CT_KERNEL_RADIUS_MAX 16
+#define CT_KERNEL_RADIUS_MAX 32
 // smallest interior a level may still be measured on, per axis
 #define CT_MIN_INTERIOR ((size_t)8)
 // below this much detail there is nothing in the area worth enhancing and so
@@ -257,10 +269,19 @@ int legacy_params(dt_iop_module_t *self,
 // rungs this far below the peak are noise, and in log space they would
 // otherwise dominate the residual
 #define CT_ENERGY_FLOOR 1e-6
-// the model has three free parameters, so a couple of octaves of ladder is the
-// least that can pin it down. a region too small to provide that cannot be
-// measured at all.
-#define CT_MIN_BANDS (2 * CT_SCALES_PER_OCTAVE)
+// how far an idealized hump is expected to sit from a real texture's ladder,
+// as a fraction. it is the floor under every rung's error bar: past a couple
+// of hundred independent samples a rung stops getting more trustworthy, so
+// extra pixels stop buying it extra weight.
+#define CT_MODEL_ERROR 0.15
+// what the fit needs to be worth trusting, and so what decides the smallest
+// area that can be measured at all. the hump is located by its flanks, so what
+// matters is the *range* of sizes the ladder covers rather than how many rungs
+// it took to cover them: one full octave, plus enough rungs to outnumber the
+// model's three parameters. together these put the floor at 24 pixels on the
+// short axis.
+#define CT_MIN_SPAN 2.0
+#define CT_MIN_BANDS 4
 
 // the rectangle an area picker asked us to measure, inside the single-channel
 // luminance buffer process() has already built for its own use.
@@ -302,36 +323,57 @@ static inline int _mirror(int x, const int n)
   return (x < n) ? x : period - x;
 }
 
-// how far the mirrored border can reach into a level, in that level's own
+// the sigma of ladder rung s, in the pixels of the level it is measured on
+static inline double _rung_sigma(const double unit, const int s)
+{
+  return unit * exp2((double)s / CT_SCALES_PER_OCTAVE);
+}
+
+// how far the mirrored border reaches into each rung, in that level's own
 // pixels: the strip that has to be dropped from the energy sums, and from the
-// level before it is handed down to the next octave.
+// top rung before it is handed down to the next octave.
 //
-// successive blurs add their kernel *radii* -- they do not combine in
-// quadrature the way their sigmas do -- so this is a plain sum over the
-// ladder, computed from the same _gauss_kernel() the blurs themselves use so
-// that it cannot drift away from them.
-static int _ladder_reach(const gboolean first_octave)
+// this is the kernel radius of the single blur that produces the rung from its
+// octave's base image, which is the whole reason each rung is blurred straight
+// from that base rather than from the rung below it. a chain of blurs reaches
+// as far as the *sum* of its radii -- radii add where sigmas combine in
+// quadrature -- and on a small picked area that sum is most of what there is
+// to measure. going back to the base each time costs a few more kernel taps
+// and buys back roughly a third of the usable width.
+//
+// so this is the reach from the level's *base*, and it is the reach from the
+// picked area itself only where the two coincide: on the first octave, and on
+// every octave after a decimation, which crops the reached strip away. a
+// ladder climbing in place (see _measure_detail_scale) inherits its base's
+// reach uncounted, and a couple of pixels per side of already-mirrored texture
+// leak back into its sums. that is deliberate. mirroring is exact under
+// composition -- symmetric reflection commutes with symmetric convolution, so
+// the level is the honest blur of the mirror-extended area rather than
+// anything corrupted -- and what remains is the second-order bias of measuring
+// a locally even field, worth two or three hundredths of an octave where
+// counting the inherited reach costs three or four tenths in lost ladder.
+//
+// radii are computed from the same _gauss_kernel() the blurs themselves use,
+// so they cannot drift away from them.
+static void _ladder_radii(const double unit,
+                          const double base_sigma,
+                          int *const restrict radii)
 {
   float kern[2 * CT_KERNEL_RADIUS_MAX + 1];
 
-  // octave zero starts from the raw region and has to blur its way up to
-  // sigma_base itself; every deeper octave inherits that blur through the
-  // decimation, already cropped clean.
-  int reach = first_octave ? _gauss_kernel(CT_SIGMA_BASE, kern) : 0;
-
-  for(int s = 0; s < CT_SCALES_PER_OCTAVE; s++)
+  for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++)
   {
-    const double lo = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
-    const double hi = CT_SIGMA_BASE * exp2((double)(s + 1) / CT_SCALES_PER_OCTAVE);
-    reach += _gauss_kernel((float)sqrt(hi * hi - lo * lo), kern);
+    const double sigma = _rung_sigma(unit, s);
+    const double var = sigma * sigma - base_sigma * base_sigma;
+    radii[s] = var > 0.0 ? _gauss_kernel((float)sqrt(var), kern) : 0;
   }
-
-  return reach;
 }
 
-// separable Gaussian with mirrored borders. sigma stays around one pixel here
-// (the ladder is climbed in small increments and by decimation, never by one
-// large blur), so a short explicit kernel is both exact and cheap.
+// separable Gaussian with mirrored borders. sigma is bounded here -- a level
+// climbs at most one octave above its own base, and a ladder that has to climb
+// in place instead of decimating (see _measure_detail_scale) is stopped once
+// its kernel reaches CT_KERNEL_RADIUS_MAX -- so a short explicit kernel is
+// both exact and cheap.
 static void _gauss_blur(const float *const restrict src,
                         float *const restrict dst,
                         float *const restrict tmp,
@@ -394,6 +436,25 @@ static void _gauss_blur(const float *const restrict src,
   }
 }
 
+// produce ladder rung s from the octave's base image
+static void _ladder_rung(const float *const restrict base,
+                         float *const restrict dst,
+                         float *const restrict scratch,
+                         const size_t width,
+                         const size_t height,
+                         const double unit,
+                         const double base_sigma,
+                         const int s)
+{
+  const double sigma = _rung_sigma(unit, s);
+  const double var = sigma * sigma - base_sigma * base_sigma;
+
+  if(var > 0.0)
+    _gauss_blur(base, dst, scratch, width, height, (float)sqrt(var));
+  else
+    memcpy(dst, base, width * height * sizeof(float));  // already there
+}
+
 // mean squared difference of two neighbouring rungs, over the interior only
 static double _band_energy(const float *const restrict a,
                            const float *const restrict b,
@@ -419,8 +480,8 @@ static double _band_energy(const float *const restrict a,
 }
 
 // plain subsampling by two, of the interior only. the source has just been
-// blurred to 2 * sigma_base, which puts the new grid's Nyquist frequency about
-// four sigma out, so there is nothing left up there to alias.
+// blurred to twice the ladder's base sigma, which puts the new grid's Nyquist
+// frequency about four sigma out, so there is nothing left up there to alias.
 //
 // dropping the reached border here rather than carrying it along is what keeps
 // the pyramid honest. whatever border bias a level has left, passing it down would
@@ -473,15 +534,29 @@ static void _decimate2_interior(const float *const restrict src,
 // energy the height is a pure vertical offset, solved in closed form by a mean.
 // so scan tau and the floor-to-height ratio over a grid and take the pair with
 // the smallest residual.
+//
+// the rungs are not equally trustworthy -- one measured on the last, nearly
+// exhausted level of a small area rests on a handful of independent samples
+// where one from the full width rests on thousands -- so every sum below is
+// weighted by how many samples the rung actually had.
 static double _fit_texture_scale(const double *const restrict sigmas,
                                  const double *const restrict energies,
+                                 const double *const restrict weights,
                                  const int nbands)
 {
-  if(nbands < CT_MIN_BANDS) return 0.0;
+  // the smallest area that can be measured at all covers exactly one octave,
+  // so this comparison is met on the nose there and is given a rounding's
+  // worth of slack rather than being left to turn on an ulp.
+  if(nbands < CT_MIN_BANDS
+     || sigmas[nbands - 1] < CT_MIN_SPAN * sigmas[0] * (1.0 - 1e-9))
+    return 0.0;
 
-  const double n = (double)nbands;
-  double peak_e = 0.0;
-  for(int i = 0; i < nbands; i++) peak_e = fmax(peak_e, energies[i]);
+  double n = 0.0, peak_e = 0.0;
+  for(int i = 0; i < nbands; i++)
+  {
+    n += weights[i];
+    peak_e = fmax(peak_e, energies[i]);
+  }
 
   // nothing there at any scale: a blank sky, a blown highlight, a black frame
   if(peak_e <= CT_FLAT_ENERGY) return 0.0;
@@ -527,7 +602,7 @@ static double _fit_texture_scale(const double *const restrict sigmas,
       for(int i = 0; i < nbands; i++)
       {
         model[i] = log(shape[i] + ratio);
-        offset += y[i] - model[i];
+        offset += weights[i] * (y[i] - model[i]);
       }
       offset /= n;  // the hump's height, in closed form
 
@@ -535,7 +610,7 @@ static double _fit_texture_scale(const double *const restrict sigmas,
       for(int i = 0; i < nbands; i++)
       {
         const double d = y[i] - model[i] - offset;
-        residual += d * d;
+        residual += weights[i] * d * d;
       }
 
       if(residual < best_residual)
@@ -572,19 +647,25 @@ static double _measure_detail_scale(const _ct_region_t *const region)
   const size_t w0 = region->width, h0 = region->height;
   const size_t npixels = w0 * h0;
 
-  const size_t reach_first = (size_t)_ladder_reach(TRUE);
-  const size_t reach_deeper = (size_t)_ladder_reach(FALSE);
-
-  if(w0 < 2 * reach_first + CT_MIN_INTERIOR || h0 < 2 * reach_first + CT_MIN_INTERIOR)
-    return 0.0;
-
-  float *restrict buf_a = dt_alloc_align_float(npixels);
-  float *restrict buf_b = dt_alloc_align_float(npixels);
-  float *restrict scratch = dt_alloc_align_float(npixels);
-  if(!buf_a || !buf_b || !scratch)
   {
-    dt_free_align(buf_a);
-    dt_free_align(buf_b);
+    // the finest band of the first octave is the least this can possibly do
+    int radii[CT_SCALES_PER_OCTAVE + 1];
+    _ladder_radii(CT_SIGMA_BASE, 0.0, radii);
+    const size_t smallest = 2 * (size_t)radii[1] + CT_MIN_INTERIOR;
+    if(w0 < smallest || h0 < smallest) return 0.0;
+  }
+
+  // the first three are handed around between the roles below, so they are
+  // left unqualified: at any moment they still name three distinct buffers.
+  float *base = dt_alloc_align_float(npixels);
+  float *buf_lo = dt_alloc_align_float(npixels);
+  float *buf_hi = dt_alloc_align_float(npixels);
+  float *const restrict scratch = dt_alloc_align_float(npixels);
+  if(!base || !buf_lo || !buf_hi || !scratch)
+  {
+    dt_free_align(base);
+    dt_free_align(buf_lo);
+    dt_free_align(buf_hi);
     dt_free_align(scratch);
     return -1.0;
   }
@@ -601,7 +682,7 @@ static double _measure_detail_scale(const _ct_region_t *const region)
   DT_OMP_FOR(reduction(+ : mean_ev))
   for(size_t j = 0; j < h0; j++)
   {
-    float *const out = buf_a + j * w0;
+    float *const out = base + j * w0;
     const float *const row = lum + (y0 + j) * stride + x0;
     double rowsum = 0.0;
     for(size_t i = 0; i < w0; i++)
@@ -624,57 +705,131 @@ static double _measure_detail_scale(const _ct_region_t *const region)
 
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
-    buf_a[k] -= offset;
+    base[k] -= offset;
 
-  float *cur = buf_a, *nxt = buf_b;
-  _gauss_blur(cur, nxt, scratch, w0, h0, CT_SIGMA_BASE);
-  float *swap = cur; cur = nxt; nxt = swap;
-
-  double sigmas[CT_MAX_BANDS], energies[CT_MAX_BANDS];
+  double sigmas[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
   int nbands = 0;
   size_t cw = w0, ch = h0;
 
+  // the ladder's base sigma in the *current buffer's* pixels, and how many
+  // level-0 pixels one of those covers. decimating leaves the first unchanged
+  // and doubles the second; climbing without decimating does the opposite.
+  double unit = CT_SIGMA_BASE;
+  double step = 1.0;
+  gboolean base_is_raw = TRUE;
+
   for(int octave = 0; octave < CT_MAX_OCTAVES; octave++)
   {
-    const size_t margin = octave == 0 ? reach_first : reach_deeper;
+    // octave zero's base is the raw region, so its rungs carry the whole blur
+    // up from nothing; afterwards the base always arrives at exactly `unit`.
+    const double base_sigma = base_is_raw ? 0.0 : unit;
+
+    int radii[CT_SCALES_PER_OCTAVE + 1];
+    _ladder_radii(unit, base_sigma, radii);
+
+    float *lo = buf_lo, *hi = buf_hi;
+    _ladder_rung(base, lo, scratch, cw, ch, unit, base_sigma, 0);
+
+    int produced = 0;
+    for(int s = 0; s < CT_SCALES_PER_OCTAVE; s++)
+    {
+      // a band is bounded by the coarser of its two rungs. the radii grow
+      // with s, so once one band does not fit, neither does any above it.
+      const size_t margin = (size_t)radii[s + 1];
+      if(radii[s + 1] >= CT_KERNEL_RADIUS_MAX
+         || cw < 2 * margin + CT_MIN_INTERIOR
+         || ch < 2 * margin + CT_MIN_INTERIOR)
+        break;
+
+      _ladder_rung(base, hi, scratch, cw, ch, unit, base_sigma, s + 1);
+
+      energies[nbands] = _band_energy(lo, hi, cw, ch, margin);
+      // the DoG's own peak frequency sits within a percent of the one the
+      // geometric mean of its two sigmas predicts, so label the band with that
+      // and carry it back to level-0 pixels.
+      const double sigma_here = sqrt(_rung_sigma(unit, s) * _rung_sigma(unit, s + 1));
+      sigmas[nbands] = sigma_here * step;
+
+      // and how much this rung is worth to the fit, as one over the variance
+      // its log carries.
+      //
+      // one part of that is sampling: a mean of squares over n independent
+      // samples has a relative variance of 2/n, and the samples of a band stop
+      // being independent about sigma pixels apart, so the interior it was
+      // summed over is worth roughly its area divided by sigma squared.
+      //
+      // the other part does not shrink with n at all. the hump being fitted is
+      // an idealization, and a real texture departs from it by some percent no
+      // matter how many pixels are averaged. without that floor the weights
+      // span two orders of magnitude across a deep pyramid -- each octave has
+      // four times fewer samples than the one below -- and the fine rungs
+      // drown out the coarse flank entirely, which is precisely the half of
+      // the curve that says a texture is large.
+      const double interior = (double)(cw - 2 * margin) * (double)(ch - 2 * margin);
+      const double samples = fmax(interior / (sigma_here * sigma_here), 1.0);
+      weights[nbands] =
+        1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / samples);
+      nbands++;
+      produced++;
+
+      float *const swap = lo; lo = hi; hi = swap;
+    }
 
     // the ladder is bounded by the *region*: a small picked area cannot show
     // that the texture keeps growing past its own edge, so it saturates at a
     // finer answer. picking large is what makes a coarse answer available.
-    if(cw < 2 * margin + CT_MIN_INTERIOR || ch < 2 * margin + CT_MIN_INTERIOR)
-      break;
+    // stop as soon as an octave cannot be completed -- without its top rung
+    // there is nothing to carry forward.
+    if(produced < CT_SCALES_PER_OCTAVE) break;
 
-    for(int s = 0; s < CT_SCALES_PER_OCTAVE; s++)
+    // lo now holds the rung at twice the base sigma, which is the next
+    // octave's base image either way. the only question is how to get there.
+    const size_t crop = (size_t)radii[CT_SCALES_PER_OCTAVE];
+    const size_t nw = cw > 2 * crop ? (cw - 2 * crop) / 2 : 0;
+    const size_t nh = ch > 2 * crop ? (ch - 2 * crop) / 2 : 0;
+
+    // what the child would need to be worth having: enough room for its
+    // *coarsest* band, not just its finest. handing down a level that dies
+    // half way through its octave is worse than not decimating at all.
+    int child_radii[CT_SCALES_PER_OCTAVE + 1];
+    _ladder_radii(unit, unit, child_radii);
+    const size_t child_min =
+      2 * (size_t)child_radii[CT_SCALES_PER_OCTAVE] + CT_MIN_INTERIOR;
+
+    if(nw >= child_min && nh >= child_min)
     {
-      const double lo = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
-      const double hi = CT_SIGMA_BASE * exp2((double)(s + 1) / CT_SCALES_PER_OCTAVE);
-      _gauss_blur(cur, nxt, scratch, cw, ch, (float)sqrt(hi * hi - lo * lo));
-
-      energies[nbands] = _band_energy(cur, nxt, cw, ch, margin);
-      // the DoG's own peak frequency sits within a percent of the one the
-      // geometric mean of its two sigmas predicts, so label the band with that
-      // and carry it back to level-0 pixels.
-      sigmas[nbands] = sqrt(lo * hi) * (double)(1 << octave);
-      nbands++;
-
-      swap = cur; cur = nxt; nxt = swap;
+      // decimating is what keeps this linear in the area, and on anything of
+      // a decent size it is free: the image is already blurred to twice the
+      // base sigma, so its Nyquist frequency is four sigma out and there is
+      // nothing left up there to alias.
+      _decimate2_interior(lo, cw, crop, nw, nh, base);
+      cw = nw;
+      ch = nh;
+      step *= 2.0;
+    }
+    else
+    {
+      // but on a small area it is ruinous -- the crop and the halving together
+      // are the difference between another octave of ladder and none -- and
+      // the speed it buys is worth nothing there anyway. so keep the pixels
+      // and climb by doubling the ladder itself instead. the rungs get wider
+      // kernels and the borders reach further, which is what eventually stops
+      // this, but it stops one or two octaves later than decimating would.
+      float *const previous = base;
+      if(lo == buf_lo) { base = buf_lo; buf_lo = previous; }
+      else             { base = buf_hi; buf_hi = previous; }
+      unit *= 2.0;
     }
 
-    // cur is now blurred to 2 * sigma_base in this octave's own pixels, which
-    // is precisely the next octave's starting rung once subsampled.
-    const size_t nw = (cw - 2 * margin) / 2;
-    const size_t nh = (ch - 2 * margin) / 2;
-    _decimate2_interior(cur, cw, margin, nw, nh, nxt);
-    cw = nw;
-    ch = nh;
-    swap = cur; cur = nxt; nxt = swap;
+    base_is_raw = FALSE;
   }
 
-  dt_free_align(buf_a);
-  dt_free_align(buf_b);
+  dt_free_align(base);
+  dt_free_align(buf_lo);
+  dt_free_align(buf_hi);
   dt_free_align(scratch);
 
-  return _fit_texture_scale(sigmas, energies, nbands);
+  return _fit_texture_scale(sigmas, energies, weights, nbands);
 }
 
 // Compute smoothed luminance mask using edge-aware filters
