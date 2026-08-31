@@ -114,7 +114,8 @@ const dt_iop_order_entry_t legacy_order[] = {
   { {26.0f }, "hazeremoval", 0},
   { {27.0f }, "colorin", 0},
   { {27.5f }, "channelmixerrgb", 0},
-  { {27.5f }, "contrastntexture", 0}, 
+  { {27.5f }, "contrastntexture", 0},
+  { {27.6f }, "contrastadv", 0},
   { {27.5f }, "diffuse", 0},
   { {27.5f }, "censorize", 0},
   { {27.5f }, "negadoctor", 0},
@@ -224,6 +225,7 @@ const dt_iop_order_entry_t v30_order[] = {
   { {28.0f }, "colorin", 0},
   { {28.5f }, "channelmixerrgb", 0},
   { {28.5f }, "contrastntexture", 0},
+  { {28.6f }, "contrastadv", 0},
   { {28.5f }, "diffuse", 0},
   { {28.5f }, "censorize", 0},
   { {28.5f }, "negadoctor", 0},      // Cineon film encoding comes
@@ -348,6 +350,7 @@ const dt_iop_order_entry_t v50_order[] = {
   { {28.0f }, "colorin", 0},
   { {28.5f }, "channelmixerrgb", 0},
   { {28.5f }, "contrastntexture", 0},
+  { {28.6f }, "contrastadv", 0},
   { {28.5f }, "diffuse", 0},
   { {28.5f }, "censorize", 0},
   { {28.5f }, "negadoctor", 0},      // Cineon film encoding comes
@@ -473,6 +476,7 @@ const dt_iop_order_entry_t v30_jpg_order[] = {
   // from there, it's the same as the raw order
   { { 28.5f }, "channelmixerrgb", 0 },
   { { 28.5f }, "contrastntexture", 0 },
+  { { 28.6f }, "contrastadv", 0 },
   { { 28.5f }, "diffuse", 0 },
   { { 28.5f }, "censorize", 0 },
   { { 28.5f }, "negadoctor", 0 },   // Cineon film encoding comes after scanner input color profile
@@ -600,6 +604,7 @@ const dt_iop_order_entry_t v50_jpg_order[] = {
   // from there, it's the same as the raw order
   { { 28.5f }, "channelmixerrgb", 0 },
   { { 28.5f }, "contrastntexture", 0 },
+  { { 28.6f }, "contrastadv", 0 },
   { { 28.5f }, "diffuse", 0 },
   { { 28.5f }, "censorize", 0 },
   { { 28.5f }, "negadoctor", 0 },   // Cineon film encoding comes after scanner input color profile
@@ -754,6 +759,7 @@ void dt_ioppr_migrate_legacy_iop_order_list(GList *iop_order_list)
   //                iop-order list kind.
   _insert_before_after(iop_order_list, "nlmeans", "negadoctor", TRUE);
   _insert_before_after(iop_order_list, "negadoctor", "channelmixerrgb", TRUE);
+  _insert_before_after(iop_order_list, "negadoctor", "contrastadv", TRUE);
   _insert_before_after(iop_order_list, "negadoctor", "contrastntexture", TRUE);
   _insert_before_after(iop_order_list, "negadoctor", "censorize", TRUE);
   _insert_before_after(iop_order_list, "negadoctor", "primaries", TRUE);
