@@ -75,25 +75,40 @@ Current status as implemented by Jandren:
 #include <omp.h>
 #endif
 
-DT_MODULE_INTROSPECTION(1, dt_iop_contrast_params_t)
+DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
+
+#define CT_BANDS 9          // detail levels 2..10, one node per octave
+#define CT_BAND_D0 2.0f     // detail level of the coarsest node
+
+typedef enum dt_iop_contrast_decomposition_t
+{
+  CT_DECOMPOSITION_ACCURATE = 0, // $DESCRIPTION: "accurate" -- every band direct, no pyramid
+  CT_DECOMPOSITION_FAST = 1      // $DESCRIPTION: "fast" -- hybrid: coarse bands pyramided
+} dt_iop_contrast_decomposition_t;
 
 typedef struct dt_iop_contrast_params_t
 {
   float gain_local_contrast;  // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0  $DESCRIPTION: "local contrast"
-  float detail_level;         // $MIN: 0.0 $MAX: 15.0 $DEFAULT: 4.0 $DESCRIPTION: "detail level"
+  float band[CT_BANDS];       // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0
+  float scale_shift;          // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0 $DESCRIPTION: "node placement"
   float edge_protection;      // $MIN: -10.0 $MAX: 10.0 $DEFAULT: 0.0 $DESCRIPTION: "adjust edge protection"
   int filter_iterations;      // $MIN: 1 $MAX: 20 $DEFAULT: 1 $DESCRIPTION: "filter iterations"
   float noise_bias;           // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.001 $DESCRIPTION: "noise bias"
+  dt_iop_contrast_decomposition_t decomposition; // $DEFAULT: CT_DECOMPOSITION_ACCURATE $DESCRIPTION: "decomposition"
 } dt_iop_contrast_params_t;
 
 typedef struct dt_iop_contrast_data_t
 {
   float gain_local_contrast;
-  float contrast_scale;
+  float scale_shift;
+  float band[CT_BANDS];        // gains, copied verbatim from params
+  int   nbands;                 // bands that survive the current roi scale
+  float sigma[CT_BANDS];        // boundary sigmas, finest-surviving-first, in pixels of this roi
+  float gain[CT_BANDS];         // matching gains, same order as sigma
   float feathering;
-  int radius_local;
   int iterations;
   float noise_bias;
+  dt_iop_contrast_decomposition_t decomposition;
 } dt_iop_contrast_data_t;
 
 typedef enum dt_iop_details_display_t
@@ -132,7 +147,9 @@ typedef struct dt_iop_contrast_gui_data_t
 
   // GTK widgets
   GtkWidget *gain_local_contrast;
-  GtkWidget *detail_level;
+  GtkWidget *band[CT_BANDS];
+  GtkWidget *scale_shift;
+  GtkWidget *decomposition;
   GtkWidget *edge_protection;
   GtkWidget *filter_iterations;
   GtkWidget *noise_bias;
@@ -189,6 +206,40 @@ int legacy_params(dt_iop_module_t *self,
                   int32_t *new_params_size,
                   int *new_version)
 {
+  typedef struct dt_iop_contrast_params_v1_t
+  {
+    float gain_local_contrast;
+    float detail_level;
+    float edge_protection;
+    int filter_iterations;
+    float noise_bias;
+  } dt_iop_contrast_params_v1_t;
+
+  if(old_version == 1)
+  {
+    const dt_iop_contrast_params_v1_t *o = (dt_iop_contrast_params_v1_t *)old_params;
+    dt_iop_contrast_params_t *n = malloc(sizeof(dt_iop_contrast_params_t));
+
+    // v1 had one gain over everything finer than detail_level.
+    // Reproduce it: put the ladder's coarsest boundary at detail_level and open
+    // every band. The bands telescope, so this is exact up to the ladder's
+    // half-octave quantisation, which scale_shift absorbs. The new master gain
+    // stays neutral -- the old strength lives entirely in the opened bands now.
+    const float d = CLAMP(o->detail_level, CT_BAND_D0, CT_BAND_D0 + CT_BANDS - 1);
+    n->gain_local_contrast = 1.0f;
+    n->scale_shift = CLAMP(d - roundf(d), -0.5f, 0.5f);
+    for(int k = 0; k < CT_BANDS; k++)
+      n->band[k] = (CT_BAND_D0 + k >= roundf(d)) ? o->gain_local_contrast : 1.0f;
+    n->edge_protection = o->edge_protection;
+    n->filter_iterations = o->filter_iterations;
+    n->noise_bias = o->noise_bias;
+    n->decomposition = CT_DECOMPOSITION_ACCURATE;
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_contrast_params_t);
+    *new_version = 2;
+    return 0;
+  }
   return 1;
 }
 
