@@ -1841,6 +1841,19 @@ static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
   return M_PI * sqrt(num / den);
 }
 
+// map a wavelength (in some roi's own pixels) to a graph x fraction, on the
+// same nominal-octave axis the band nodes themselves sit on
+// (_graph_curve_from_params) -- ignoring scale_shift, exactly as the nodes'
+// own fixed screen positions do, so a rung/preset shape and the node it
+// nominally corresponds to line up regardless of where scale_shift has
+// since moved the *physical* meaning of that node. Shared by §3.2's graph
+// overlay and §3.4's analytic preset shapes.
+static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
+{
+  const double d = -log2(lambda / fmax(roi_long_edge, 1.0));
+  return CLAMP((float)((d - CT_BAND_D0) / (double)CT_BANDS), 0.0f, 1.0f);
+}
+
 // query §3.1's per-band block tables (built alongside the ladder in the same
 // guarded preview pass -- see process()'s comment above the ladder build)
 // for the box the picker used. e_module/sigma_out are filled finest-first,
@@ -2084,6 +2097,152 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   }
 
   return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// §3.4: presets, built the same way the picker projects a target curve onto
+// the nine bands (_project_to_bands) -- research.md §5.7's own "the same
+// solve also gives you preset-building for free" -- but from an analytic
+// shape instead of a picked area's fit. Shapes below are hand-picked
+// starting points, the same way atrous.c's own shipped presets are plain
+// numbers with no cited derivation; nothing here claims the empirical
+// grounding phase 0's decomposition choices had.
+// ---------------------------------------------------------------------------
+
+// an arbitrary, large "frame size" purely to keep the nominal sigma formula
+// well-conditioned (modify_roi_in's own "-1" discretisation correction is
+// negligible once sigma is this large) -- only the *ratios* between bands'
+// sigmas matter for H_k, so any sufficiently large constant here yields the
+// same projected gains. scale_shift = 0: presets sit on the standard ladder.
+#define CT_PRESET_S 100000.0f
+
+static void _preset_nominal_sigma(float *const restrict sigma)  // CT_BANDS, finest-first
+{
+  int idx = 0;
+  for(int k = CT_BANDS - 1; k >= 0; k--)
+  {
+    const float D = CT_BAND_D0 + k + 0.5f;
+    const float diameter = exp2f(-D) * CT_PRESET_S;
+    sigma[idx++] = fmaxf(0.5f * (diameter - 1.0f), 0.0f);
+  }
+}
+
+// project target[] (evaluated on lambda_grid[]) onto the nine bands and
+// write the result into p->band[], coarsest-first -- the same reversal
+// color_picker_apply does at the end of its own projection.
+static gboolean _preset_apply_target(const double *const restrict lambda_grid,
+                                     const double *const restrict target, const int m,
+                                     const float *const restrict sigma,
+                                     dt_iop_contrast_params_t *const p)
+{
+  float gains[CT_BANDS];
+  if(!_project_to_bands(lambda_grid, target, m, sigma, CT_BANDS, NULL, gains)) return FALSE;
+  for(int k = 0; k < CT_BANDS; k++) p->band[k] = gains[CT_BANDS - 1 - k];
+  return TRUE;
+}
+
+// raised-cosine bump on x in [0,1] (the graph's own coarse=0/fine=1 axis,
+// via _spectrum_lambda_to_x), centred at x0 with half-width w -- zero
+// outside [x0-w, x0+w], peak 1 at x0.
+static double _preset_bump(const double x, const double x0, const double w)
+{
+  const double t = CLAMP((x - x0) / w, -1.0, 1.0);
+  return 0.5 * (1.0 + cos(M_PI * t));
+}
+
+void init_presets(dt_iop_module_so_t *self)
+{
+  dt_iop_contrast_params_t p;
+  memset(&p, 0, sizeof(p));
+  p.gain_local_contrast = 1.0f;
+  p.scale_shift = 0.0f;
+  p.edge_protection = 0.0f;
+  p.filter_iterations = 1;
+  p.noise_bias = 0.001f;
+  p.decomposition = CT_DECOMPOSITION_ACCURATE;
+  for(int k = 0; k < CT_BANDS; k++) p.band[k] = 1.0f;
+
+  float sigma[CT_BANDS];
+  _preset_nominal_sigma(sigma);
+  double lambda_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
+  const double lo = 2.0 * M_PI * fmax((double)sigma[0], 1e-3) * 0.25;
+  const double hi = 2.0 * M_PI * (double)sigma[CT_BANDS - 1] * 4.0;
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+    lambda_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+
+  // "clarity": a broad boost centred mid-ladder, slightly toward the coarse
+  // side -- traditional medium/large-scale local contrast.
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    target[j] = 1.0 + 0.6 * _preset_bump(x, 0.35, 0.5);
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+    dt_gui_presets_add_generic(_("clarity"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
+
+  // "texture": a broader boost biased toward the fine end -- less peaked
+  // than micro-contrast below, meant as a general "add texture" default.
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    target[j] = 1.0 + 0.5 * _preset_bump(x, 0.7, 0.6);
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+    dt_gui_presets_add_generic(_("texture"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
+
+  // "micro-contrast": only the finest couple of bands, ramped in rather
+  // than a bump, for a tighter, more surgical fine-detail boost.
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double ramp = pow(CLAMP((x - 0.55) / 0.45, 0.0, 1.0), 1.5);
+    target[j] = 1.0 + 0.8 * ramp;
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+    dt_gui_presets_add_generic(_("micro-contrast"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
+
+  // "soften": the inverse of micro-contrast -- an edge-aware fine-detail
+  // smoother, g_k < 1 toward the finest bands, untouched at the coarse end.
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double ramp = CLAMP((x - 0.5) / 0.5, 0.0, 1.0);
+    target[j] = 1.0 - 0.7 * ramp;
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+    dt_gui_presets_add_generic(_("soften"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
+
+  // "flatten spectrum": research.md §5.6's "equalize" mode,
+  // clamp((E_ref/S_hat)^alpha) * S/(S+N), evaluated against a synthetic
+  // self-similar spectrum (beta = 2.4, research.md §5.3's typical measured
+  // slope; no sized texture) rather than any particular picked area's own
+  // fit -- a reasonable default assumption, not a measurement. E_ref is the
+  // spectrum's own value at the ladder's centre wavelength; a modest noise
+  // floor and a fractional alpha keep the correction from chasing the
+  // noisiest, finest scale to an extreme gain.
+  {
+    const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.4, .noise = 0.02,
+                                  .texture = 0.0, .tau = 0.0 };
+    const double lambda_mid = sqrt(lo * hi);
+    double s_ref, n_ref;
+    _ct_fit_eval(&synthetic, lambda_mid, &s_ref, &n_ref);
+    const double alpha = 0.4;
+    for(int j = 0; j < CT_PROJECT_GRID; j++)
+    {
+      double s_hat, n_hat;
+      _ct_fit_eval(&synthetic, lambda_grid[j], &s_hat, &n_hat);
+      const double wiener = s_hat / fmax(s_hat + n_hat, DBL_MIN);
+      const double eq = pow(s_ref / fmax(s_hat, DBL_MIN), alpha) * wiener;
+      target[j] = CLAMP(eq, 0.3, 2.5);
+    }
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+    dt_gui_presets_add_generic(_("flatten spectrum"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
 }
 
 // §2.2: synchronous now that the ladder is frame-wide and pre-published
@@ -2344,18 +2503,6 @@ static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const flo
 // pick has landed. Makes the picker legible instead of magic: the data was
 // already being measured (§2.1/§3.1), this just puts it on screen.
 // ---------------------------------------------------------------------------
-
-// map a wavelength (in the ladder/box roi's own pixels) to the graph's x
-// fraction, on the same nominal-octave axis the band nodes themselves sit
-// on (_graph_curve_from_params) -- ignoring scale_shift, exactly as the
-// nodes' own fixed screen positions do, so a rung and the node it nominally
-// corresponds to line up regardless of where scale_shift has since moved
-// the *physical* meaning of that node.
-static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
-{
-  const double d = -log2(lambda / fmax(roi_long_edge, 1.0));
-  return CLAMP((float)((d - CT_BAND_D0) / (double)CT_BANDS), 0.0f, 1.0f);
-}
 
 // energies span orders of magnitude across ordinary images (phase0-band-
 // energy.md's own tables), so the y axis here is log, normalised to
