@@ -1800,12 +1800,26 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
 // eigf's edge-awareness is known to deliver less than this linear model
 // would (research.md §5.8). Rows are unaffected: the smoothness penalty acts
 // on the {g_k} output directly and has no H_k of its own to calibrate.
+//
+// implementation-plan-2.md §4.4: gain_lo/gain_hi are the envelope the
+// caller's own target curve promised -- research.md §5.6 and _target_curve's
+// own comment say the picker sets shape, never strength, so no band should
+// come back outside it. The second-difference penalty above can ring past
+// the envelope on a two-to-three-band hump (0.974/0.81 measured on real
+// picks, both clamp violations, neither a real measurement); this is a hard
+// clamp rather than a clamp-and-resolve active set because that ringing was
+// small in practice -- revisit if a legitimate curve is measured to flatten
+// visibly against it. The picker passes [min(1,master), max(1,master)];
+// presets pass their own envelope directly since some (soften) are
+// deliberately < 1 and one (flatten spectrum) straddles 1 on both sides,
+// neither of which a single "master" scalar can express.
 static gboolean _project_to_bands(const double *const restrict lambda_grid,
                                   const double *const restrict g_target,
                                   const int m,
                                   const float *const restrict sigma,
                                   const int nbands,
                                   const float *const restrict calibration,
+                                  const float gain_lo, const float gain_hi,
                                   float *const restrict gains)
 {
   if(nbands < 2 || m < 2) return FALSE;
@@ -1847,7 +1861,7 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
   const gboolean ok = pseudo_solve(A, y, rows, (size_t)nbands, FALSE);
   if(ok)
     for(int k = 0; k < nbands; k++)
-      gains[k] = CLAMP(y[k] + 1.0f, 0.0f, 5.0f);
+      gains[k] = CLAMP(y[k] + 1.0f, gain_lo, gain_hi);
 
   dt_free_align(A);
   dt_free_align(y);
@@ -2197,14 +2211,20 @@ static void _preset_nominal_sigma(float *const restrict sigma)  // CT_BANDS, fin
 
 // project target[] (evaluated on lambda_grid[]) onto the nine bands and
 // write the result into p->band[], coarsest-first -- the same reversal
-// color_picker_apply does at the end of its own projection.
+// color_picker_apply does at the end of its own projection. gain_lo/gain_hi
+// (§4.4) is this preset's own envelope: most presets built target[] as
+// 1 + strength*shape(), so their envelope is exactly [1, 1+strength] (or
+// the reverse for a sub-1 preset like "soften"); "flatten spectrum" already
+// clamps target[] itself, so its own bounds are what it passes here.
 static gboolean _preset_apply_target(const double *const restrict lambda_grid,
                                      const double *const restrict target, const int m,
                                      const float *const restrict sigma,
+                                     const float gain_lo, const float gain_hi,
                                      dt_iop_contrast_params_t *const p)
 {
   float gains[CT_BANDS];
-  if(!_project_to_bands(lambda_grid, target, m, sigma, CT_BANDS, NULL, gains)) return FALSE;
+  if(!_project_to_bands(lambda_grid, target, m, sigma, CT_BANDS, NULL, gain_lo, gain_hi, gains))
+    return FALSE;
   for(int k = 0; k < CT_BANDS; k++) p->band[k] = gains[CT_BANDS - 1 - k];
   return TRUE;
 }
@@ -2245,7 +2265,7 @@ void init_presets(dt_iop_module_so_t *self)
     const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
     target[j] = 1.0 + 0.6 * _preset_bump(x, 0.35, 0.5);
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.6f, &p))
     dt_gui_presets_add_generic(_("clarity"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -2256,7 +2276,7 @@ void init_presets(dt_iop_module_so_t *self)
     const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
     target[j] = 1.0 + 0.5 * _preset_bump(x, 0.7, 0.6);
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.5f, &p))
     dt_gui_presets_add_generic(_("texture"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -2268,7 +2288,7 @@ void init_presets(dt_iop_module_so_t *self)
     const double ramp = pow(CLAMP((x - 0.55) / 0.45, 0.0, 1.0), 1.5);
     target[j] = 1.0 + 0.8 * ramp;
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.8f, &p))
     dt_gui_presets_add_generic(_("micro-contrast"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -2280,7 +2300,7 @@ void init_presets(dt_iop_module_so_t *self)
     const double ramp = CLAMP((x - 0.5) / 0.5, 0.0, 1.0);
     target[j] = 1.0 - 0.7 * ramp;
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 0.3f, 1.0f, &p))
     dt_gui_presets_add_generic(_("soften"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 
@@ -2311,7 +2331,7 @@ void init_presets(dt_iop_module_so_t *self)
       target[j] = CLAMP(eq, 0.3, 2.5);
     }
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 0.3f, 2.5f, &p))
     dt_gui_presets_add_generic(_("flatten spectrum"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 }
@@ -2446,8 +2466,14 @@ void color_picker_apply(dt_iop_module_t *self,
   float calibration[CT_BANDS];
   _compute_band_calibration(self, box, long_edge, &fit, calibration);
 
+  // §4.4: the envelope the target curve itself was built to (target[] =
+  // 1 + (master-1)*shape, shape in [0,1]) -- no band should leave it.
+  const float gain_lo = fminf(1.0f, p->gain_local_contrast);
+  const float gain_hi = fmaxf(1.0f, p->gain_local_contrast);
+
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
-  if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration, gains))
+  if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration,
+                        gain_lo, gain_hi, gains))
   {
     dt_control_log(_("could not fit a curve to the picked area"));
     return;
