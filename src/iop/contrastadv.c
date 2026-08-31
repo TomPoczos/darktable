@@ -83,6 +83,16 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_BANDS 9          // detail levels 2..10, one node per octave
 #define CT_BAND_D0 2.0f     // detail level of the coarsest node
 
+// §3.3/research.md §2.4: eps_k = eps * (sigma_k/sigma_ref)^p, sigma_ref the
+// finest surviving band. p is deliberately small and un-exposed ("a small p,
+// not another slider") -- 0.3 is a plausible starting point sized against
+// phase0-band-energy.md's own numbers (raising the *global* eps from 0.2 to
+// 0.8, a 4x change, was enough to keep every band alive there), not a
+// value re-validated with phase0's own visual A/B method against real
+// images; revisit if a future pass finds coarse bands still collapsing, or
+// overshooting into halos, at this setting.
+#define CT_FEATHERING_EXPONENT 0.3f
+
 // §1.9 FAST: how many of the *finest* (d->sigma[]-space, index 0) bands stay
 // direct-eigf regardless of decomposition. phase0-hybrid-pyramid-summary.md's
 // sweep labels this count `c` -- `H(5)` is the setting that measured safe on
@@ -149,7 +159,8 @@ typedef struct dt_iop_contrast_data_t
   int   nbands;                 // bands that survive the current roi scale
   float sigma[CT_BANDS];        // boundary sigmas, finest-surviving-first, in pixels of this roi
   float gain[CT_BANDS];         // matching gains, same order as sigma
-  float feathering;
+  float feathering[CT_BANDS];   // §3.3: per-band edge protection, same order as sigma/gain
+  float feathering_base;        // from edge_protection/filter_iterations, before the per-band scaling
   int iterations;
   float noise_bias;
   dt_iop_contrast_decomposition_t decomposition;
@@ -1177,7 +1188,7 @@ static void _accumulate_pyramid_bands(const float *const restrict lum,
 
     memcpy(level_blur, base_src, base_w * base_h * sizeof(float));
     const float local_sigma = fmaxf(d->sigma[k] / (float)decimation, 1.0f);
-    fast_eigf_surface_blur(level_blur, base_w, base_h, local_sigma, d->feathering, d->iterations,
+    fast_eigf_surface_blur(level_blur, base_w, base_h, local_sigma, d->feathering[k], d->iterations,
                            DT_GF_BLENDING_LINEAR, 1.0f,
                            0.0f, NORM_MIN, 4.0f);
     interpolate_bilinear(level_blur, base_w, base_h, full_scratch, width, height, 1);
@@ -1272,7 +1283,7 @@ static void _decompose_and_accumulate(const float *const restrict lum,
   for(int k = 0; k < direct_bands; k++)
   {
     memcpy(blur, lum, npixels * sizeof(float));
-    fast_eigf_surface_blur(blur, width, height, d->sigma[k], d->feathering, d->iterations,
+    fast_eigf_surface_blur(blur, width, height, d->sigma[k], d->feathering[k], d->iterations,
                            DT_GF_BLENDING_LINEAR, 1.0f,
                            0.0f, NORM_MIN, 4.0f);
 
@@ -1609,6 +1620,7 @@ void modify_roi_in(dt_iop_module_t *self,
   // which never gets dropped.
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
+  float sigma_ref = 1.0f;  // §3.3: the finest surviving band at this scale, set below
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
     const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
@@ -1616,9 +1628,20 @@ void modify_roi_in(dt_iop_module_t *self,
     const float sigma = 0.5f * (diameter - 1.0f);
 
     if(nbands == 0 && sigma < 0.7f) continue;  // unresolvable fine tail: drop
+    if(nbands == 0) sigma_ref = fmaxf(sigma, 0.7f);
 
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
+    // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
+    // blurring at all) as the window grows, so a single global eps leaves
+    // coarse bands empty on most ordinary photographs -- phase0-band-
+    // energy.md found the coarsest 1-4 of 9 bands going exactly to zero on
+    // three of four test images (portrait, sunset, flower), and recommended
+    // promoting this from a Phase-3 "only if" to required. Scale eps up
+    // with the band's own sigma relative to the finest surviving one, so
+    // coarse bands keep real edge-tolerance instead of saturating away.
+    d->feathering[nbands] =
+      d->feathering_base * powf(fmaxf(sigma, 0.7f) / sigma_ref, CT_FEATHERING_EXPONENT);
     nbands++;
   }
   d->nbands = nbands;
@@ -1643,7 +1666,11 @@ void commit_params(dt_iop_module_t *self,
   // UI feathering is inverted (higher = stricter edge preservation).
   // Adjust the strength based on the number of iterations to maintain a consistent overall effect regardless of iteration count.
   const float default_feathering = 0.2f;  // Base value based on Christian's experiments for a good balance of edge preservation and contrast boost at default settings.
-  d->feathering = default_feathering * powf(2.0f, -p->edge_protection) / (p->filter_iterations * p->filter_iterations);
+  // §3.3: this is now the *base* value modify_roi_in scales per band
+  // (d->feathering[] is what process() actually reads); modify_roi_in runs
+  // after commit_params for the same pipe pass and needs d->band[] (also
+  // written here) before it can compute a per-band sigma to scale by.
+  d->feathering_base = default_feathering * powf(2.0f, -p->edge_protection) / (p->filter_iterations * p->filter_iterations);
 }
 
 // redraw the graph once a pipe has actually run, so its stripe shading
