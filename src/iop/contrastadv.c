@@ -1358,12 +1358,22 @@ static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *
   // below runs under the gui-update guard and so deliberately writes nothing
   // back, which is the whole point of that guard -- it normally runs the other
   // way around, syncing widgets to params that have already changed.
-  //
-  // this only positions the ladder (scale_shift); it does not yet reshape the
-  // bands around the measured size -- that reshaping is Phase 1.7.
   dt_iop_contrast_params_t *p = self->params;
   const float d = CLAMP(level, CT_BAND_D0, CT_BAND_D0 + CT_BANDS - 1);
   p->scale_shift = CLAMP(d - roundf(d), -0.5f, 0.5f);
+
+  // §1.7: reshape the bands into a single hump centred on the measured size,
+  // so the pick does something visible beyond repositioning the ladder. a
+  // hump peaking at the neutral gain would be invisible, so if the master
+  // gain hasn't been touched yet, raise it first.
+  if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = 1.5f;
+  const float center = d - CT_BAND_D0;  // continuous band-index units
+  const float width = 1.0f;             // octaves either side of the peak
+  for(int k = 0; k < CT_BANDS; k++)
+  {
+    const float dist = (k - center) / width;
+    p->band[k] = 1.0f + (p->gain_local_contrast - 1.0f) * expf(-0.5f * dist * dist);
+  }
 
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 
