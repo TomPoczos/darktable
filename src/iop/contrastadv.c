@@ -2223,6 +2223,16 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   if(*mode == CT_TARGET_TEXTURE)
   {
     const double target_sigma = sqrt(fit->tau);
+
+    // §6.2: the fitted size sits within half an octave of the window's own
+    // coarse edge (§1.1's lambda_max) -- there is no peak inside what the
+    // box could see, only a rising flank, so the reported size is read off
+    // the edge of the window rather than measured. Warn, don't refuse: this
+    // is the honest answer, not a bad one.
+    if(target_sigma >= sigma[nrungs - 1] / M_SQRT2)
+      dt_control_log(_("the measured size sits at the edge of what this box can see -- "
+                        "it may be larger than reported"));
+
     int nearest = 0;
     double best_d = DBL_MAX;
     for(int r = 0; r < nrungs; r++)
