@@ -2005,10 +2005,21 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     if(by1 <= by0) by1 = MIN(bh, by0 + 1);
     const double nblocks = (double)(bx1 - bx0) * (double)(by1 - by0);
 
-    nrungs = g->ladder_nrungs;
+    // §1.1: a rung whose wavelength does not fit inside the box at least once
+    // is not measuring the box's own texture -- past that size the block sum
+    // is dominated by the box's offset from its surroundings (a bias, not
+    // noise) and the fit will lock onto that instead. One full period is the
+    // loosest defensible cut; see implementation-plan-2.md §1.1.
+    const double box_w = (double)(bx1 - bx0) * CT_BLOCK;
+    const double box_h = (double)(by1 - by0) * CT_BLOCK;
+    const double lambda_max = fmin(box_w, box_h);
+
     const float *const restrict buf = g->pd.buf;
-    for(int r = 0; r < nrungs; r++)
+    nrungs = 0;
+    for(int r = 0; r < g->ladder_nrungs; r++)
     {
+      if(g->ladder_lambda[r] > lambda_max) break;  // rungs run fine -> coarse
+
       const double s2 = buf[(by1 * sat_w + bx1) * comps + 2 * r]
                        - buf[(by0 * sat_w + bx1) * comps + 2 * r]
                        - buf[(by1 * sat_w + bx0) * comps + 2 * r]
@@ -2027,11 +2038,12 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       const double n_per_block = fmax(1.0, (double)(CT_BLOCK * CT_BLOCK) / (step * step));
       const double n_eff = fmax(nblocks * n_per_block, 1.0);
 
-      lambda[r] = g->ladder_lambda[r];
-      energies[r] = s2 / n_eff;
-      s1_energy[r] = s1 / n_eff;
-      weights[r] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_eff);
-      noise_floor[r] = g->ladder_noise_floor[r];
+      lambda[nrungs] = g->ladder_lambda[r];
+      energies[nrungs] = s2 / n_eff;
+      s1_energy[nrungs] = s1 / n_eff;
+      weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_eff);
+      noise_floor[nrungs] = g->ladder_noise_floor[r];
+      nrungs++;
     }
   }
 
