@@ -228,6 +228,17 @@ typedef struct dt_iop_contrast_gui_data_t
   dt_preview_data_t band_pd;
   int band_nbands;               // how many of CT_BANDS survived the pass that built band_pd
   float band_sigma[CT_BANDS];    // finest-first, pixels of that same pass's roi (== ladder_roi_in)
+
+  // §3.2: the last successful pick's own raw per-rung spectrum and fit, for
+  // the graph's live overlay -- a record of the last measurement, drawn
+  // every _area_draw regardless of whether the picker itself is still
+  // "fresh". The fit's scalar fields are stored individually rather than as
+  // a _ct_fit_t so this struct doesn't need that type's (later) definition.
+  gboolean spectrum_valid;
+  int spectrum_nrungs;
+  double spectrum_lambda[CT_MAX_BANDS];
+  double spectrum_energy[CT_MAX_BANDS];
+  double spectrum_noise, spectrum_self_similar, spectrum_texture, spectrum_tau, spectrum_beta;
 } dt_iop_contrast_gui_data_t;
 
 
@@ -1918,8 +1929,15 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
 // refusals `_fit_texture_scale` always used -- too few rungs, too narrow a
 // span, or nothing above the noise floor anywhere in the box; the two
 // dt_control_log calls below are advisory only and never cause a refusal.
+// spectrum_lambda/spectrum_energy/spectrum_nrungs (all optional, NULL to
+// skip) return this box's own raw per-rung measurement -- §3.2's graph
+// overlay wants it alongside the fit itself, to plot what was actually
+// measured next to what the model made of it.
 static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
-                                    _ct_fit_t *const fit, _ct_target_mode_t *const mode)
+                                    _ct_fit_t *const fit, _ct_target_mode_t *const mode,
+                                    double *const restrict spectrum_lambda,
+                                    double *const restrict spectrum_energy,
+                                    int *const restrict spectrum_nrungs)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
@@ -2031,6 +2049,13 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     }
   }
 
+  if(spectrum_lambda && spectrum_energy && spectrum_nrungs)
+  {
+    memcpy(spectrum_lambda, lambda, sizeof(double) * nrungs);
+    memcpy(spectrum_energy, energies, sizeof(double) * nrungs);
+    *spectrum_nrungs = nrungs;
+  }
+
   return TRUE;
 }
 
@@ -2074,11 +2099,29 @@ void color_picker_apply(dt_iop_module_t *self,
 
   _ct_fit_t fit;
   _ct_target_mode_t mode;
-  if(!_fit_curve_from_box(self, box, &fit, &mode))
+  double spectrum_lambda[CT_MAX_BANDS], spectrum_energy[CT_MAX_BANDS];
+  int spectrum_nrungs = 0;
+  if(!_fit_curve_from_box(self, box, &fit, &mode,
+                          spectrum_lambda, spectrum_energy, &spectrum_nrungs))
   {
     dt_control_log(_("the picked area is too small, or has nothing in it to measure a detail size from"));
     return;
   }
+
+  // §3.2: publish this pick's own spectrum + fit for the graph's live
+  // overlay -- a record of the last measurement, independent of whether the
+  // picker itself is still "fresh" by the time it gets drawn.
+  dt_iop_gui_enter_critical_section(self);
+  memcpy(g->spectrum_lambda, spectrum_lambda, sizeof(double) * spectrum_nrungs);
+  memcpy(g->spectrum_energy, spectrum_energy, sizeof(double) * spectrum_nrungs);
+  g->spectrum_nrungs = spectrum_nrungs;
+  g->spectrum_noise = fit.noise;
+  g->spectrum_self_similar = fit.self_similar;
+  g->spectrum_texture = fit.texture;
+  g->spectrum_tau = fit.tau;
+  g->spectrum_beta = fit.beta;
+  g->spectrum_valid = TRUE;
+  dt_iop_gui_leave_critical_section(self);
 
   // write into params and commit *before* refreshing the widget: the refresh
   // below runs under the gui-update guard and so deliberately writes nothing
@@ -2266,6 +2309,175 @@ static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const flo
   dt_bauhaus_slider_set_val(g->band[k], gain);
 }
 
+// ---------------------------------------------------------------------------
+// §3.2: the live spectrum overlay -- research.md's own suggestion (§5.6,
+// implementation-plan.md §1.4 step 4/toneequal's inset histogram) to draw
+// the frame-wide ladder as the graph's background at all times, and the
+// last picked box's own spectrum plus its fitted model on top of it once a
+// pick has landed. Makes the picker legible instead of magic: the data was
+// already being measured (§2.1/§3.1), this just puts it on screen.
+// ---------------------------------------------------------------------------
+
+// map a wavelength (in the ladder/box roi's own pixels) to the graph's x
+// fraction, on the same nominal-octave axis the band nodes themselves sit
+// on (_graph_curve_from_params) -- ignoring scale_shift, exactly as the
+// nodes' own fixed screen positions do, so a rung and the node it nominally
+// corresponds to line up regardless of where scale_shift has since moved
+// the *physical* meaning of that node.
+static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
+{
+  const double d = -log2(lambda / fmax(roi_long_edge, 1.0));
+  return CLAMP((float)((d - CT_BAND_D0) / (double)CT_BANDS), 0.0f, 1.0f);
+}
+
+// energies span orders of magnitude across ordinary images (phase0-band-
+// energy.md's own tables), so the y axis here is log, normalised to
+// whichever curve on screen has the higher peak -- purely relative shape,
+// no fixed absolute meaning.
+#define CT_SPECTRUM_LOG_RANGE 10.0  // stops of dynamic range shown below the on-screen peak
+
+static float _spectrum_energy_to_y(const double energy, const double peak)
+{
+  if(energy <= 0.0 || peak <= 0.0) return 0.0f;
+  return CLAMP((float)(1.0 + log2(energy / peak) / CT_SPECTRUM_LOG_RANGE), 0.0f, 1.0f);
+}
+
+// the frame-wide ladder's own spectrum: one (lambda, energy) point per rung,
+// energy = S2/n over the *whole* ladder grid. Since a summed-area table is
+// zero-padded on its low side (§2.1's _ladder_build_sat), the frame total is
+// simply the table's own opposite corner -- no subtraction needed, unlike a
+// box query.
+static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
+                                     double *const restrict lambda,
+                                     double *const restrict energy,
+                                     int *const restrict nrungs)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+  gboolean ok = FALSE;
+
+  dt_iop_gui_enter_critical_section(self);
+  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
+  const size_t comps = g->pd.components;
+  if(g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
+     && comps == (size_t)(2 * g->ladder_nrungs))
+  {
+    const double nblocks = (double)(sat_w - 1) * (double)(sat_h - 1);
+    const float *const restrict buf = g->pd.buf;
+    const size_t corner = (sat_h - 1) * sat_w + (sat_w - 1);
+    *nrungs = g->ladder_nrungs;
+    for(int r = 0; r < g->ladder_nrungs; r++)
+    {
+      const double step = g->ladder_step[r];
+      const double n_per_block = fmax(1.0, (CT_BLOCK / step) * (CT_BLOCK / step));
+      const double n_eff = fmax(nblocks * n_per_block, 1.0);
+      lambda[r] = g->ladder_lambda[r];
+      energy[r] = (double)buf[corner * comps + 2 * r] / n_eff;
+    }
+    ok = TRUE;
+  }
+  dt_iop_gui_leave_critical_section(self);
+  return ok;
+}
+
+// draw one (lambda[], energy[]) polyline, in the current cairo source, over
+// the graph's plotting area.
+static void _draw_spectrum_curve(cairo_t *cr, const int width, const int height,
+                                 const double *const restrict lambda,
+                                 const double *const restrict energy,
+                                 const int n, const double roi_long_edge, const double peak)
+{
+  if(n < 1) return;
+  gboolean started = FALSE;
+  for(int r = 0; r < n; r++)
+  {
+    const float x = _spectrum_lambda_to_x(lambda[r], roi_long_edge) * width;
+    const float y = height * (1.0f - _spectrum_energy_to_y(energy[r], peak));
+    if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
+    else cairo_line_to(cr, x, y);
+  }
+  cairo_stroke(cr);
+}
+
+static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
+                                   const int width, const int height)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+
+  double frame_lambda[CT_MAX_BANDS], frame_energy[CT_MAX_BANDS];
+  int frame_nrungs = 0;
+  const gboolean have_frame = _spectrum_frame_wide(self, frame_lambda, frame_energy, &frame_nrungs);
+
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean have_pick = g->spectrum_valid;
+  const int pick_nrungs = g->spectrum_nrungs;
+  double pick_lambda[CT_MAX_BANDS], pick_energy[CT_MAX_BANDS];
+  double fit_noise = 0.0, fit_self_similar = 0.0, fit_texture = 0.0, fit_tau = 0.0, fit_beta = 2.0;
+  if(have_pick)
+  {
+    memcpy(pick_lambda, g->spectrum_lambda, sizeof(double) * pick_nrungs);
+    memcpy(pick_energy, g->spectrum_energy, sizeof(double) * pick_nrungs);
+    fit_noise = g->spectrum_noise;
+    fit_self_similar = g->spectrum_self_similar;
+    fit_texture = g->spectrum_texture;
+    fit_tau = g->spectrum_tau;
+    fit_beta = g->spectrum_beta;
+  }
+  const double roi_long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
+  dt_iop_gui_leave_critical_section(self);
+
+  if(!have_frame && !have_pick) return;
+
+  double peak = 0.0;
+  for(int r = 0; r < frame_nrungs; r++) peak = fmax(peak, frame_energy[r]);
+  for(int r = 0; r < pick_nrungs; r++) peak = fmax(peak, pick_energy[r]);
+  if(peak <= 0.0) return;
+
+  cairo_save(cr);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+
+  if(have_frame)
+  {
+    cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                             darktable.bauhaus->graph_border.green,
+                             darktable.bauhaus->graph_border.blue, 0.8);
+    _draw_spectrum_curve(cr, width, height, frame_lambda, frame_energy, frame_nrungs,
+                         roi_long_edge, peak);
+  }
+
+  if(have_pick)
+  {
+    cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
+                             darktable.bauhaus->color_fill.green,
+                             darktable.bauhaus->color_fill.blue, 0.9);
+    _draw_spectrum_curve(cr, width, height, pick_lambda, pick_energy, pick_nrungs,
+                         roi_long_edge, peak);
+
+    // the fitted S(lambda) + N(lambda) model, sampled densely across the
+    // picked box's own measured range, dashed to read as "model" rather
+    // than "measurement" next to the polyline above.
+    const _ct_fit_t fit = { .noise = fit_noise, .self_similar = fit_self_similar,
+                            .texture = fit_texture, .tau = fit_tau, .beta = fit_beta };
+    const double dashes[2] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(3.0) };
+    cairo_set_dash(cr, dashes, 2, 0.0);
+    gboolean started = FALSE;
+    const double lo = pick_lambda[0], hi = pick_lambda[pick_nrungs - 1];
+    for(int j = 0; j <= CT_GRAPH_RES; j++)
+    {
+      const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
+      double S, N;
+      _ct_fit_eval(&fit, lambda, &S, &N);
+      const float x = _spectrum_lambda_to_x(lambda, roi_long_edge) * width;
+      const float y = height * (1.0f - _spectrum_energy_to_y(S + N, peak));
+      if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
+      else cairo_line_to(cr, x, y);
+    }
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
+  }
+
+  cairo_restore(cr);
+}
+
 static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = self->gui_data;
@@ -2322,8 +2534,11 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   dt_draw_line(cr, 0, baseline_y, width, baseline_y);
   cairo_stroke(cr);
 
-  // 5. the curve: monotone cubic through the nine nodes (research.md's
-  // Phase 2 spectrum overlay is not built yet, so there is no step 4 here)
+  // 4. the measured spectrum (§3.2): frame-wide ladder always in the
+  // background, the last pick's own spectrum + fitted model on top of it.
+  _draw_spectrum_overlay(cr, self, width, height);
+
+  // 5. the curve: monotone cubic through the nine nodes
   _graph_curve_from_params(g->curve, p);
   float xs[CT_GRAPH_RES], ys[CT_GRAPH_RES];
   dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, xs, ys);
