@@ -650,6 +650,30 @@ static gboolean _fit_spectrum(const double *const restrict lambda,
   return TRUE;
 }
 
+// §2.5/research.md §5.6: S(lambda) = A*G(lambda;tau) + C*lambda^(beta-2) (real
+// scene detail) and N(lambda) = N*G(lambda;0) (noise), evaluated in exactly
+// the (s = sigma^2 = (lambda/2pi)^2) basis _fit_spectrum solved in -- reusing
+// _dog_shape as G is what keeps this consistent with the fit rather than
+// introducing a second, unrelated normalisation.
+static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double lambda,
+                                double *const S, double *const N)
+{
+  const double sigma = lambda / (2.0 * M_PI);
+  const double s = sigma * sigma;
+  *S = fit->texture * _dog_shape(s, fit->tau)
+     + fit->self_similar * pow(s, (fit->beta - 2.0) * 0.5);
+  *N = fit->noise * _dog_shape(s, 0.0);
+}
+
+// §2.5: which of research.md §5.6's target shapes a fit earns. TEXTURE is
+// the default; DETAIL is the A-negligible fallback -- "a self-similar area
+// with no size", `_fit_curve_from_box` below decides which.
+typedef enum _ct_target_mode_t
+{
+  CT_TARGET_TEXTURE = 0,
+  CT_TARGET_DETAIL  = 1
+} _ct_target_mode_t;
+
 // ---------------------------------------------------------------------------
 // §2.1: the frame-wide DoG ladder + block energy tables
 // ---------------------------------------------------------------------------
@@ -1488,20 +1512,153 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
     gtk_widget_queue_draw(GTK_WIDGET(g->area));
 }
 
+// ---------------------------------------------------------------------------
+// §2.5: from the fit to a target gain curve, and from that curve to nodes
+// ---------------------------------------------------------------------------
+//
+// research.md §5.6: the picker's job stops at *shape*, never strength -- the
+// caller (color_picker_apply) is what turns this into an actual gain curve,
+// by lerping between 1 (no effect) and the master gain along the shape
+// below, so dragging the master gain afterwards keeps behaving predictably.
+
+// §2.5/research.md §5.6: shape(lambda), peak-normalised where the table says
+// so -- T_hat carries its own peak-1 normalisation (over the grid actually
+// evaluated, since that is the only "max(A*G)" available here); DETAIL's
+// S/(S+N) is used exactly as it falls out, per the table, with no further
+// rescaling.
+static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
+                          const double *const restrict lambda_grid, const int m,
+                          double *const restrict shape)
+{
+  double peak_tex = 0.0;
+  if(mode == CT_TARGET_TEXTURE)
+    for(int j = 0; j < m; j++)
+    {
+      const double sigma = lambda_grid[j] / (2.0 * M_PI);
+      peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma * sigma, fit->tau));
+    }
+
+  for(int j = 0; j < m; j++)
+  {
+    double S, N;
+    _ct_fit_eval(fit, lambda_grid[j], &S, &N);
+    const double wiener = S / fmax(S + N, DBL_MIN);
+
+    if(mode == CT_TARGET_TEXTURE)
+    {
+      const double sigma = lambda_grid[j] / (2.0 * M_PI);
+      const double that = peak_tex > 0.0
+        ? (fit->texture * _dog_shape(sigma * sigma, fit->tau)) / peak_tex : 0.0;
+      shape[j] = that * wiener;
+    }
+    else
+    {
+      shape[j] = wiener;
+    }
+  }
+}
+
+// §2.5/research.md §5.7: least-squares projection of a target curve onto the
+// module's own band gains. Point-sampling g_target at each node's own
+// wavelength would be wrong -- the bands overlap too heavily (§2.2) -- so
+// this solves for the {g_k} whose H_k basis best reproduces the whole curve
+// instead, with a second-difference penalty for smoothness (the fitted model
+// is already the regulariser against per-rung noise; this is what keeps nine
+// mostly-collinear H_k columns from chasing that noise into an oscillating
+// curve).
+//
+// H_k(lambda) = HP_k(lambda) - HP_{k-1}(lambda), HP_k(lambda) = 1 -
+// exp(-2*pi^2*sigma_k^2/lambda^2) is the cumulative fraction of energy at
+// wavelength `lambda` band k's own highpass (relative to its boundary sigma)
+// would capture; the incremental H_k is what setting gain_k alone adds to
+// the module's net response, treating boundary -1 as sigma = 0 (nothing
+// captured before band 0).
+//
+// sigma[] and gains[] both run finest-first (sigma increasing with k), which
+// is d->sigma[]'s own convention (§1.2) -- the caller maps back to param
+// (coarsest-first) order.
+#define CT_PROJECT_GRID 100
+// second-difference penalty weight (relative to one grid point's own unit
+// weight, scaled by grid size below) -- small enough not to flatten a real
+// single-octave hump, large enough that nine mostly-collinear H_k columns
+// don't chase per-point noise into an oscillating curve. no closed-form
+// value here; picked by eye against a synthetic single-hump target and left
+// generous rather than tight, since implementation-plan.md §2.5's own
+// acceptance leans on the fit -- not this regulariser -- to keep the curve
+// honest.
+#define CT_PROJECT_SMOOTHNESS 0.05
+
+static gboolean _project_to_bands(const double *const restrict lambda_grid,
+                                  const double *const restrict g_target,
+                                  const int m,
+                                  const float *const restrict sigma,
+                                  const int nbands,
+                                  float *const restrict gains)
+{
+  if(nbands < 2 || m < 2) return FALSE;
+
+  const int nreg = nbands - 2;
+  const size_t rows = (size_t)m + (size_t)MAX(nreg, 0);
+
+  float *const restrict A = dt_alloc_align_float(rows * (size_t)nbands);
+  float *const restrict y = dt_alloc_align_float(rows);
+  if(!A || !y) { dt_free_align(A); dt_free_align(y); return FALSE; }
+
+  memset(A, 0, rows * (size_t)nbands * sizeof(float));
+
+  for(int j = 0; j < m; j++)
+  {
+    const double lambda = lambda_grid[j];
+    for(int k = 0; k < nbands; k++)
+    {
+      const double sigma_km1 = (k == 0) ? 0.0 : (double)sigma[k - 1];
+      const double sigma_k = (double)sigma[k];
+      const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
+      const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
+      A[j * nbands + k] = (float)(hp_k - hp_km1);
+    }
+    y[j] = (float)(g_target[j] - 1.0);
+  }
+
+  const double w = sqrt(CT_PROJECT_SMOOTHNESS * (double)m);
+  for(int r = 0; r < nreg; r++)
+  {
+    const int row = m + r;
+    A[row * nbands + r]     = (float)w;
+    A[row * nbands + r + 1] = (float)(-2.0 * w);
+    A[row * nbands + r + 2] = (float)w;
+    y[row] = 0.0f;
+  }
+
+  const gboolean ok = pseudo_solve(A, y, rows, (size_t)nbands, FALSE);
+  if(ok)
+    for(int k = 0; k < nbands; k++)
+      gains[k] = CLAMP(y[k] + 1.0f, 0.0f, 5.0f);
+
+  dt_free_align(A);
+  dt_free_align(y);
+  return ok;
+}
+
 // §2.2: query the ladder's published SAT tables for the box the picker
-// selected, and feed the resulting per-rung (wavelength, energy, weight)
-// triples to §2.3's `_fit_spectrum` -- primed, per §2.4, with a frame-wide
-// noise estimate rather than fitting N freely -- and (§2.4) read the box's
-// own sparseness back out of the same tables. box is in the pixels of
-// g->ladder_roi_in, i.e. of the preview the ladder was built from. returns
-// the fitted texture wavelength in those same pixels, or 0 if nothing was
-// measurable in the box -- see below for what "nothing" covers now that the
-// fit separates noise and self-similar content from an actual texture size.
+// selected, feed the resulting per-rung (wavelength, energy, weight) triples
+// to §2.3's `_fit_spectrum` -- primed, per §2.4, with a frame-wide noise
+// estimate rather than fitting N freely -- and (§2.4) read the box's own
+// sparseness back out of the same tables. box is in the pixels of
+// g->ladder_roi_in, i.e. of the preview the ladder was built from.
 //
 // research.md §5.2: any box query is 4 lookups per rung -- this is that
 // query, one held critical section covering every rung so the buffer can't
 // be resized out from under it mid-query.
-static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
+//
+// on success, *fit holds the model and *mode which of §2.5's target shapes
+// it earns (TEXTURE normally, DETAIL when A came back negligible -- "a
+// self-similar area with no size"). returns FALSE only under the same
+// refusals `_fit_texture_scale` always used -- too few rungs, too narrow a
+// span, or nothing above the noise floor anywhere in the box; the two
+// dt_control_log calls below are advisory only and never cause a refusal.
+static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
+                                    _ct_fit_t *const fit, _ct_target_mode_t *const mode)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
@@ -1561,7 +1718,7 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
 
   dt_iop_gui_leave_critical_section(self);
 
-  if(!have_data) return 0.0;
+  if(!have_data) return FALSE;
 
   double peak_e = 0.0;
   for(int r = 0; r < nrungs; r++) peak_e = fmax(peak_e, energies[r]);
@@ -1571,47 +1728,32 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
   // stops a genuinely fine texture from getting explained away as noise.
   const double noise_prior = _ladder_estimate_noise(lambda, noise_floor, nrungs);
 
-  _ct_fit_t fit;
-  if(!_fit_spectrum(lambda, energies, weights, nrungs, noise_prior, &fit)) return 0.0;
+  if(!_fit_spectrum(lambda, energies, weights, nrungs, noise_prior, fit)) return FALSE;
 
-  // §2.4/research.md §5.9: advisory only -- does not refuse the pick, just
-  // explains a result that might otherwise look like nothing happened.
-  // evaluated at the box's own peak-energy rung: S(lambda) = A*G(lambda;tau)
-  // + C*lambda^(beta-2) is what the fit calls real content, N(lambda) =
-  // N*G(lambda;0) is what it calls noise, both in the same (s = sigma^2)
-  // basis _fit_spectrum solved in.
+  // §2.5/research.md §5.6: what the texture term actually delivers over the
+  // measured rungs (fit->texture_peak) is negligible next to the box's own
+  // peak energy: there is no sized texture here, only sensor noise and/or
+  // ordinary (beta != 2) scene content -- fall back to the broad DETAIL
+  // shape rather than inventing a bump. (fit->texture itself is not
+  // comparable to peak_e -- see §2.3's own comment on why texture_peak
+  // exists.)
+  *mode = (fit->texture_peak <= peak_e * 1e-2) ? CT_TARGET_DETAIL : CT_TARGET_TEXTURE;
+
+  // §2.4/research.md §5.9: advisory only, neither warning below refuses the
+  // pick -- both just explain a result that might otherwise look like
+  // nothing happened, or like an untrustworthy size.
   {
     int peak_idx = 0;
     for(int r = 1; r < nrungs; r++) if(energies[r] > energies[peak_idx]) peak_idx = r;
-    const double sigma_pk = lambda[peak_idx] / (2.0 * M_PI);
-    const double s_pk = sigma_pk * sigma_pk;
-    const double S = fit.texture * _dog_shape(s_pk, fit.tau)
-                    + fit.self_similar * pow(s_pk, (fit.beta - 2.0) * 0.5);
-    const double N = fit.noise * _dog_shape(s_pk, 0.0);
+    double S, N;
+    _ct_fit_eval(fit, lambda[peak_idx], &S, &N);
     if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
       dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
   }
 
-  // what the texture term actually delivers over the measured rungs
-  // (fit.texture_peak) is negligible next to the box's own peak energy:
-  // there is no sized texture here to report a wavelength for, only sensor
-  // noise and/or ordinary (beta != 2) scene content -- comparing fit.texture
-  // itself to fit.noise/fit.self_similar would not mean anything, since
-  // _dog_shape's amplitude and the self-similar power law's live on
-  // unrelated scales. research.md §5.6 (Phase 2.5) is what turns "no real
-  // texture" into a proper fallback to a "detail" target curve; until then,
-  // fall back the same way `_fit_texture_scale` used to on a self-similar
-  // area -- report the finest measurable size, which boosts what is there
-  // without reaching for structure that isn't, rather than declining
-  // outright.
-  if(fit.texture_peak <= peak_e * 1e-2) return lambda[0];
-
-  // §2.4/research.md §5.9: advisory only, does not refuse the pick -- warns
-  // that the measured size may not mean much when the box's rung nearest the
-  // fitted texture size looks sparse (kappa >> CT_KAPPA_GAUSSIAN) rather than
-  // dense, i.e. more like one strong edge crossing the box than real texture.
+  if(*mode == CT_TARGET_TEXTURE)
   {
-    const double target_lambda = 2.0 * M_PI * sqrt(fit.tau);
+    const double target_lambda = 2.0 * M_PI * sqrt(fit->tau);
     int nearest = 0;
     double best_d = DBL_MAX;
     for(int r = 0; r < nrungs; r++)
@@ -1628,11 +1770,7 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
     }
   }
 
-  // the hump peaks at t = 2*tau, i.e. at sigma = sqrt(2)*sigma_t, and the
-  // normalized Laplacian of a sinusoid of wavelength L peaks at
-  // sigma = L / (pi*sqrt(2)) -- so the wavelength this stands for is simply
-  // 2*pi*sigma_t (`_fit_texture_scale`'s established convention).
-  return 2.0 * M_PI * sqrt(fit.tau);
+  return TRUE;
 }
 
 // §2.2: synchronous now that the ladder is frame-wide and pre-published
@@ -1673,50 +1811,65 @@ void color_picker_apply(dt_iop_module_t *self,
       memcpy(box, picked, sizeof(box));
   }
 
-  const double wavelength = _fit_curve_from_box(self, box);
-  if(wavelength <= 0.0)
+  _ct_fit_t fit;
+  _ct_target_mode_t mode;
+  if(!_fit_curve_from_box(self, box, &fit, &mode))
   {
     dt_control_log(_("the picked area is too small, or has nothing in it to measure a detail size from"));
     return;
   }
-
-  // invert what modify_roi_in() does with a node's placement: node D's
-  // window is 2^-D * max_size * roi->scale pixels wide, so asking for a
-  // window exactly one texture wavelength wide -- the shortest box average
-  // that removes that texture from the base layer completely, and so hands
-  // all of it to the high pass without also dragging in anything coarser --
-  // gives the D below, which is folded into scale_shift.
-  //
-  // the scale factor cancels the fact that this was measured on the preview:
-  // what comes out is a fraction of the frame and is carried unchanged to
-  // full resolution. what does not cancel is that the preview cannot resolve
-  // texture finer than a few of its own pixels, which is what bounds the
-  // fine end of the answer.
-  const double max_size = MAX(pipe->iwidth, pipe->iheight);
-  const double scale = fmax((double)roi_in.scale, 1e-6);
-  const float level =
-    (float)CLAMP(log2(max_size * scale / wavelength), 0.0, 15.0);
 
   // write into params and commit *before* refreshing the widget: the refresh
   // below runs under the gui-update guard and so deliberately writes nothing
   // back, which is the whole point of that guard -- it normally runs the other
   // way around, syncing widgets to params that have already changed.
   dt_iop_contrast_params_t *p = self->params;
-  const float d = CLAMP(level, CT_BAND_D0, CT_BAND_D0 + CT_BANDS - 1);
-  p->scale_shift = CLAMP(d - roundf(d), -0.5f, 0.5f);
 
-  // §1.7: reshape the bands into a single hump centred on the measured size,
-  // so the pick does something visible beyond repositioning the ladder. a
-  // hump peaking at the neutral gain would be invisible, so if the master
-  // gain hasn't been touched yet, raise it first.
+  // §2.5/research.md §5.6: the picker sets shape, never strength -- with one
+  // exception, the same one blackwhite's picker uses to turn its filter on:
+  // a shape with no strength behind it (gain still at its neutral default)
+  // would be invisible, so raise it first.
   if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = 1.5f;
-  const float center = d - CT_BAND_D0;  // continuous band-index units
-  const float width = 1.0f;             // octaves either side of the peak
-  for(int k = 0; k < CT_BANDS; k++)
+
+  // §2.5: the nominal per-band boundary sigma, in the same (ladder-roi)
+  // pixel units as `lambda` above -- modify_roi_in's own formula (§1.2), but
+  // evaluated at the ladder's roi/scale_shift rather than whatever roi
+  // happens to be piping through when the picker fires, and finest-first
+  // (idx 0) to match `_project_to_bands`'s H_k derivation.
+  float sigma[CT_BANDS];
   {
-    const float dist = (k - center) / width;
-    p->band[k] = 1.0f + (p->gain_local_contrast - 1.0f) * expf(-0.5f * dist * dist);
+    const float S = MAX(pipe->iwidth, pipe->iheight);
+    int idx = 0;
+    for(int k = CT_BANDS - 1; k >= 0; k--)
+    {
+      const float D = CT_BAND_D0 + k + 0.5f + p->scale_shift;
+      const float diameter = exp2f(-D) * S * (float)roi_in.scale;
+      sigma[idx++] = fmaxf(0.5f * (diameter - 1.0f), 0.0f);
+    }
   }
+
+  // dense log-lambda grid spanning the node ladder itself, padded two
+  // octaves either side so the projection sees each end band's full
+  // response rather than a truncated one.
+  double lambda_grid[CT_PROJECT_GRID], shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
+  const double lo = 2.0 * M_PI * fmax((double)sigma[0], 1e-3) * 0.25;
+  const double hi = 2.0 * M_PI * (double)sigma[CT_BANDS - 1] * 4.0;
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+    lambda_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+
+  _target_curve(&fit, mode, lambda_grid, CT_PROJECT_GRID, shape);
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+    target[j] = 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
+
+  float gains[CT_BANDS];  // finest-first, matching sigma[] above
+  if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, gains))
+  {
+    dt_control_log(_("could not fit a curve to the picked area"));
+    return;
+  }
+
+  for(int k = 0; k < CT_BANDS; k++)
+    p->band[k] = gains[CT_BANDS - 1 - k];  // back to coarsest-first param order
 
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 
