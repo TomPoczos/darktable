@@ -2212,21 +2212,18 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 // grounding phase 0's decomposition choices had.
 // ---------------------------------------------------------------------------
 
-// an arbitrary, large "frame size" purely to keep the nominal sigma formula
-// well-conditioned (modify_roi_in's own "-1" discretisation correction is
-// negligible once sigma is this large) -- only the *ratios* between bands'
-// sigmas matter for H_k, so any sufficiently large constant here yields the
-// same projected gains. scale_shift = 0: presets sit on the standard ladder.
-#define CT_PRESET_S 100000.0f
-
+// implementation-plan-2.md §5.2: §4.1's frame-relative formula -- H_k
+// depends only on the *ratio* between sigma and lambda, so the arbitrary
+// large "frame size" this used to need (to keep modify_roi_in's own "-1"
+// pixel-discretisation term negligible) was never necessary, and neither
+// was the term itself. scale_shift = 0: presets sit on the standard ladder.
 static void _preset_nominal_sigma(float *const restrict sigma)  // CT_BANDS, finest-first
 {
   int idx = 0;
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
-    const float D = CT_BAND_D0 + k + 0.5f;
-    const float diameter = exp2f(-D) * CT_PRESET_S;
-    sigma[idx++] = fmaxf(0.5f * (diameter - 1.0f), 0.0f);
+    const double D = CT_BAND_D0 + k + 0.5;
+    sigma[idx++] = (float)exp2(-(D + 1.0));
   }
 }
 
@@ -2271,19 +2268,26 @@ void init_presets(dt_iop_module_so_t *self)
   p.decomposition = CT_DECOMPOSITION_ACCURATE;
   for(int k = 0; k < CT_BANDS; k++) p.band[k] = 1.0f;
 
+  // implementation-plan-2.md §5.2/§4.3: sigma-native grid, frame-relative
+  // (long edge = 1.0 throughout -- _spectrum_lambda_to_x's roi_long_edge
+  // argument, and _preset_nominal_sigma above), matching the picker's own
+  // §4.3 grid exactly.
   float sigma[CT_BANDS];
   _preset_nominal_sigma(sigma);
-  double lambda_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
-  const double lo = 2.0 * M_PI * fmax((double)sigma[0], 1e-3) * 0.25;
-  const double hi = 2.0 * M_PI * (double)sigma[CT_BANDS - 1] * 4.0;
+  double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
+  const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
+  const double hi = (double)sigma[CT_BANDS - 1] * 4.0;
   for(int j = 0; j < CT_PROJECT_GRID; j++)
-    lambda_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+  {
+    sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+    lambda_grid[j] = sigma_grid[j] * CT_SIGMA_TO_LAMBDA;
+  }
 
   // "clarity": a broad boost centred mid-ladder, slightly toward the coarse
   // side -- traditional medium/large-scale local contrast.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
-    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], 1.0);
     target[j] = 1.0 + 0.6 * _preset_bump(x, 0.35, 0.5);
   }
   if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.6f, &p))
@@ -2294,7 +2298,7 @@ void init_presets(dt_iop_module_so_t *self)
   // than micro-contrast below, meant as a general "add texture" default.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
-    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], 1.0);
     target[j] = 1.0 + 0.5 * _preset_bump(x, 0.7, 0.6);
   }
   if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.5f, &p))
@@ -2305,7 +2309,7 @@ void init_presets(dt_iop_module_so_t *self)
   // than a bump, for a tighter, more surgical fine-detail boost.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
-    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], 1.0);
     const double ramp = pow(CLAMP((x - 0.55) / 0.45, 0.0, 1.0), 1.5);
     target[j] = 1.0 + 0.8 * ramp;
   }
@@ -2317,7 +2321,7 @@ void init_presets(dt_iop_module_so_t *self)
   // smoother, g_k < 1 toward the finest bands, untouched at the coarse end.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
-    const double x = _spectrum_lambda_to_x(lambda_grid[j], CT_PRESET_S);
+    const double x = _spectrum_lambda_to_x(lambda_grid[j], 1.0);
     const double ramp = CLAMP((x - 0.5) / 0.5, 0.0, 1.0);
     target[j] = 1.0 - 0.7 * ramp;
   }
@@ -2336,17 +2340,16 @@ void init_presets(dt_iop_module_so_t *self)
   {
     const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.4, .noise = 0.02,
                                   .texture = 0.0, .tau = 0.0 };
-    const double lambda_mid = sqrt(lo * hi);
+    // lo/hi are the sigma-grid bounds (§5.2) -- _ct_fit_eval takes sigma
+    // directly, no CT_SIGMA_TO_LAMBDA conversion needed here.
+    const double sigma_mid = sqrt(lo * hi);
     double s_ref, n_ref;
-    // implementation-plan-2.md §3.2: _ct_fit_eval takes sigma now; §5.2
-    // rebuilds this preset's grid as sigma-native, this is the minimal
-    // conversion to keep it correct in the meantime.
-    _ct_fit_eval(&synthetic, lambda_mid / CT_SIGMA_TO_LAMBDA, &s_ref, &n_ref);
+    _ct_fit_eval(&synthetic, sigma_mid, &s_ref, &n_ref);
     const double alpha = 0.4;
     for(int j = 0; j < CT_PROJECT_GRID; j++)
     {
       double s_hat, n_hat;
-      _ct_fit_eval(&synthetic, lambda_grid[j] / CT_SIGMA_TO_LAMBDA, &s_hat, &n_hat);
+      _ct_fit_eval(&synthetic, sigma_grid[j], &s_hat, &n_hat);
       const double wiener = s_hat / fmax(s_hat + n_hat, DBL_MIN);
       const double eq = pow(s_ref / fmax(s_hat, DBL_MIN), alpha) * wiener;
       target[j] = CLAMP(eq, 0.3, 2.5);
