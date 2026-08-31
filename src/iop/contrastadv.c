@@ -2899,6 +2899,35 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_fill(cr);
   }
 
+  // 2b. §6.3: shade the coarse end of the axis the last pick's own window
+  // (§1.1) could not see -- coarse sits at x=0, same axis the unresolvable
+  // shading above uses. The honest version of 6.1/6.2's refusal/warning:
+  // this is *why* the pick answered what it did. The coarsest rung that
+  // survived the window (published as the last entry of g->spectrum_lambda,
+  // already the windowed set per §1.3) stands in for the window's own
+  // cutoff -- close enough, since nothing coarser than it was ever queried.
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const gboolean have_pick_window = g->spectrum_valid && g->spectrum_nrungs > 0;
+    const double pick_coarsest_lambda =
+      have_pick_window ? g->spectrum_lambda[g->spectrum_nrungs - 1] : 0.0;
+    const double window_roi_long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
+    dt_iop_gui_leave_critical_section(self);
+
+    if(have_pick_window)
+    {
+      const float x1 = _spectrum_lambda_to_x(pick_coarsest_lambda, window_roi_long_edge) * width;
+      if(x1 > 0.0f)
+      {
+        cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                                 darktable.bauhaus->graph_border.green,
+                                 darktable.bauhaus->graph_border.blue, 0.4);
+        cairo_rectangle(cr, 0, 0, x1, height);
+        cairo_fill(cr);
+      }
+    }
+  }
+
   // 3. baseline at gain 1.0
   const float baseline_y = height * (1.0f - 1.0f / CT_GRAPH_Y_MAX);
   set_color(cr, darktable.bauhaus->graph_fg);
