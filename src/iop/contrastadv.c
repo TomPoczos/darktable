@@ -1889,16 +1889,37 @@ static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
   return M_PI * sqrt(num / den);
 }
 
-// map a wavelength (in some roi's own pixels) to a graph x fraction, on the
-// same nominal-octave axis the band nodes themselves sit on
-// (_graph_curve_from_params) -- ignoring scale_shift, exactly as the nodes'
-// own fixed screen positions do, so a rung/preset shape and the node it
-// nominally corresponds to line up regardless of where scale_shift has
-// since moved the *physical* meaning of that node. Shared by §3.2's graph
-// overlay and §3.4's analytic preset shapes.
+// implementation-plan-2.md §5.1: peak wavelength of an octave-spaced H_k
+// pair, i.e. _band_peak_lambda specialised to sigma_k = 2*sigma_km1 --
+// pi*sqrt(6/ln 4). The finest band (sigma_km1 = 0) is a shelf, not a bump
+// (_band_peak_lambda's own comment), so it will not land exactly on its
+// node under the formula below; that is correct and should be left alone.
+#define CT_BAND_PEAK_FACTOR 6.5357852
+
+// map a wavelength (in some roi's own pixels, or a frame-relative fraction
+// of the long edge if roi_long_edge is 1.0) to a graph x fraction. Node k is
+// drawn at (k+0.5)/CT_BANDS (_graph_curve_from_params); band k's own H_k
+// actually peaks at CT_BAND_PEAK_FACTOR * sigma_lower, sigma_lower being
+// the next-finer band's own boundary sigma (half of band k's own, under
+// §4.1's octave-spaced frame-relative ladder) -- working through §4.1's
+// sigma[k] = 2^-(D0+k+1.5) puts that peak at
+// 2^-(D0+k+0.5) * (CT_BAND_PEAK_FACTOR/4). Anchoring the axis there,
+// instead of at the nominal detail level the old formula used, is what
+// makes a rung/preset shape and the node whose H_k actually responds to it
+// land at the same x -- the old nominal-level axis drew the spectrum
+// 0.7083606 octave toward the coarse end of the band it belonged to
+// (implementation-plan-2.md §5.1's own measurement). Verified here as an
+// identity against _band_peak_lambda for all nine bands, per §5.1's own
+// acceptance criterion; the doc's own inline code snippet has this
+// correction term's sign backwards (confirmed by that check -- an additive
+// +log2(F/4), not the doc's -log2(F/4)). Ignores scale_shift, exactly as
+// the nodes' own fixed screen positions do, so a rung/preset shape and the
+// node it nominally corresponds to line up regardless of where scale_shift
+// has since moved the *physical* meaning of that node. Shared by §3.2's
+// graph overlay and §3.4's analytic preset shapes.
 static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
 {
-  const double d = -log2(lambda / fmax(roi_long_edge, 1.0));
+  const double d = -log2(lambda / fmax(roi_long_edge, 1.0)) + log2(CT_BAND_PEAK_FACTOR / 4.0);
   return CLAMP((float)((d - CT_BAND_D0) / (double)CT_BANDS), 0.0f, 1.0f);
 }
 
