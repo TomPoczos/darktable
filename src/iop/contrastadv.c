@@ -69,6 +69,7 @@ Current status as implemented by Jandren:
 #include "gui/color_picker_proxy.h"
 #include "gui/gtk.h"
 #include "gui/presets.h"
+#include "iop/choleski.h"
 #include "iop/iop_api.h"
 #include "libs/lib.h"
 #include "common/iop_group.h"
@@ -120,6 +121,7 @@ typedef struct _ct_ladder_t
   size_t bw, bh;                 // block grid, the same for every rung
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
   double *sat1;                  // Sum(|b|), same layout
+  double noise_floor[CT_MAX_BANDS];  // §2.4: per-rung, frame-wide block-minimum noise estimate
 } _ct_ladder_t;
 
 typedef enum dt_iop_contrast_decomposition_t
@@ -213,6 +215,7 @@ typedef struct dt_iop_contrast_gui_data_t
   int ladder_nrungs;
   double ladder_lambda[CT_MAX_BANDS];
   double ladder_step[CT_MAX_BANDS];
+  double ladder_noise_floor[CT_MAX_BANDS];  // §2.4, frame-wide, published the same way
   dt_iop_roi_t ladder_roi_in;  // the roi_in the ladder above was built from
 } dt_iop_contrast_gui_data_t;
 
@@ -754,6 +757,64 @@ static void _ladder_build_sat(const double *const restrict blk,
   }
 }
 
+// §2.4/research.md §5.2, §5.5: this rung's noise floor -- the minimum block
+// energy among blocks whose L2/L1 ratio (kappa) is close to what pure
+// Gaussian noise gives. Restricting to near-Gaussian blocks is what keeps a
+// block that happens to hold real texture or a hard edge -- either one pushes
+// kappa well away from CT_KAPPA_GAUSSIAN -- from dragging the floor down
+// below the sensor's actual noise level. Computed frame-wide, over every
+// block on the rung, not just a picked box: "noise is global, texture is
+// local" (implementation-plan.md §2.4), so this is a far more stable
+// estimate than anything one box could produce on its own.
+#define CT_KAPPA_GAUSSIAN 1.2533141373155003  // sqrt(pi/2), kappa of Gaussian noise
+#define CT_KAPPA_NOISE_TOL 0.10                // +/- 10% of CT_KAPPA_GAUSSIAN counts as "noise-like"
+#define CT_KAPPA_EDGE 2.0                      // sparseness warning threshold, research.md §5.2/§5.9
+#define CT_NOISE_DOMINATED_FRAC 0.15           // S/(S+N) below this at the box's peak rung -> warn
+
+static double _ladder_rung_noise_floor(const double *const restrict blk2,
+                                       const double *const restrict blk1,
+                                       const size_t nblocks,
+                                       const double step)
+{
+  const double n_per_block = fmax(1.0, (CT_BLOCK / step) * (CT_BLOCK / step));
+  double floor_e = -1.0;
+  for(size_t i = 0; i < nblocks; i++)
+  {
+    const double m = blk1[i] / n_per_block;
+    if(m <= 0.0) continue;
+    const double e = blk2[i] / n_per_block;
+    const double kappa = sqrt(e) / m;
+    if(fabs(kappa - CT_KAPPA_GAUSSIAN) <= CT_KAPPA_NOISE_TOL * CT_KAPPA_GAUSSIAN
+       && (floor_e < 0.0 || e < floor_e))
+      floor_e = e;
+  }
+  return floor_e;  // < 0: no near-Gaussian block found on this rung
+}
+
+// §2.4: fold every rung's own noise floor into a single scalar estimate of
+// the fit's N (research.md §5.5's "block-minimum noise estimate"). Each
+// rung's floor is a raw energy; dividing out that rung's own noise transfer
+// function (_dog_shape(s,0)) recovers what N it implies, and the minimum
+// implied N across the ladder is the least contaminated one -- self-similar
+// or textured content only ever adds energy on top of the true noise floor,
+// never subtracts from it.
+static double _ladder_estimate_noise(const double *const restrict lambda,
+                                     const double *const restrict noise_floor,
+                                     const int nrungs)
+{
+  double best = -1.0;
+  for(int r = 0; r < nrungs; r++)
+  {
+    if(noise_floor[r] < 0.0) continue;
+    const double sigma = lambda[r] / (2.0 * M_PI);
+    const double g0 = _dog_shape(sigma * sigma, 0.0);
+    if(g0 <= 0.0) continue;
+    const double n_est = noise_floor[r] / g0;
+    if(best < 0.0 || n_est < best) best = n_est;
+  }
+  return best;  // < 0: no usable rung, caller's fit falls back to fitting N freely
+}
+
 // build the ladder frame-wide: mean-centre log2 luminance once, then climb
 // octaves, each one's four rungs blurred straight from that octave's own
 // base (never chained rung-to-rung, which is what keeps every rung an
@@ -844,6 +905,8 @@ static gboolean _build_ladder(const float *const restrict lum,
       for(size_t k = 0; k < cw * ch; k++) band[k] = rung[s][k] - rung[s + 1][k];
 
       _ladder_accumulate_blocks(band, cw, ch, step, ladder->bw, ladder->bh, blk2, blk1);
+      ladder->noise_floor[nrungs] =
+        _ladder_rung_noise_floor(blk2, blk1, ladder->bw * ladder->bh, step);
       _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
 
@@ -1257,6 +1320,7 @@ void process(dt_iop_module_t *self,
       g->ladder_nrungs = built.nrungs;
       memcpy(g->ladder_lambda, built.lambda, sizeof(g->ladder_lambda));
       memcpy(g->ladder_step, built.step, sizeof(g->ladder_step));
+      memcpy(g->ladder_noise_floor, built.noise_floor, sizeof(g->ladder_noise_floor));
       g->ladder_roi_in = *roi_in;
       dt_iop_gui_leave_critical_section(self);
     }
@@ -1426,7 +1490,9 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 
 // §2.2: query the ladder's published SAT tables for the box the picker
 // selected, and feed the resulting per-rung (wavelength, energy, weight)
-// triples to §2.3's `_fit_spectrum`. box is in the pixels of
+// triples to §2.3's `_fit_spectrum` -- primed, per §2.4, with a frame-wide
+// noise estimate rather than fitting N freely -- and (§2.4) read the box's
+// own sparseness back out of the same tables. box is in the pixels of
 // g->ladder_roi_in, i.e. of the preview the ladder was built from. returns
 // the fitted texture wavelength in those same pixels, or 0 if nothing was
 // measurable in the box -- see below for what "nothing" covers now that the
@@ -1440,6 +1506,8 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
   double lambda[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
+  double s1_energy[CT_MAX_BANDS];    // §2.4: Sum(|b|)/n_eff over the box, for its own sparseness
+  double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
   int nrungs = 0;
 
   dt_iop_gui_enter_critical_section(self);
@@ -1469,6 +1537,10 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
                        - buf[(by0 * sat_w + bx1) * comps + 2 * r]
                        - buf[(by1 * sat_w + bx0) * comps + 2 * r]
                        + buf[(by0 * sat_w + bx0) * comps + 2 * r];
+      const double s1 = buf[(by1 * sat_w + bx1) * comps + 2 * r + 1]
+                       - buf[(by0 * sat_w + bx1) * comps + 2 * r + 1]
+                       - buf[(by1 * sat_w + bx0) * comps + 2 * r + 1]
+                       + buf[(by0 * sat_w + bx0) * comps + 2 * r + 1];
 
       // n_per_block is deterministic from the rung's own decimation: CT_BLOCK
       // level-0 pixels per block side, step level-0 pixels per level pixel of
@@ -1481,7 +1553,9 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
 
       lambda[r] = g->ladder_lambda[r];
       energies[r] = s2 / n_eff;
+      s1_energy[r] = s1 / n_eff;
       weights[r] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_eff);
+      noise_floor[r] = g->ladder_noise_floor[r];
     }
   }
 
@@ -1492,10 +1566,31 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
   double peak_e = 0.0;
   for(int r = 0; r < nrungs; r++) peak_e = fmax(peak_e, energies[r]);
 
-  // §2.4 will supply a real per-rung noise floor to fix N against; until
-  // then every call here fits it freely alongside C and A.
+  // §2.4: fix N from the frame-wide block-minimum estimate rather than
+  // fitting it freely -- "stabilises everything else" (research.md §5.5) and
+  // stops a genuinely fine texture from getting explained away as noise.
+  const double noise_prior = _ladder_estimate_noise(lambda, noise_floor, nrungs);
+
   _ct_fit_t fit;
-  if(!_fit_spectrum(lambda, energies, weights, nrungs, -1.0, &fit)) return 0.0;
+  if(!_fit_spectrum(lambda, energies, weights, nrungs, noise_prior, &fit)) return 0.0;
+
+  // §2.4/research.md §5.9: advisory only -- does not refuse the pick, just
+  // explains a result that might otherwise look like nothing happened.
+  // evaluated at the box's own peak-energy rung: S(lambda) = A*G(lambda;tau)
+  // + C*lambda^(beta-2) is what the fit calls real content, N(lambda) =
+  // N*G(lambda;0) is what it calls noise, both in the same (s = sigma^2)
+  // basis _fit_spectrum solved in.
+  {
+    int peak_idx = 0;
+    for(int r = 1; r < nrungs; r++) if(energies[r] > energies[peak_idx]) peak_idx = r;
+    const double sigma_pk = lambda[peak_idx] / (2.0 * M_PI);
+    const double s_pk = sigma_pk * sigma_pk;
+    const double S = fit.texture * _dog_shape(s_pk, fit.tau)
+                    + fit.self_similar * pow(s_pk, (fit.beta - 2.0) * 0.5);
+    const double N = fit.noise * _dog_shape(s_pk, 0.0);
+    if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
+      dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
+  }
 
   // what the texture term actually delivers over the measured rungs
   // (fit.texture_peak) is negligible next to the box's own peak energy:
@@ -1510,6 +1605,28 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
   // without reaching for structure that isn't, rather than declining
   // outright.
   if(fit.texture_peak <= peak_e * 1e-2) return lambda[0];
+
+  // §2.4/research.md §5.9: advisory only, does not refuse the pick -- warns
+  // that the measured size may not mean much when the box's rung nearest the
+  // fitted texture size looks sparse (kappa >> CT_KAPPA_GAUSSIAN) rather than
+  // dense, i.e. more like one strong edge crossing the box than real texture.
+  {
+    const double target_lambda = 2.0 * M_PI * sqrt(fit.tau);
+    int nearest = 0;
+    double best_d = DBL_MAX;
+    for(int r = 0; r < nrungs; r++)
+    {
+      const double dist = fabs(log(lambda[r] / target_lambda));
+      if(dist < best_d) { best_d = dist; nearest = r; }
+    }
+    if(s1_energy[nearest] > 0.0)
+    {
+      const double kappa = sqrt(energies[nearest]) / s1_energy[nearest];
+      if(kappa > CT_KAPPA_EDGE)
+        dt_control_log(_("the picked area looks more like a hard edge than dense texture -- "
+                          "the measured size may be unreliable"));
+    }
+  }
 
   // the hump peaks at t = 2*tau, i.e. at sigma = sqrt(2)*sigma_t, and the
   // normalized Laplacian of a sinusoid of wavelength L peaks at
