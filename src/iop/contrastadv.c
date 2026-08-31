@@ -305,10 +305,9 @@ int legacy_params(dt_iop_module_t *self,
 // §2.2: the ladder itself is built frame-wide now (§2.1's _build_ladder,
 // queried through the SAT tables color_picker_apply() reads directly) rather
 // than inside the picked box, so the box no longer bounds how far the ladder
-// can reach -- what is left here is only the fit: given a rung's (sigma,
+// can reach -- what is left here is only the fit: given a rung's (wavelength,
 // energy, weight) triples for the picked box, what texture size explains
-// them. `_fit_texture_scale` below is still that fit (implementation-plan.md
-// §2.3 replaces it with the richer noise/self-similar/texture model).
+// them. §2.3's `_fit_spectrum`, below, is that fit.
 //
 // detail_level is a low-pass size: the filter radius is 2^-detail_level of the
 // image's long edge, and everything finer than that window ends up in the
@@ -359,10 +358,11 @@ int legacy_params(dt_iop_module_t *self,
 #define CT_FLAT_ENERGY (CT_FLAT_RMS_EV * CT_FLAT_RMS_EV)
 // grid resolution of the model fit's texture size, per octave
 #define CT_FIT_STEPS_PER_OCTAVE 8.0
-// the fit's other grid: the self-similar floor as a fraction of the hump's
-// height, scanned over 2^-CT_FIT_RATIO_FLOOR .. 2^(STEPS - FLOOR)
-#define CT_FIT_RATIO_STEPS 16
-#define CT_FIT_RATIO_FLOOR 12.0
+// the fit's other grid: the self-similar spectrum's slope, research.md §5.3's
+// measured spread across scene categories
+#define CT_FIT_BETA_MIN 1.6
+#define CT_FIT_BETA_MAX 3.0
+#define CT_FIT_BETA_STEPS 6  // 7 values, CT_FIT_BETA_MIN .. CT_FIT_BETA_MAX
 // rungs this far below the peak are noise, and in log space they would
 // otherwise dominate the residual
 #define CT_ENERGY_FLOOR 1e-6
@@ -380,139 +380,271 @@ int legacy_params(dt_iop_module_t *self,
 #define CT_MIN_SPAN 2.0
 #define CT_MIN_BANDS 4
 
-// the size the ladder is best explained by, as a wavelength in the pixels the
-// ladder was measured in, or 0 if it does not describe a texture at all.
+// §2.3: the exact DoG response (research.md §5.4c) of white noise smoothed
+// to sigma_t = sqrt(tau), measured at scale s = sigma^2. reduces to the pure
+// sensor-noise response (§5.4a) at tau = 0 -- which is what lets the same
+// closed form serve as both the model's noise term and its texture term
+// below, differing only in what tau each one carries.
+static inline double _dog_shape(const double s, const double tau)
+{
+  const double k2 = 1.5874010519681994;  // 2^(2/3), the DoG step at CT_SCALES_PER_OCTAVE = 3
+  return 1.0 / (2.0 * (k2 * s + tau))
+       - 2.0 / ((k2 + 1.0) * s + 2.0 * tau)
+       + 1.0 / (2.0 * (s + tau));
+}
+
+// research.md §5.4's model: E(s) = N*_dog_shape(s,0) + C*s^((beta-2)/2) +
+// A*_dog_shape(s,tau) -- sensor noise, self-similar scene content, and a
+// texture with a size, respectively. replaces `_fit_texture_scale`'s
+// single-hump-plus-floor fit: that fit could locate a texture's size but had
+// no way to tell a real one from a patch of self-similar content that simply
+// disagreed with beta = 2, nor from a noise floor rising into the fine end
+// of the ladder -- both read as "texture" before. N, C, A are amplitudes and
+// so constrained >= 0; tau (texture size^2) and beta (spectral slope) are
+// fit by grid search, same discipline as the argmax-is-hopeless reasoning
+// `_fit_texture_scale` documented: locate the hump by fitting its whole
+// shape in log energy, not by reading off a raw peak.
+typedef struct _ct_fit_t
+{
+  double noise, self_similar, texture;  // amplitudes N, C, A -- all >= 0
+  double tau, beta;                     // texture size^2, spectral slope
+  double texture_peak;                  // texture*max(dog_shape) over the *measured* rungs, in energy units
+  double residual;                      // weighted log-space residual, winning grid point
+} _ct_fit_t;
+
+// non-negative least squares for the model's (up to) three linear
+// amplitudes, from the already-weighted normal equations AtA x = Aty.
+// init_active marks which of the three are free to fit (§2.3's caller fixes
+// the noise term off when it has a prior for it); n <= 3, so a closed-form
+// Cramer's-rule solve per active set is simpler and cheaper than a generic
+// solver at the thousands of tiny solves the grid search below runs -- drop
+// the most negative component and resolve until every free component is
+// non-negative or none are left.
+static void _nnls3(const double AtA[3][3],
+                   const double Aty[3],
+                   const gboolean *const restrict init_active,
+                   double *const restrict x)
+{
+  // whiten each column by its own RMS magnitude (sqrt of its AtA diagonal)
+  // before solving. the three model terms live at wildly different natural
+  // scales -- _dog_shape peaks around 1e-4, s^((beta-2)/2) spans several
+  // orders of magnitude over a ten-octave ladder -- so a ridge or
+  // determinant tolerance sized to matter for one column either does
+  // nothing for the others or swamps them outright. normalized, every
+  // active diagonal is ~1 and a single small, scale-free ridge and
+  // determinant floor are meaningful for all three at once; the solved
+  // coefficients are scaled back at the end.
+  double norm[3];
+  for(int a = 0; a < 3; a++) norm[a] = sqrt(fmax(AtA[a][a], 1e-300));
+
+  double M[3][3], y[3];
+  for(int a = 0; a < 3; a++)
+  {
+    y[a] = Aty[a] / norm[a];
+    for(int b = 0; b < 3; b++) M[a][b] = AtA[a][b] / (norm[a] * norm[b]);
+  }
+
+  const double ridge = 1e-9;
+
+  gboolean active[3] = { init_active[0], init_active[1], init_active[2] };
+
+  for(int pass = 0; pass < 4; pass++)
+  {
+    int idx[3], k = 0;
+    for(int j = 0; j < 3; j++) { x[j] = 0.0; if(active[j]) idx[k++] = j; }
+    if(k == 0) return;
+
+    double sol[3] = { 0.0, 0.0, 0.0 };
+    if(k == 1)
+    {
+      const int a = idx[0];
+      const double m = M[a][a] + ridge;
+      if(m > 1e-12) sol[0] = y[a] / m;
+    }
+    else if(k == 2)
+    {
+      const int a = idx[0], b = idx[1];
+      const double m00 = M[a][a] + ridge, m01 = M[a][b], m11 = M[b][b] + ridge;
+      const double det = m00 * m11 - m01 * m01;
+      if(det > 1e-12)
+      {
+        sol[0] = (y[a] * m11 - y[b] * m01) / det;
+        sol[1] = (m00 * y[b] - m01 * y[a]) / det;
+      }
+    }
+    else  // k == 3
+    {
+      const double m00 = M[0][0] + ridge, m01 = M[0][1], m02 = M[0][2];
+      const double m11 = M[1][1] + ridge, m12 = M[1][2], m22 = M[2][2] + ridge;
+      const double c00 = m11 * m22 - m12 * m12;
+      const double c01 = m01 * m22 - m12 * m02;
+      const double c02 = m01 * m12 - m11 * m02;
+      const double det = m00 * c00 - m01 * c01 + m02 * c02;
+      if(det > 1e-15)
+      {
+        const double y0 = y[0], y1 = y[1], y2 = y[2];
+        sol[0] = (y0 * c00 - m01 * (y1 * m22 - m12 * y2) + m02 * (y1 * m12 - m11 * y2)) / det;
+        sol[1] = (m00 * (y1 * m22 - m12 * y2) - y0 * c01 + m02 * (m01 * y2 - y1 * m02)) / det;
+        sol[2] = (m00 * (m11 * y2 - y1 * m12) - m01 * (m01 * y2 - y1 * m02) + y0 * c02) / det;
+      }
+    }
+
+    int worst = -1;
+    double worst_val = -1e-9;  // small negative tolerance against float noise, in the whitened scale
+    for(int c = 0; c < k; c++)
+      if(sol[c] < worst_val) { worst_val = sol[c]; worst = idx[c]; }
+
+    if(worst < 0)
+    {
+      for(int c = 0; c < k; c++) x[idx[c]] = fmax(sol[c], 0.0) / norm[idx[c]];
+      return;
+    }
+    active[worst] = FALSE;
+  }
+}
+
+// fit the model to one box's per-rung (wavelength, energy, weight) triples.
+// noise_prior >= 0 fixes N to that value instead of fitting it (research.md
+// §5.5: "prefer fixing N from the block-minimum noise estimate... stabilises
+// everything else") -- §2.4 is what will supply a real prior; until then
+// every caller passes -1 and N fits freely alongside C and A.
 //
-// the argmax is a hopeless estimator here and it is worth being explicit about
-// why: the normalized-Laplacian curve of a texture with a characteristic size
-// is extremely broad -- an octave either side of its peak it has only fallen
-// by about a sixth -- so a few percent of sampling noise on one rung walks the
-// argmax a whole octave, and in practice it does, constantly. what actually
-// locates the size is not the flat top but the two flanks, which are steep
-// (the energy climbs as t^2 below the peak and falls as 1/t above it) and span
-// decades. so fit the whole curve's shape, and fit it in log energy, where
-// those decades carry their proper weight and each rung's roughly constant
-// *relative* error becomes a constant absolute one.
-//
-// the shape is available in closed form for the simplest thing that counts as
-// "texture of a size": white noise smoothed to sigma_t, whose spectrum is
-// exp(-4 pi^2 f^2 sigma_t^2). integrating the normalized-Laplacian response
-// against it gives A * t^2 / (t + tau)^3 with tau = sigma_t^2, a single hump
-// peaking at t = 2 tau, whose height turns out to depend only on the texture's
-// contrast and not on its size -- so two textures of equal contrast and
-// different size compete on equal terms. anything self-similar underneath --
-// the 1/f^2 part of the picture, which is most of it -- contributes a constant
-// instead, which is precisely what the gamma = 1 normalization was chosen to
-// arrange.
-//
-// that leaves three parameters: the hump's size tau, its height, and the floor
-// under it. only the first two of the three matter to the answer, and in log
-// energy the height is a pure vertical offset, solved in closed form by a mean.
-// so scan tau and the floor-to-height ratio over a grid and take the pair with
-// the smallest residual.
-//
-// the rungs are not equally trustworthy -- one measured on the last, nearly
-// exhausted level of a small area rests on a handful of independent samples
-// where one from the full width rests on thousands -- so every sum below is
-// weighted by how many samples the rung actually had.
-static double _fit_texture_scale(const double *const restrict sigmas,
-                                 const double *const restrict energies,
-                                 const double *const restrict weights,
-                                 const int nbands)
+// returns FALSE under the same refusals `_fit_texture_scale` used: too few
+// rungs or too narrow a span to trust a fit, or nothing above the noise
+// floor anywhere in the box.
+static gboolean _fit_spectrum(const double *const restrict lambda,
+                              const double *const restrict energy,
+                              const double *const restrict weight,
+                              const int n,
+                              const double noise_prior,
+                              _ct_fit_t *const restrict fit)
 {
   // the smallest area that can be measured at all covers exactly one octave,
   // so this comparison is met on the nose there and is given a rounding's
   // worth of slack rather than being left to turn on an ulp.
-  if(nbands < CT_MIN_BANDS
-     || sigmas[nbands - 1] < CT_MIN_SPAN * sigmas[0] * (1.0 - 1e-9))
-    return 0.0;
+  if(n < CT_MIN_BANDS || lambda[n - 1] < CT_MIN_SPAN * lambda[0] * (1.0 - 1e-9))
+    return FALSE;
 
-  double n = 0.0, peak_e = 0.0;
-  for(int i = 0; i < nbands; i++)
+  double peak_e = 0.0;
+  for(int i = 0; i < n; i++) peak_e = fmax(peak_e, energy[i]);
+  // nothing there at any scale: a blank sky, a blown highlight, a black frame
+  if(peak_e <= CT_FLAT_ENERGY) return FALSE;
+
+  double s[CT_MAX_BANDS];  // s = sigma^2, the model's own scale variable
+  for(int i = 0; i < n; i++)
   {
-    n += weights[i];
-    peak_e = fmax(peak_e, energies[i]);
+    const double sigma_i = lambda[i] / (2.0 * M_PI);
+    s[i] = sigma_i * sigma_i;
   }
 
-  // nothing there at any scale: a blank sky, a blown highlight, a black frame
-  if(peak_e <= CT_FLAT_ENERGY) return 0.0;
+  const gboolean fix_noise = noise_prior >= 0.0;
+  const gboolean init_active[3] = { !fix_noise, TRUE, TRUE };
 
-  // a rung that has fallen this far below the peak carries no information
-  // about anything except its own rounding error, and in log space it would
-  // otherwise dominate the residual outright.
-  double y[CT_MAX_BANDS];
-  for(int i = 0; i < nbands; i++)
-    y[i] = log(fmax(energies[i], peak_e * CT_ENERGY_FLOOR));
-
-  // candidate texture sizes: from half the finest rung to the coarsest one.
-  // the top of that range puts the hump's peak just past the end of the
-  // ladder, which is as far as the rising flank alone can honestly be pushed.
-  const double lo = sigmas[0] * 0.5;
-  const double hi = sigmas[nbands - 1];
-  const int steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * log2(hi / lo)), 1);
+  // candidate texture sizes: from half the finest rung to the coarsest one,
+  // same range `_fit_texture_scale` scanned and for the same reason -- the
+  // top of it puts the hump's peak just past the end of the ladder, as far
+  // as the rising flank alone can honestly be pushed.
+  const double lo = (lambda[0] / (2.0 * M_PI)) * 0.5;
+  const double hi = lambda[n - 1] / (2.0 * M_PI);
+  const int tau_steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * log2(hi / lo)), 1);
 
   double best_residual = DBL_MAX;
-  double best_sigma_t = 0.0;
+  _ct_fit_t best = { 0 };
 
-  for(int q = 0; q <= steps; q++)
+  for(int bi = 0; bi <= CT_FIT_BETA_STEPS; bi++)
   {
-    const double sigma_t = lo * exp2((double)q / CT_FIT_STEPS_PER_OCTAVE);
-    const double tau = sigma_t * sigma_t;
+    const double beta =
+      CT_FIT_BETA_MIN + (double)bi * (CT_FIT_BETA_MAX - CT_FIT_BETA_MIN) / (double)CT_FIT_BETA_STEPS;
 
-    double shape[CT_MAX_BANDS];
-    for(int i = 0; i < nbands; i++)
+    double col_c[CT_MAX_BANDS];  // self-similar column depends only on beta
+    for(int i = 0; i < n; i++) col_c[i] = pow(s[i], (beta - 2.0) * 0.5);
+
+    for(int q = 0; q <= tau_steps; q++)
     {
-      const double t = sigmas[i] * sigmas[i];
-      const double d = t + tau;
-      // the hump, scaled to unit height so that the ratio scanned below is
-      // directly the floor's height as a fraction of the hump's
-      shape[i] = 6.75 * tau * t * t / (d * d * d);
-    }
+      const double sigma_t = lo * exp2((double)q / CT_FIT_STEPS_PER_OCTAVE);
+      const double tau = sigma_t * sigma_t;
 
-    for(int m = 0; m <= CT_FIT_RATIO_STEPS; m++)
-    {
-      const double ratio = exp2((double)m - CT_FIT_RATIO_FLOOR);
-
-      double model[CT_MAX_BANDS];
-      double offset = 0.0;
-      for(int i = 0; i < nbands; i++)
+      double col_n[CT_MAX_BANDS], col_a[CT_MAX_BANDS];
+      for(int i = 0; i < n; i++)
       {
-        model[i] = log(shape[i] + ratio);
-        offset += weights[i] * (y[i] - model[i]);
+        col_n[i] = _dog_shape(s[i], 0.0);
+        col_a[i] = _dog_shape(s[i], tau);
       }
-      offset /= n;  // the hump's height, in closed form
+
+      // 2-3 IRLS passes to approximate a log-space fit (research.md §5.5)
+      // while keeping every inner solve linear: reweight by 1/E_model^2
+      // after each solve, starting from the sampling weights alone.
+      double w[CT_MAX_BANDS];
+      for(int i = 0; i < n; i++) w[i] = weight[i];
+
+      double x[3] = { 0.0, 0.0, 0.0 };
+      for(int irls = 0; irls < 3; irls++)
+      {
+        double AtA[3][3] = { { 0.0 } };
+        double Aty[3] = { 0.0, 0.0, 0.0 };
+        for(int i = 0; i < n; i++)
+        {
+          const double y = fix_noise ? energy[i] - noise_prior * col_n[i] : energy[i];
+          const double c[3] = { col_n[i], col_c[i], col_a[i] };
+          for(int a = 0; a < 3; a++)
+          {
+            Aty[a] += w[i] * c[a] * y;
+            for(int b = a; b < 3; b++) AtA[a][b] += w[i] * c[a] * c[b];
+          }
+        }
+        AtA[1][0] = AtA[0][1]; AtA[2][0] = AtA[0][2]; AtA[2][1] = AtA[1][2];
+
+        _nnls3(AtA, Aty, init_active, x);
+
+        for(int i = 0; i < n; i++)
+        {
+          const double e_model =
+            (fix_noise ? noise_prior : x[0]) * col_n[i] + x[1] * col_c[i] + x[2] * col_a[i];
+          w[i] = weight[i] / fmax(e_model * e_model, CT_ENERGY_FLOOR * CT_ENERGY_FLOOR);
+        }
+      }
 
       double residual = 0.0;
-      for(int i = 0; i < nbands; i++)
+      for(int i = 0; i < n; i++)
       {
-        const double d = y[i] - model[i] - offset;
-        residual += weights[i] * d * d;
+        const double e_model =
+          (fix_noise ? noise_prior : x[0]) * col_n[i] + x[1] * col_c[i] + x[2] * col_a[i];
+        const double d = log(fmax(energy[i], peak_e * CT_ENERGY_FLOOR))
+                        - log(fmax(e_model, peak_e * CT_ENERGY_FLOOR));
+        residual += weight[i] * d * d;
       }
 
       if(residual < best_residual)
       {
+        // A alone is not comparable to N or C: _dog_shape peaks around 1e-4
+        // while the self-similar column can be O(1)-O(10), so a "large" A is
+        // routinely needed just to explain a small amount of real energy --
+        // and, at large tau, _dog_shape's near-zero, nearly featureless
+        // values over every *measured* rung make the (tau, A) pair almost
+        // unidentifiable from self-similar-only data: residual stays flat
+        // while A drifts arbitrarily high chasing float-noise-scale
+        // "improvement". texture_peak reports what A actually delivers over
+        // the rungs this box could measure, in the same energy units
+        // peak_e is in, which is what the caller below can honestly compare
+        // against.
+        double col_a_peak = 0.0;
+        for(int i = 0; i < n; i++) col_a_peak = fmax(col_a_peak, col_a[i]);
+
         best_residual = residual;
-        best_sigma_t = sigma_t;
+        best.noise = fix_noise ? noise_prior : x[0];
+        best.self_similar = x[1];
+        best.texture = x[2];
+        best.tau = tau;
+        best.beta = beta;
+        best.texture_peak = x[2] * col_a_peak;
+        best.residual = residual;
       }
     }
   }
 
-  if(best_sigma_t <= 0.0) return 0.0;
-
-  // note what happens when the area is self-similar -- dry grass, sand, plain
-  // sensor noise -- and has no one size at all: the ladder comes out flat, no
-  // position of the hump explains it better than any other, and the fit
-  // settles at the fine end of the grid because that is where the hump's own
-  // rising flank is shortest and disturbs the flat fit least. reporting the
-  // finest measurable size for such an area is the right answer anyway: it is
-  // the setting that boosts the texture without reaching up into structure
-  // that isn't there, and it is the one that cannot produce halos.
-
-  // the hump peaks at t = 2 tau, i.e. at sigma = sqrt(2) * sigma_t, and the
-  // normalized Laplacian of a sinusoid of wavelength L peaks at
-  // sigma = L / (pi * sqrt(2)) -- so the wavelength this stands for is simply
-  // 2 * pi * sigma_t.
-  return 2.0 * M_PI * best_sigma_t;
+  if(best_residual == DBL_MAX) return FALSE;
+  *fit = best;
+  return TRUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -524,8 +656,8 @@ static double _fit_texture_scale(const double *const restrict sigmas,
 // of rebuilding the ladder per pick. A band's value at a pixel already
 // carries context from a sigma-neighbourhood, so a small box can still report
 // on a large-wavelength band -- noisily, not truncated -- which is why the
-// per-rung weights the fit uses (still `_fit_texture_scale` for now, see
-// implementation-plan.md §2.3) matter more here than they did before.
+// per-rung weights the fit uses (§2.3's `_fit_spectrum`, above) matter more
+// here than they did before.
 //
 // `dt_gaussian_blur` (common/gaussian.c) is an IIR (van Vliet) approximation
 // whose cost is independent of sigma, unlike the explicit mirrored kernels
@@ -535,7 +667,8 @@ static double _fit_texture_scale(const double *const restrict sigmas,
 //
 // §2.2 republishes the ladder this builds through dt_preview_data_t and
 // wires color_picker_apply() to query it synchronously -- see that section,
-// below, for the box query and the fit it feeds (`_fit_texture_scale` above).
+// below, for the box query and the fit it feeds (§2.3's `_fit_spectrum`,
+// above).
 
 #define CT_BLOCK 8            // block-statistics granularity, in level-0 (finest rung) pixels
 #define CT_LADDER_MIN_DIM 4   // stop decimating once the next level would be smaller than this
@@ -671,7 +804,7 @@ static gboolean _build_ladder(const float *const restrict lum,
   // downstream is a difference of blurs and so ignores this offset
   // mathematically, but centring it keeps the numbers well away from
   // wherever the exposure happens to put the absolute level (the same
-  // exposure-invariance argument as `_fit_texture_scale`'s log-energy fit,
+  // exposure-invariance argument as `_fit_spectrum`'s log-energy fit,
   // above -- both want the ladder's numbers independent of exposure).
   double mean_ev = 0.0;
   DT_OMP_FOR(reduction(+ : mean_ev))
@@ -716,7 +849,7 @@ static gboolean _build_ladder(const float *const restrict lum,
 
       // the DoG's peak frequency sits within a percent of the geometric mean
       // of its two rung sigmas; 2*pi*sigma is the sigma-to-wavelength
-      // convention `_fit_texture_scale`'s return value already established.
+      // convention `_fit_spectrum`'s model (tau, s = sigma^2) already established.
       const double sigma_s = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
       const double sigma_s1 = CT_SIGMA_BASE * exp2((double)(s + 1) / CT_SCALES_PER_OCTAVE);
       ladder->lambda[nrungs] = 2.0 * M_PI * sqrt(sigma_s * sigma_s1) * step;
@@ -1292,11 +1425,12 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 }
 
 // §2.2: query the ladder's published SAT tables for the box the picker
-// selected, and feed the resulting per-rung (sigma, energy, weight) triples
-// to `_fit_texture_scale` (§2.3 replaces the fit itself, not this query).
-// box is in the pixels of g->ladder_roi_in, i.e. of the preview the ladder
-// was built from. returns the fitted wavelength in those same pixels, or 0
-// if nothing was measurable in the box.
+// selected, and feed the resulting per-rung (wavelength, energy, weight)
+// triples to §2.3's `_fit_spectrum`. box is in the pixels of
+// g->ladder_roi_in, i.e. of the preview the ladder was built from. returns
+// the fitted texture wavelength in those same pixels, or 0 if nothing was
+// measurable in the box -- see below for what "nothing" covers now that the
+// fit separates noise and self-similar content from an actual texture size.
 //
 // research.md §5.2: any box query is 4 lookups per rung -- this is that
 // query, one held critical section covering every rung so the buffer can't
@@ -1305,7 +1439,7 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
-  double sigmas[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
+  double lambda[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
   int nrungs = 0;
 
   dt_iop_gui_enter_critical_section(self);
@@ -1345,7 +1479,7 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
       const double n_per_block = fmax(1.0, (double)(CT_BLOCK * CT_BLOCK) / (step * step));
       const double n_eff = fmax(nblocks * n_per_block, 1.0);
 
-      sigmas[r] = g->ladder_lambda[r] / (2.0 * M_PI);
+      lambda[r] = g->ladder_lambda[r];
       energies[r] = s2 / n_eff;
       weights[r] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_eff);
     }
@@ -1353,7 +1487,35 @@ static double _fit_curve_from_box(dt_iop_module_t *self, const int *const box)
 
   dt_iop_gui_leave_critical_section(self);
 
-  return have_data ? _fit_texture_scale(sigmas, energies, weights, nrungs) : 0.0;
+  if(!have_data) return 0.0;
+
+  double peak_e = 0.0;
+  for(int r = 0; r < nrungs; r++) peak_e = fmax(peak_e, energies[r]);
+
+  // §2.4 will supply a real per-rung noise floor to fix N against; until
+  // then every call here fits it freely alongside C and A.
+  _ct_fit_t fit;
+  if(!_fit_spectrum(lambda, energies, weights, nrungs, -1.0, &fit)) return 0.0;
+
+  // what the texture term actually delivers over the measured rungs
+  // (fit.texture_peak) is negligible next to the box's own peak energy:
+  // there is no sized texture here to report a wavelength for, only sensor
+  // noise and/or ordinary (beta != 2) scene content -- comparing fit.texture
+  // itself to fit.noise/fit.self_similar would not mean anything, since
+  // _dog_shape's amplitude and the self-similar power law's live on
+  // unrelated scales. research.md §5.6 (Phase 2.5) is what turns "no real
+  // texture" into a proper fallback to a "detail" target curve; until then,
+  // fall back the same way `_fit_texture_scale` used to on a self-similar
+  // area -- report the finest measurable size, which boosts what is there
+  // without reaching for structure that isn't, rather than declining
+  // outright.
+  if(fit.texture_peak <= peak_e * 1e-2) return lambda[0];
+
+  // the hump peaks at t = 2*tau, i.e. at sigma = sqrt(2)*sigma_t, and the
+  // normalized Laplacian of a sinusoid of wavelength L peaks at
+  // sigma = L / (pi*sqrt(2)) -- so the wavelength this stands for is simply
+  // 2*pi*sigma_t (`_fit_texture_scale`'s established convention).
+  return 2.0 * M_PI * sqrt(fit.tau);
 }
 
 // §2.2: synchronous now that the ladder is frame-wide and pre-published
