@@ -458,6 +458,15 @@ typedef struct _ct_fit_t
   double residual;                      // weighted log-space residual, winning grid point
 } _ct_fit_t;
 
+// implementation-plan-2.md §6.1: why a pick was refused, so the caller can
+// say something specific instead of one message covering "too small" and
+// "nothing here" alike.
+typedef enum _ct_fit_refusal_t
+{
+  CT_FIT_REFUSED_SPAN,  // fewer than CT_MIN_BANDS rungs, or less than CT_MIN_SPAN octaves
+  CT_FIT_REFUSED_FLAT   // nothing above CT_FLAT_ENERGY at any surviving rung
+} _ct_fit_refusal_t;
+
 // non-negative least squares for the model's (up to) three linear
 // amplitudes, from the already-weighted normal equations AtA x = Aty.
 // init_active marks which of the three are free to fit (§2.3's caller fixes
@@ -557,13 +566,15 @@ static void _nnls3(const double AtA[3][3],
 //
 // returns FALSE under the same refusals `_fit_texture_scale` used: too few
 // rungs or too narrow a span to trust a fit, or nothing above the noise
-// floor anywhere in the box.
+// floor anywhere in the box -- *reason says which (implementation-plan-2.md
+// §6.1), so the caller can say something specific.
 static gboolean _fit_spectrum(const double *const restrict sigma,
                               const double *const restrict energy,
                               const double *const restrict weight,
                               const int n,
                               const double noise_prior,
-                              _ct_fit_t *const restrict fit)
+                              _ct_fit_t *const restrict fit,
+                              _ct_fit_refusal_t *const restrict reason)
 {
   // the smallest area that can be measured at all covers exactly one octave,
   // so this comparison is met on the nose there and is given a rounding's
@@ -571,12 +582,19 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   // lambda differ by the fixed CT_SIGMA_TO_LAMBDA factor, so the ratio this
   // compares is the same either way.
   if(n < CT_MIN_BANDS || sigma[n - 1] < CT_MIN_SPAN * sigma[0] * (1.0 - 1e-9))
+  {
+    *reason = CT_FIT_REFUSED_SPAN;
     return FALSE;
+  }
 
   double peak_e = 0.0;
   for(int i = 0; i < n; i++) peak_e = fmax(peak_e, energy[i]);
   // nothing there at any scale: a blank sky, a blown highlight, a black frame
-  if(peak_e <= CT_FLAT_ENERGY) return FALSE;
+  if(peak_e <= CT_FLAT_ENERGY)
+  {
+    *reason = CT_FIT_REFUSED_FLAT;
+    return FALSE;
+  }
 
   double s[CT_MAX_BANDS];  // s = sigma^2, the model's own scale variable
   for(int i = 0; i < n; i++) s[i] = sigma[i] * sigma[i];
@@ -2066,6 +2084,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   double s1_energy[CT_MAX_BANDS];    // §2.4: Sum(|b|)/n_eff over the box, for its own sparseness
   double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
   int nrungs = 0;
+  double ladder_lambda0 = 0.0;       // §6.1: finest rung's own wavelength, set below
 
   dt_iop_gui_enter_critical_section(self);
 
@@ -2094,6 +2113,10 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     const double box_w = (double)(bx1 - bx0) * CT_BLOCK;
     const double box_h = (double)(by1 - by0) * CT_BLOCK;
     const double lambda_max = fmin(box_w, box_h);
+    // §6.1: the ladder's own finest rung, independent of the window above --
+    // needed even when the box is too small to keep a single rung, to quote
+    // the smallest box that would have worked.
+    ladder_lambda0 = g->ladder_lambda[0];
 
     const float *const restrict buf = g->pd.buf;
     nrungs = 0;
@@ -2140,7 +2163,11 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 
   dt_iop_gui_leave_critical_section(self);
 
-  if(!have_data) return FALSE;
+  if(!have_data)
+  {
+    dt_control_log(_("the preview isn't ready to measure yet -- try again in a moment"));
+    return FALSE;
+  }
 
   double peak_e = 0.0;
   for(int r = 0; r < nrungs; r++) peak_e = fmax(peak_e, energies[r]);
@@ -2150,7 +2177,27 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   // stops a genuinely fine texture from getting explained away as noise.
   const double noise_prior = _ladder_estimate_noise(sigma, noise_floor, nrungs);
 
-  if(!_fit_spectrum(sigma, energies, weights, nrungs, noise_prior, fit)) return FALSE;
+  // §6.1: say *which* refusal this is instead of one message covering both
+  // -- "too small" and "flat" want different reactions from the user.
+  _ct_fit_refusal_t refusal = CT_FIT_REFUSED_FLAT;
+  if(!_fit_spectrum(sigma, energies, weights, nrungs, noise_prior, fit, &refusal))
+  {
+    if(refusal == CT_FIT_REFUSED_SPAN)
+    {
+      // the smallest box that would work at the current preview scale is
+      // computable: CT_MIN_SPAN octaves' worth of the finest rung's own
+      // wavelength -- the loosest lower bound §1.1's window allows.
+      const double min_side = CT_MIN_SPAN * ladder_lambda0;
+      dt_control_log(_("the picked area is too small to measure a detail size from -- "
+                        "try at least %.0f x %.0f px"), min_side, min_side);
+    }
+    else
+    {
+      dt_control_log(_("the picked area has nothing to measure a detail size from -- "
+                        "flat sky, a blown highlight and a black frame all look like this"));
+    }
+    return FALSE;
+  }
 
   // §2.5/research.md §5.6: what the texture term actually delivers over the
   // measured rungs (fit->texture_peak) is negligible next to the box's own
@@ -2409,12 +2456,11 @@ void color_picker_apply(dt_iop_module_t *self,
   _ct_target_mode_t mode;
   double spectrum_lambda[CT_MAX_BANDS], spectrum_energy[CT_MAX_BANDS];
   int spectrum_nrungs = 0;
+  // §6.1: _fit_curve_from_box already logs a specific reason on every
+  // refusal path -- nothing generic left to say here.
   if(!_fit_curve_from_box(self, box, long_edge, &fit, &mode,
                           spectrum_lambda, spectrum_energy, &spectrum_nrungs))
-  {
-    dt_control_log(_("the picked area is too small, or has nothing in it to measure a detail size from"));
     return;
-  }
 
   // §3.2: publish this pick's own spectrum + fit for the graph's live
   // overlay -- a record of the last measurement, independent of whether the
