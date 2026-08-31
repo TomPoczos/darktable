@@ -120,13 +120,22 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_MAX_OCTAVES 12
 #define CT_MAX_BANDS (CT_MAX_OCTAVES * CT_SCALES_PER_OCTAVE)
 
+// implementation-plan-2.md §3.1: peak wavelength of the DoG between sigma and
+// 2^(1/CT_SCALES_PER_OCTAVE)*sigma -- lambda = pi*sqrt(2*(k2-1)/ln k2) * sigma,
+// k2 = 2^(2/CT_SCALES_PER_OCTAVE) -- _band_peak_lambda's formula specialised
+// to the ladder's own fixed rung ratio. The single conversion factor between
+// a rung's sigma and the wavelength label it is published under; recompute if
+// CT_SCALES_PER_OCTAVE ever changes.
+#define CT_SIGMA_TO_LAMBDA 5.0091626
+
 // §2.1: the frame-wide DoG ladder's block energy tables. Declared here,
 // ahead of its own section further down, because dt_iop_contrast_gui_data_t
 // needs the type; see that section for what builds and frees one.
 typedef struct _ct_ladder_t
 {
   int    nrungs;
-  double lambda[CT_MAX_BANDS];  // band-centre wavelength (2*pi*sigma), level-0 pixels
+  double sigma[CT_MAX_BANDS];   // §3.1: rung's own lower-boundary sigma, level-0 pixels
+  double lambda[CT_MAX_BANDS];  // band-centre wavelength (sigma * CT_SIGMA_TO_LAMBDA), level-0 pixels
   double step[CT_MAX_BANDS];    // level-0 pixels per pixel of the rung's own level
   size_t bw, bh;                 // block grid, the same for every rung
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
@@ -224,6 +233,7 @@ typedef struct dt_iop_contrast_gui_data_t
   // == self.
   dt_preview_data_t pd;
   int ladder_nrungs;
+  double ladder_sigma[CT_MAX_BANDS];   // §3.1: rung's own lower-boundary sigma, level-0 px
   double ladder_lambda[CT_MAX_BANDS];
   double ladder_step[CT_MAX_BANDS];
   double ladder_noise_floor[CT_MAX_BANDS];  // §2.4, frame-wide, published the same way
@@ -994,12 +1004,14 @@ static gboolean _build_ladder(const float *const restrict lum,
       _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
 
-      // the DoG's peak frequency sits within a percent of the geometric mean
-      // of its two rung sigmas; 2*pi*sigma is the sigma-to-wavelength
-      // convention `_fit_spectrum`'s model (tau, s = sigma^2) already established.
+      // implementation-plan-2.md §3.1: label the rung by its own lower-
+      // boundary sigma, not the geometric mean of its two rung sigmas -- the
+      // DoG's actual peak sits at CT_SIGMA_TO_LAMBDA * sigma_lower (the exact
+      // formula, not "within a percent"), which is 1.41x finer than the old
+      // geometric-mean label claimed.
       const double sigma_s = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
-      const double sigma_s1 = CT_SIGMA_BASE * exp2((double)(s + 1) / CT_SCALES_PER_OCTAVE);
-      ladder->lambda[nrungs] = 2.0 * M_PI * sqrt(sigma_s * sigma_s1) * step;
+      ladder->sigma[nrungs] = sigma_s * step;
+      ladder->lambda[nrungs] = ladder->sigma[nrungs] * CT_SIGMA_TO_LAMBDA;
       ladder->step[nrungs] = step;
       nrungs++;
     }
@@ -1502,6 +1514,7 @@ void process(dt_iop_module_t *self,
 
       dt_iop_gui_enter_critical_section(self);
       g->ladder_nrungs = built.nrungs;
+      memcpy(g->ladder_sigma, built.sigma, sizeof(g->ladder_sigma));
       memcpy(g->ladder_lambda, built.lambda, sizeof(g->ladder_lambda));
       memcpy(g->ladder_step, built.step, sizeof(g->ladder_step));
       memcpy(g->ladder_noise_floor, built.noise_floor, sizeof(g->ladder_noise_floor));
