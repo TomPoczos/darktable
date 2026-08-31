@@ -1051,9 +1051,14 @@ static inline void compute_luminance(const float *const restrict in,
 //
 // full_scratch is the caller's full-res "blur" buffer: already allocated,
 // and the direct loop above is done with it by the time this runs.
+// prev_log is the running previous band's log2(blur) (research.md §2.1's
+// L_{k-1}), full res, seeded by the caller from the last direct band and
+// updated in place here as each pyramid level is folded in -- see the
+// correctness note above _decompose_and_accumulate for why this has to be
+// incremental rather than always diffed against the original luminance.
 __DT_CLONE_TARGETS__
 static void _accumulate_pyramid_bands(const float *const restrict lum,
-                                      const float *const restrict log_lum,
+                                      float *const restrict prev_log,
                                       float *const restrict correction,
                                       float *const restrict coarsest,
                                       float *const restrict full_scratch,
@@ -1110,10 +1115,12 @@ static void _accumulate_pyramid_bands(const float *const restrict lum,
     DT_OMP_FOR()
     for(size_t p = 0; p < npixels; p++)
     {
-      const float b_k = log_lum[p] - log2f(fmaxf(full_scratch[p], NORM_MIN));
+      const float log_blur = log2f(fmaxf(full_scratch[p], NORM_MIN));
+      const float b_k = prev_log[p] - log_blur;
       if(is_display) correction[p] = b_k;
       else if(detail_mode) correction[p] += b_k;
       else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+      prev_log[p] = log_blur;
     }
 
     if(k == d->nbands - 1) memcpy(coarsest, full_scratch, npixels * sizeof(float));
@@ -1130,6 +1137,16 @@ static void _accumulate_pyramid_bands(const float *const restrict lum,
 // correction ends up holding sum_k (gain_k - 1) * b_k, in EV, still missing
 // the master gain and the Wiener gate -- both are cheap scalar-per-pixel
 // operations applied once by the caller, rather than folded in here.
+//
+// b_k is research.md §2.1's incremental band: log2(blur_{k-1}) - log2(blur_k),
+// diffed against the *previous* band's own blur (blur_{-1} = the untouched
+// luminance), not always against the original -- that is what makes
+// sum_k b_k telescope to a single log2(L) - log2(blur_{nbands-1}) highpass
+// when every gain is equal, which is the property legacy_params's v1
+// conversion and DT_CT_MASK_DETAIL both rely on to reproduce v1's own
+// single-band behaviour exactly. A cumulative log2(L) - log2(blur_k) here
+// (diffing every band against the original image) does not telescope and
+// silently over-boosts whenever more than one band is open at once.
 //
 // display_band selects what correction ends up holding (Phase 1.6):
 // >= 0 writes that one surviving band's raw b_k, instead of accumulating,
@@ -1188,15 +1205,20 @@ static void _decompose_and_accumulate(const float *const restrict lum,
     DT_OMP_FOR()
     for(size_t p = 0; p < npixels; p++)
     {
-      const float b_k = log_lum[p] - log2f(fmaxf(blur[p], NORM_MIN));
+      const float log_blur = log2f(fmaxf(blur[p], NORM_MIN));
+      const float b_k = log_lum[p] - log_blur;  // log_lum here holds band (k-1)'s own blur, not the original
       if(is_display) correction[p] = b_k;
       else if(detail_mode) correction[p] += b_k;
       else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+      log_lum[p] = log_blur;  // becomes band (k+1)'s "previous"
     }
 
     if(k == d->nbands - 1) memcpy(coarsest, blur, npixels * sizeof(float));
   }
 
+  // log_lum now holds the last direct band's own log2(blur) -- exactly the
+  // "previous" state _accumulate_pyramid_bands needs to keep the incremental
+  // chain going into the coarse tail, per the correctness note above.
   if(direct_bands < d->nbands)
     _accumulate_pyramid_bands(lum, log_lum, correction, coarsest, blur, width, height,
                               d, direct_bands, display_band);
