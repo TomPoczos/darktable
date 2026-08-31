@@ -2268,8 +2268,10 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   // ordinary (beta != 2) scene content -- fall back to the broad DETAIL
   // shape rather than inventing a bump. (fit->texture itself is not
   // comparable to peak_e -- see §2.3's own comment on why texture_peak
-  // exists.)
-  *mode = (fit->texture_peak <= peak_e * 1e-2) ? CT_TARGET_DETAIL : CT_TARGET_TEXTURE;
+  // exists.) implementation-plan-2.md §8.2/target-shape.md: EQUALIZE, not
+  // TEXTURE, is the shape a found texture earns -- decided by rendered
+  // comparison, not by this comment.
+  *mode = (fit->texture_peak <= peak_e * 1e-2) ? CT_TARGET_DETAIL : CT_TARGET_EQUALIZE;
 
   // §2.4/research.md §5.9: advisory only, neither warning below refuses the
   // pick -- both just explain a result that might otherwise look like
@@ -2283,7 +2285,12 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
   }
 
-  if(*mode == CT_TARGET_TEXTURE)
+  // §8.2: fit->tau/fit->texture feed _ct_fit_eval's S(sigma) the same way
+  // regardless of mode (EQUALIZE's wiener term and E_ref both depend on
+  // them, just not peak-normalised the way TEXTURE's shape was) -- so the
+  // fitted size is still worth warning about whenever a texture was found
+  // at all, not only in the now-unreachable-from-the-picker TEXTURE case.
+  if(*mode != CT_TARGET_DETAIL)
   {
     const double target_sigma = sqrt(fit->tau);
 
