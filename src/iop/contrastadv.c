@@ -1277,6 +1277,33 @@ void process(dt_iop_module_t *self,
   dt_free_align(coarsest);
 }
 
+// dt_iop_contrast_data_t (sigma[]/gain[]/nbands on top of the params it
+// copies) is bigger than dt_iop_contrast_params_t, but without an init_pipe
+// of its own the module got develop/imageop.c's default_init_pipe, which
+// sizes piece->data at self->params_size -- too small. commit_params below
+// (which the module *does* override) then writes past the end of that
+// undersized allocation on every call. Silent until whatever happens to sit
+// next on the heap gets its chunk header corrupted, then a crash at a much
+// later, unrelated free(): found by exporting a real image with the module
+// enabled (every band gain != 1, so commit_params actually runs) under gdb --
+// SIGABRT in dt_dev_pixelpipe_cleanup_nodes, malloc_printerr "free(): invalid
+// next size". Needs its own init_pipe/cleanup_pipe sized to the real struct,
+// same pattern as toneequal.c/colorequal.c/atrous.c.
+void init_pipe(dt_iop_module_t *self,
+               dt_dev_pixelpipe_t *pipe,
+               dt_dev_pixelpipe_iop_t *piece)
+{
+  piece->data = dt_calloc1_align_type(dt_iop_contrast_data_t);
+}
+
+void cleanup_pipe(dt_iop_module_t *self,
+                  dt_dev_pixelpipe_t *pipe,
+                  dt_dev_pixelpipe_iop_t *piece)
+{
+  dt_free_align(piece->data);
+  piece->data = NULL;
+}
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *roi_out,
