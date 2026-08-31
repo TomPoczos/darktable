@@ -749,10 +749,17 @@ static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double sigma,
 // §2.5: which of research.md §5.6's target shapes a fit earns. TEXTURE is
 // the default; DETAIL is the A-negligible fallback -- "a self-similar area
 // with no size", `_fit_curve_from_box` below decides which.
+// implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is research.md §5.6's
+// third shape, "boost what's weak" rather than TEXTURE's "boost whatever
+// carries the most energy" -- already shipped, unchanged, as the "flatten
+// spectrum" preset; §8.1 only wires it into the live picker path so a pick
+// can use it too. Not yet chosen *between* TEXTURE and EQUALIZE for the
+// picker -- that is §8.2, decided separately with rendered crops, not code.
 typedef enum _ct_target_mode_t
 {
-  CT_TARGET_TEXTURE = 0,
-  CT_TARGET_DETAIL  = 1
+  CT_TARGET_TEXTURE  = 0,
+  CT_TARGET_DETAIL   = 1,
+  CT_TARGET_EQUALIZE = 2
 } _ct_target_mode_t;
 
 // ---------------------------------------------------------------------------
@@ -1783,6 +1790,21 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // evaluated, since that is the only "max(A*G)" available here); DETAIL's
 // S/(S+N) is used exactly as it falls out, per the table, with no further
 // rescaling.
+//
+// implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is different in *kind*,
+// not degree, from the other two -- research.md §5.6's own table gives it as
+// a bounded absolute curve, clamp((E_ref/S_hat)^alpha) * S/(S+N), already
+// shipped unchanged as the "flatten spectrum" preset's own expression (§3.4)
+// -- not a [0,1] boost shape with a separate strength knob. shape[] here for
+// CT_TARGET_EQUALIZE *is* that curve directly: the caller must use it as the
+// target curve as-is, not lerp it between 1 and a master gain the way
+// TEXTURE/DETAIL's shape[] is. E_ref is evaluated at the same geometric-mean-
+// of-the-grid reference point the preset uses, against this box's own fit
+// rather than the preset's synthetic self-similar assumption.
+#define CT_EQUALIZE_ALPHA 0.4
+#define CT_EQUALIZE_GAIN_LO 0.3
+#define CT_EQUALIZE_GAIN_HI 2.5
+
 static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
                           const double *const restrict sigma_grid, const int m,
                           double *const restrict shape)
@@ -1791,6 +1813,13 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
   if(mode == CT_TARGET_TEXTURE)
     for(int j = 0; j < m; j++)
       peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau));
+
+  double s_ref = 0.0, n_ref = 0.0;
+  if(mode == CT_TARGET_EQUALIZE && m > 0)
+  {
+    const double sigma_mid = sqrt(sigma_grid[0] * sigma_grid[m - 1]);
+    _ct_fit_eval(fit, sigma_mid, &s_ref, &n_ref);
+  }
 
   for(int j = 0; j < m; j++)
   {
@@ -1803,6 +1832,11 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
       const double that = peak_tex > 0.0
         ? (fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau)) / peak_tex : 0.0;
       shape[j] = that * wiener;
+    }
+    else if(mode == CT_TARGET_EQUALIZE)
+    {
+      const double eq = pow(s_ref / fmax(S, DBL_MIN), CT_EQUALIZE_ALPHA) * wiener;
+      shape[j] = CLAMP(eq, CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI);
     }
     else
     {
@@ -2415,33 +2449,17 @@ void init_presets(dt_iop_module_so_t *self)
     dt_gui_presets_add_generic(_("soften"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 
-  // "flatten spectrum": research.md §5.6's "equalize" mode,
-  // clamp((E_ref/S_hat)^alpha) * S/(S+N), evaluated against a synthetic
-  // self-similar spectrum (beta = 2.4, research.md §5.3's typical measured
-  // slope; no sized texture) rather than any particular picked area's own
-  // fit -- a reasonable default assumption, not a measurement. E_ref is the
-  // spectrum's own value at the ladder's centre wavelength; a modest noise
-  // floor and a fractional alpha keep the correction from chasing the
-  // noisiest, finest scale to an extreme gain.
+  // "flatten spectrum": research.md §5.6's "equalize" mode, now also the
+  // live picker's CT_TARGET_EQUALIZE (§8.1) -- same _target_curve, evaluated
+  // against a synthetic self-similar spectrum (beta = 2.4, research.md
+  // §5.3's typical measured slope; no sized texture) rather than any
+  // particular picked area's own fit, since a preset has no box to measure.
   {
     const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.4, .noise = 0.02,
                                   .texture = 0.0, .tau = 0.0 };
-    // lo/hi are the sigma-grid bounds (§5.2) -- _ct_fit_eval takes sigma
-    // directly, no CT_SIGMA_TO_LAMBDA conversion needed here.
-    const double sigma_mid = sqrt(lo * hi);
-    double s_ref, n_ref;
-    _ct_fit_eval(&synthetic, sigma_mid, &s_ref, &n_ref);
-    const double alpha = 0.4;
-    for(int j = 0; j < CT_PROJECT_GRID; j++)
-    {
-      double s_hat, n_hat;
-      _ct_fit_eval(&synthetic, sigma_grid[j], &s_hat, &n_hat);
-      const double wiener = s_hat / fmax(s_hat + n_hat, DBL_MIN);
-      const double eq = pow(s_ref / fmax(s_hat, DBL_MIN), alpha) * wiener;
-      target[j] = CLAMP(eq, 0.3, 2.5);
-    }
+    _target_curve(&synthetic, CT_TARGET_EQUALIZE, sigma_grid, CT_PROJECT_GRID, target);
   }
-  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 0.3f, 2.5f, &p))
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI, &p))
     dt_gui_presets_add_generic(_("flatten spectrum"), self->op, self->version(), &p, sizeof(p), TRUE,
                                DEVELOP_BLEND_CS_RGB_SCENE);
 }
@@ -2566,8 +2584,13 @@ void color_picker_apply(dt_iop_module_t *self,
   }
 
   _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, shape);
+  // §8.1: CT_TARGET_EQUALIZE's shape[] is already the bounded absolute
+  // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
+  // target[] as-is, not lerped between 1 and master the way TEXTURE/DETAIL's
+  // [0,1] shape is.
+  const gboolean is_equalize = (mode == CT_TARGET_EQUALIZE);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
-    target[j] = 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
+    target[j] = is_equalize ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
   // §3.1: how much of its own linear H_k each band actually delivered over
   // this same box, last time the module's own bands were measured there --
@@ -2575,10 +2598,11 @@ void color_picker_apply(dt_iop_module_t *self,
   float calibration[CT_BANDS];
   _compute_band_calibration(self, box, long_edge, &fit, calibration);
 
-  // §4.4: the envelope the target curve itself was built to (target[] =
-  // 1 + (master-1)*shape, shape in [0,1]) -- no band should leave it.
-  const float gain_lo = fminf(1.0f, p->gain_local_contrast);
-  const float gain_hi = fmaxf(1.0f, p->gain_local_contrast);
+  // §4.4: the envelope the target curve itself was built to -- TEXTURE/
+  // DETAIL's is 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own
+  // fixed clamp (§8.1, same as the preset). No band should leave it.
+  const float gain_lo = is_equalize ? CT_EQUALIZE_GAIN_LO : fminf(1.0f, p->gain_local_contrast);
+  const float gain_hi = is_equalize ? CT_EQUALIZE_GAIN_HI : fmaxf(1.0f, p->gain_local_contrast);
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
   if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration,
