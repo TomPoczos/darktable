@@ -2037,11 +2037,19 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       const double step = g->ladder_step[r];
       const double n_per_block = fmax(1.0, (double)(CT_BLOCK * CT_BLOCK) / (step * step));
       const double n_eff = fmax(nblocks * n_per_block, 1.0);
+      const double lam = g->ladder_lambda[r];
 
-      lambda[nrungs] = g->ladder_lambda[r];
+      // §1.2: n_eff is a pixel count and is the wrong denominator for the
+      // sampling term in the weight -- research.md §5.1's own error table is
+      // written in terms of area/sigma^2, i.e. independent samples of the
+      // rung's own period, not level pixels. Keep n_eff for the energy mean
+      // (s2/n_eff is correct there) and use n_indep only for the weight.
+      const double n_indep = fmax(box_w * box_h / (lam * lam), 0.25);
+
+      lambda[nrungs] = lam;
       energies[nrungs] = s2 / n_eff;
       s1_energy[nrungs] = s1 / n_eff;
-      weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_eff);
+      weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
       noise_floor[nrungs] = g->ladder_noise_floor[r];
       nrungs++;
     }
