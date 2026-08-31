@@ -51,6 +51,7 @@ Current status as implemented by Jandren:
 #include "common/fast_guided_filter.h"
 #include "common/color_picker.h"
 #include "common/eigf.h"
+#include "common/gaussian.h"
 #include "common/luminance_mask.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -98,6 +99,27 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 // top just rides the edge, exactly like the slider it drives.
 #define CT_GRAPH_Y_MAX 2.0f
 #define CT_GRAPH_RES 64      // curve points sampled between nodes, per implementation-plan.md §1.4
+
+// the detail-scale ladder (picked-region measurement below, and the §2.1
+// frame-wide one), shared by both: DoG bands per octave, the finest sigma,
+// and how many octaves/bands the ladder is allowed to grow to.
+#define CT_SCALES_PER_OCTAVE 3
+#define CT_SIGMA_BASE 1.2f
+#define CT_MAX_OCTAVES 12
+#define CT_MAX_BANDS (CT_MAX_OCTAVES * CT_SCALES_PER_OCTAVE)
+
+// §2.1: the frame-wide DoG ladder's block energy tables. Declared here,
+// ahead of its own section further down, because dt_iop_contrast_gui_data_t
+// needs the type; see that section for what builds and frees one.
+typedef struct _ct_ladder_t
+{
+  int    nrungs;
+  double lambda[CT_MAX_BANDS];  // band-centre wavelength (2*pi*sigma), level-0 pixels
+  double step[CT_MAX_BANDS];    // level-0 pixels per pixel of the rung's own level
+  size_t bw, bh;                 // block grid, the same for every rung
+  double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
+  double *sat1;                  // Sum(|b|), same layout
+} _ct_ladder_t;
 
 typedef enum dt_iop_contrast_decomposition_t
 {
@@ -203,6 +225,12 @@ typedef struct dt_iop_contrast_gui_data_t
   _ct_auto_state_t auto_state;
   _ct_auto_result_t auto_result;
   float auto_detail_level;
+
+  // §2.1: the frame-wide DoG ladder, rebuilt each untiled preview pass while
+  // the module is expanded and swapped in under
+  // dt_iop_gui_enter/leave_critical_section. Nothing reads it yet -- §2.2
+  // republishes it through dt_preview_data_t instead of this ad hoc handoff.
+  _ct_ladder_t ladder;
 } dt_iop_contrast_gui_data_t;
 
 
@@ -340,10 +368,8 @@ int legacy_params(dt_iop_module_t *self,
 // will be boosted -- including the shadow-noise suppression from the noise
 // bias slider, since it is measured on the same biased luminance buffer.
 
-#define CT_SCALES_PER_OCTAVE 3    // DoG bands per octave of the ladder
-#define CT_SIGMA_BASE 1.2f        // finest sigma of the ladder, in analysis pixels
-#define CT_MAX_OCTAVES 12
-#define CT_MAX_BANDS (CT_MAX_OCTAVES * CT_SCALES_PER_OCTAVE)
+// CT_SCALES_PER_OCTAVE / CT_SIGMA_BASE / CT_MAX_OCTAVES / CT_MAX_BANDS are
+// declared near dt_iop_contrast_gui_data_t, above -- shared with §2.1's ladder.
 #define CT_KERNEL_RADIUS_MAX 32
 // smallest interior a level may still be measured on, per axis
 #define CT_MIN_INTERIOR ((size_t)8)
@@ -927,6 +953,252 @@ static double _measure_detail_scale(const _ct_region_t *const region)
   return _fit_texture_scale(sigmas, energies, weights, nbands);
 }
 
+// ---------------------------------------------------------------------------
+// §2.1: the frame-wide DoG ladder + block energy tables
+// ---------------------------------------------------------------------------
+//
+// research.md §5.1: build the measurement ladder over the whole frame instead
+// of inside the picked box, and answer a box query against it in O(1) instead
+// of rebuilding the ladder per pick. A band's value at a pixel already
+// carries context from a sigma-neighbourhood, so a small box can still report
+// on a large-wavelength band -- noisily, not truncated -- which is why the
+// per-rung weights the fit uses (still `_fit_texture_scale` for now, see
+// implementation-plan.md §2.3) matter more here than they did before.
+//
+// `dt_gaussian_blur` (common/gaussian.c) is an IIR (van Vliet) approximation
+// whose cost is independent of sigma, unlike the explicit kernels
+// `_gauss_blur` above used. That removes the old ladder-length ceiling
+// (`CT_KERNEL_RADIUS_MAX`) outright; what still bounds this ladder is simply
+// running out of pixels to decimate into, not the cost of a wide blur.
+//
+// nothing calls this yet beyond process() publishing it into gui_data for
+// safekeeping -- §2.2 republishes it through dt_preview_data_t and wires
+// color_picker_apply() to query it synchronously, replacing the picked-region
+// ladder above (`_measure_detail_scale` and everything it calls) entirely.
+
+#define CT_BLOCK 8            // block-statistics granularity, in level-0 (finest rung) pixels
+#define CT_LADDER_MIN_DIM 4   // stop decimating once the next level would be smaller than this
+
+static void _ladder_free(_ct_ladder_t *const ladder)
+{
+  dt_free_align(ladder->sat2);
+  dt_free_align(ladder->sat1);
+  memset(ladder, 0, sizeof(_ct_ladder_t));
+}
+
+// accumulate one rung's band into the ladder's fixed bw x bh block grid.
+// block (bx, by) covers level-0 pixels [bx*CT_BLOCK, (bx+1)*CT_BLOCK) x (...),
+// which on this rung's own (possibly decimated) level maps to
+// [bx*CT_BLOCK/step, (bx+1)*CT_BLOCK/step) x (...) -- several level pixels
+// wide before the ladder has decimated past CT_BLOCK, one or less afterwards.
+// using one grid for every rung, rather than a grid sized to each rung's own
+// resolution, is what lets a box query be 4 lookups regardless of which rung
+// it is asking about (research.md §5.2): the caller never needs to know a
+// rung's own resolution to query it.
+static void _ladder_accumulate_blocks(const float *const restrict band,
+                                      const size_t cw, const size_t ch,
+                                      const double step,
+                                      const size_t bw, const size_t bh,
+                                      double *const restrict blk2,
+                                      double *const restrict blk1)
+{
+  DT_OMP_FOR()
+  for(size_t by = 0; by < bh; by++)
+  {
+    const size_t y0 = MIN((size_t)((double)(by * CT_BLOCK) / step), ch);
+    size_t y1 = MIN((size_t)ceil((double)((by + 1) * CT_BLOCK) / step), ch);
+    if(y1 <= y0) y1 = MIN(y0 + 1, ch);
+
+    for(size_t bx = 0; bx < bw; bx++)
+    {
+      double s2 = 0.0, s1 = 0.0;
+      if(y0 < ch)
+      {
+        const size_t x0 = MIN((size_t)((double)(bx * CT_BLOCK) / step), cw);
+        size_t x1 = MIN((size_t)ceil((double)((bx + 1) * CT_BLOCK) / step), cw);
+        if(x1 <= x0) x1 = MIN(x0 + 1, cw);
+
+        if(x0 < cw)
+          for(size_t j = y0; j < y1; j++)
+          {
+            const float *const row = band + j * cw;
+            for(size_t i = x0; i < x1; i++)
+            {
+              const double v = (double)row[i];
+              s2 += v * v;
+              s1 += fabs(v);
+            }
+          }
+      }
+      blk2[by * bw + bx] = s2;
+      blk1[by * bw + bx] = s1;
+    }
+  }
+}
+
+// standard summed-area table, one row/column of zero padding on the low side
+// so a box query is sat[y1][x1] - sat[y0][x1] - sat[y1][x0] + sat[y0][x0]
+// with no special-casing at the edges. kept in double precision -- the whole
+// point of accumulating it once per ladder rather than per pick -- because a
+// query can sum thousands of blocks and this is exactly the kind of
+// running sum that drifts in float.
+static void _ladder_build_sat(const double *const restrict blk,
+                              const size_t bw, const size_t bh,
+                              double *const restrict sat)
+{
+  const size_t sw = bw + 1;
+  for(size_t x = 0; x <= bw; x++) sat[x] = 0.0;
+  for(size_t y = 1; y <= bh; y++)
+  {
+    sat[y * sw] = 0.0;
+    double rowsum = 0.0;
+    for(size_t x = 1; x <= bw; x++)
+    {
+      rowsum += blk[(y - 1) * bw + (x - 1)];
+      sat[y * sw + x] = sat[(y - 1) * sw + x] + rowsum;
+    }
+  }
+}
+
+// build the ladder frame-wide: mean-centre log2 luminance once, then climb
+// octaves, each one's four rungs blurred straight from that octave's own base
+// (never chained rung-to-rung -- the same "always from the base" discipline
+// `_ladder_rung` used above, now via IIR blurs instead of explicit kernels),
+// decimating by two between octaves once the base is safely past its own
+// Nyquist frequency. Unlike the picked-region ladder, there is no small-area
+// floor to fall back from: a preview frame is always large enough to decimate,
+// so this always does (research.md §5.1).
+static gboolean _build_ladder(const float *const restrict lum,
+                              const size_t width, const size_t height,
+                              _ct_ladder_t *const ladder)
+{
+  memset(ladder, 0, sizeof(_ct_ladder_t));
+  if(width < CT_BLOCK || height < CT_BLOCK) return FALSE;
+
+  ladder->bw = (width + CT_BLOCK - 1) / CT_BLOCK;
+  ladder->bh = (height + CT_BLOCK - 1) / CT_BLOCK;
+  const size_t sat_stride = (ladder->bw + 1) * (ladder->bh + 1);
+  const size_t npixels = width * height;
+
+  double *const restrict sat2 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
+  double *const restrict sat1 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
+  double *const restrict blk2 = dt_alloc_align_double(ladder->bw * ladder->bh);
+  double *const restrict blk1 = dt_alloc_align_double(ladder->bw * ladder->bh);
+  float *restrict level = dt_alloc_align_float(npixels);   // this octave's base
+  float *restrict next = dt_alloc_align_float(npixels);    // next octave's decimated base
+  float *restrict band = dt_alloc_align_float(npixels);
+  float *restrict rung[CT_SCALES_PER_OCTAVE + 1] = { 0 };
+
+  gboolean ok = sat2 && sat1 && blk2 && blk1 && level && next && band;
+  for(int s = 0; ok && s <= CT_SCALES_PER_OCTAVE; s++)
+  {
+    rung[s] = dt_alloc_align_float(npixels);
+    ok = ok && rung[s];
+  }
+
+  if(!ok)
+  {
+    dt_free_align(sat2); dt_free_align(sat1);
+    dt_free_align(blk2); dt_free_align(blk1);
+    dt_free_align(level); dt_free_align(next); dt_free_align(band);
+    for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++) dt_free_align(rung[s]);
+    memset(ladder, 0, sizeof(_ct_ladder_t));
+    return FALSE;
+  }
+
+  // mean-centre log2 luminance once, over the whole frame -- everything
+  // downstream is a difference of blurs and so ignores this offset
+  // mathematically, but centring it keeps the numbers well away from
+  // wherever the exposure happens to put the absolute level (the same
+  // exposure-invariance argument `_measure_detail_scale` makes above).
+  double mean_ev = 0.0;
+  DT_OMP_FOR(reduction(+ : mean_ev))
+  for(size_t k = 0; k < npixels; k++)
+  {
+    level[k] = log2f(fmaxf(lum[k], NORM_MIN));
+    mean_ev += level[k];
+  }
+  mean_ev /= (double)npixels;
+  const float offset = (float)mean_ev;
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npixels; k++) level[k] -= offset;
+
+  size_t cw = width, ch = height;
+  double step = 1.0;
+  int nrungs = 0;
+
+  for(int octave = 0;
+      ok && octave < CT_MAX_OCTAVES && nrungs + CT_SCALES_PER_OCTAVE <= CT_MAX_BANDS;
+      octave++)
+  {
+    const float minv = -1.0e6f, maxv = 1.0e6f;
+    for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++)
+    {
+      const float sigma = CT_SIGMA_BASE * exp2f((float)s / CT_SCALES_PER_OCTAVE);
+      dt_gaussian_t *const g =
+        dt_gaussian_init((int)cw, (int)ch, 1, &maxv, &minv, sigma, DT_IOP_GAUSSIAN_ZERO);
+      if(!g) { ok = FALSE; break; }
+      dt_gaussian_blur(g, level, rung[s]);
+      dt_gaussian_free(g);
+    }
+    if(!ok) break;
+
+    for(int s = 0; s < CT_SCALES_PER_OCTAVE; s++)
+    {
+      DT_OMP_FOR()
+      for(size_t k = 0; k < cw * ch; k++) band[k] = rung[s][k] - rung[s + 1][k];
+
+      _ladder_accumulate_blocks(band, cw, ch, step, ladder->bw, ladder->bh, blk2, blk1);
+      _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
+      _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
+
+      // the DoG's peak frequency sits within a percent of the geometric mean
+      // of its two rung sigmas (kept from `_measure_detail_scale` above);
+      // 2*pi*sigma is the sigma-to-wavelength convention already established
+      // by `_fit_texture_scale`'s return value.
+      const double sigma_s = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
+      const double sigma_s1 = CT_SIGMA_BASE * exp2((double)(s + 1) / CT_SCALES_PER_OCTAVE);
+      ladder->lambda[nrungs] = 2.0 * M_PI * sqrt(sigma_s * sigma_s1) * step;
+      ladder->step[nrungs] = step;
+      nrungs++;
+    }
+
+    const size_t nw = cw / 2, nh = ch / 2;
+    if(nw < CT_LADDER_MIN_DIM || nh < CT_LADDER_MIN_DIM) break;
+
+    // the coarsest rung of this octave (index CT_SCALES_PER_OCTAVE, sigma
+    // twice the base) is already blurred well past the new grid's Nyquist
+    // frequency, so plain subsampling is exact enough -- the same B'
+    // principle phase0-nonrecursive-pyramid.md validated, applied here to a
+    // pure measurement, not to anything the halo-risk finding was about.
+    DT_OMP_FOR()
+    for(size_t j = 0; j < nh; j++)
+      for(size_t i = 0; i < nw; i++)
+        next[j * nw + i] = rung[CT_SCALES_PER_OCTAVE][(2 * j) * cw + 2 * i];
+
+    float *const swap = level; level = next; next = swap;
+    cw = nw; ch = nh;
+    step *= 2.0;
+  }
+
+  ladder->nrungs = nrungs;
+
+  dt_free_align(blk2); dt_free_align(blk1);
+  dt_free_align(level); dt_free_align(next); dt_free_align(band);
+  for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++) dt_free_align(rung[s]);
+
+  if(!ok || nrungs == 0)
+  {
+    dt_free_align(sat2); dt_free_align(sat1);
+    memset(ladder, 0, sizeof(_ct_ladder_t));
+    return FALSE;
+  }
+
+  ladder->sat2 = sat2;
+  ladder->sat1 = sat1;
+  return TRUE;
+}
+
 // Compute pixel-wise luminance (no boost) and add the noise bias, exactly as
 // the detail ladder below expects to see it.
 __DT_CLONE_TARGETS__
@@ -1305,6 +1577,23 @@ void process(dt_iop_module_t *self,
   }
 
   compute_luminance(in, luminance, roi_in, d);
+
+  // §2.1: keep the frame-wide DoG ladder current while the module is
+  // expanded. Same untiled-preview gate as the picked-region measurement
+  // below, for the same reason -- a tile is not a whole frame.
+  if(g && self->dev->gui_attached && self->expanded
+     && dt_pipe_is_preview(piece->pipe) && !piece->pipe->tiling)
+  {
+    _ct_ladder_t built;
+    if(_build_ladder(luminance, width, height, &built))
+    {
+      dt_iop_gui_enter_critical_section(self);
+      _ct_ladder_t old = g->ladder;
+      g->ladder = built;
+      dt_iop_gui_leave_critical_section(self);
+      _ladder_free(&old);
+    }
+  }
 
   // An area measurement needs to see a whole, contiguous frame, so skip it
   // while the pipe hands us one tile at a time -- the request simply stays
@@ -2156,6 +2445,7 @@ void gui_cleanup(dt_iop_module_t *self)
   self->request_color_pick = DT_REQUEST_COLORPICK_OFF;
 
   dt_draw_curve_destroy(g->curve);
+  _ladder_free(&g->ladder);
 }
 
 // clang-format off
