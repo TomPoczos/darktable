@@ -217,6 +217,17 @@ typedef struct dt_iop_contrast_gui_data_t
   double ladder_step[CT_MAX_BANDS];
   double ladder_noise_floor[CT_MAX_BANDS];  // §2.4, frame-wide, published the same way
   dt_iop_roi_t ladder_roi_in;  // the roi_in the ladder above was built from
+
+  // §3.1: per-band block SAT tables for the module's own delivered bands,
+  // built alongside the ladder in the same guarded preview pass (see
+  // _decompose_and_accumulate's optional _ct_band_tables_t argument) and
+  // queried the same way to calibrate the picker's linear H_k model against
+  // what eigf's edge-awareness actually delivers (research.md §5.8).
+  // components is fixed at 2*CT_BANDS -- unlike the ladder's nrungs, CT_BANDS
+  // never changes, so this pd needs no resize-on-change dance.
+  dt_preview_data_t band_pd;
+  int band_nbands;               // how many of CT_BANDS survived the pass that built band_pd
+  float band_sigma[CT_BANDS];    // finest-first, pixels of that same pass's roi (== ladder_roi_in)
 } dt_iop_contrast_gui_data_t;
 
 
@@ -1007,6 +1018,58 @@ static void _ladder_fill_cb(void *const user_data, float *const buf, const size_
     }
 }
 
+// §3.1: per-band block S1/S2 tables for the module's own delivered bands,
+// built over the same CT_BLOCK grid the DoG ladder (§2.1) uses so a box query
+// is the same 4-lookups-per-band shape -- but always at step = 1 (module
+// bands are full resolution by the time they reach here, direct or upsampled
+// pyramid alike). scratch_* are owned by the caller and reused across every
+// band k in turn; sat1/sat2 hold CT_BANDS separate (bw+1)x(bh+1) tables,
+// band-major, one built per k as _decompose_and_accumulate/
+// _accumulate_pyramid_bands finish computing that band's b_k.
+typedef struct _ct_band_tables_t
+{
+  size_t bw, bh;
+  double *sat2, *sat1;      // CT_BANDS * (bw+1) * (bh+1) doubles each
+  float *scratch_full;      // npixels, this band's own b_k
+  double *scratch_blk2, *scratch_blk1;  // bw*bh, this band's own blocks
+} _ct_band_tables_t;
+
+// accumulate one band's already-computed b_k (bt->scratch_full) into its own
+// slot of bt's SAT tables. Reuses §2.1's block/SAT helpers verbatim -- they
+// were already generic over "one band's array + its own step", and a module
+// band's step is simply 1.
+static void _band_tables_accumulate(_ct_band_tables_t *const restrict bt,
+                                    const int k, const size_t width, const size_t height)
+{
+  _ladder_accumulate_blocks(bt->scratch_full, width, height, 1.0, bt->bw, bt->bh,
+                            bt->scratch_blk2, bt->scratch_blk1);
+  const size_t sat_stride = (bt->bw + 1) * (bt->bh + 1);
+  _ladder_build_sat(bt->scratch_blk2, bt->bw, bt->bh, bt->sat2 + (size_t)k * sat_stride);
+  _ladder_build_sat(bt->scratch_blk1, bt->bw, bt->bh, bt->sat1 + (size_t)k * sat_stride);
+}
+
+// §3.1: dt_preview_data_fill_t for _ct_band_tables_t, the same reshape
+// _ladder_fill_cb does for the ladder but with CT_BANDS fixed instead of a
+// variable nrungs.
+static void _band_fill_cb(void *const user_data, float *const buf, const size_t nelems)
+{
+  const _ct_band_tables_t *const bt = (const _ct_band_tables_t *)user_data;
+  const size_t sw = bt->bw + 1, sh = bt->bh + 1;
+  const size_t comps = (size_t)(2 * CT_BANDS);
+  (void)nelems;  // == sw * sh * comps, by construction of the caller's resize
+
+  for(size_t y = 0; y < sh; y++)
+    for(size_t x = 0; x < sw; x++)
+    {
+      float *const dst = buf + (y * sw + x) * comps;
+      for(int k = 0; k < CT_BANDS; k++)
+      {
+        dst[2 * k]     = (float)bt->sat2[(size_t)k * sw * sh + y * sw + x];
+        dst[2 * k + 1] = (float)bt->sat1[(size_t)k * sw * sh + y * sw + x];
+      }
+    }
+}
+
 // Compute pixel-wise luminance (no boost) and add the noise bias, exactly as
 // the detail ladder below expects to see it.
 __DT_CLONE_TARGETS__
@@ -1065,7 +1128,8 @@ static void _accumulate_pyramid_bands(const float *const restrict lum,
                                       const size_t width, const size_t height,
                                       const dt_iop_contrast_data_t *const d,
                                       const int direct_bands,
-                                      const int display_band)
+                                      const int display_band,
+                                      _ct_band_tables_t *const restrict bt)  // §3.1, NULL to skip
 {
   const size_t npixels = width * height;
 
@@ -1120,8 +1184,10 @@ static void _accumulate_pyramid_bands(const float *const restrict lum,
       if(is_display) correction[p] = b_k;
       else if(detail_mode) correction[p] += b_k;
       else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+      if(bt) bt->scratch_full[p] = b_k;
       prev_log[p] = log_blur;
     }
+    if(bt) _band_tables_accumulate(bt, k, width, height);
 
     if(k == d->nbands - 1) memcpy(coarsest, full_scratch, npixels * sizeof(float));
   }
@@ -1168,7 +1234,8 @@ static void _decompose_and_accumulate(const float *const restrict lum,
                                       float *const restrict coarsest,
                                       const size_t width, const size_t height,
                                       const dt_iop_contrast_data_t *const d,
-                                      const int display_band)
+                                      const int display_band,
+                                      _ct_band_tables_t *const restrict bt)  // §3.1, NULL to skip
 {
   const size_t npixels = width * height;
 
@@ -1210,8 +1277,10 @@ static void _decompose_and_accumulate(const float *const restrict lum,
       if(is_display) correction[p] = b_k;
       else if(detail_mode) correction[p] += b_k;
       else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+      if(bt) bt->scratch_full[p] = b_k;
       log_lum[p] = log_blur;  // becomes band (k+1)'s "previous"
     }
+    if(bt) _band_tables_accumulate(bt, k, width, height);
 
     if(k == d->nbands - 1) memcpy(coarsest, blur, npixels * sizeof(float));
   }
@@ -1221,7 +1290,7 @@ static void _decompose_and_accumulate(const float *const restrict lum,
   // chain going into the coarse tail, per the correctness note above.
   if(direct_bands < d->nbands)
     _accumulate_pyramid_bands(lum, log_lum, correction, coarsest, blur, width, height,
-                              d, direct_bands, display_band);
+                              d, direct_bands, display_band, bt);
 
   dt_free_align(log_lum);
   dt_free_align(blur);
@@ -1337,12 +1406,32 @@ void process(dt_iop_module_t *self,
 
   compute_luminance(in, luminance, roi_in, d);
 
-  // §2.2: keep the frame-wide DoG ladder + its published SAT tables current
-  // while the module is expanded, on the untiled preview pipe -- a tile is
-  // not a whole frame. color_picker_apply() queries this synchronously on
-  // the GUI thread; see there for the box query and the fit it feeds.
-  if(g && self->dev->gui_attached && self->expanded
-     && dt_pipe_is_preview(piece->pipe) && !piece->pipe->tiling)
+  // §2.2/§3.1: keep the frame-wide DoG ladder and the module's own per-band
+  // block tables current while the module is expanded, on the untiled
+  // preview pipe -- a tile is not a whole frame. color_picker_apply()
+  // queries both synchronously on the GUI thread; see there for the box
+  // query and the fit/calibration they feed.
+  const gboolean update_calibration_data =
+    g && self->dev->gui_attached && self->expanded
+    && dt_pipe_is_preview(piece->pipe) && !piece->pipe->tiling;
+
+  _ct_band_tables_t band_tables = { 0 };
+  gboolean have_band_tables = FALSE;
+  if(update_calibration_data)
+  {
+    band_tables.bw = (width + CT_BLOCK - 1) / CT_BLOCK;
+    band_tables.bh = (height + CT_BLOCK - 1) / CT_BLOCK;
+    const size_t bstride = (band_tables.bw + 1) * (band_tables.bh + 1);
+    band_tables.sat2 = dt_alloc_align_double(bstride * CT_BANDS);
+    band_tables.sat1 = dt_alloc_align_double(bstride * CT_BANDS);
+    band_tables.scratch_full = dt_alloc_align_float(npixels);
+    band_tables.scratch_blk2 = dt_alloc_align_double(band_tables.bw * band_tables.bh);
+    band_tables.scratch_blk1 = dt_alloc_align_double(band_tables.bw * band_tables.bh);
+    have_band_tables = band_tables.sat2 && band_tables.sat1 && band_tables.scratch_full
+                      && band_tables.scratch_blk2 && band_tables.scratch_blk1;
+  }
+
+  if(update_calibration_data)
   {
     _ct_ladder_t built;
     if(_build_ladder(luminance, width, height, &built))
@@ -1394,7 +1483,30 @@ void process(dt_iop_module_t *self,
     }
   }
 
-  _decompose_and_accumulate(luminance, correction, coarsest, width, height, d, display_band);
+  _decompose_and_accumulate(luminance, correction, coarsest, width, height, d, display_band,
+                            have_band_tables ? &band_tables : NULL);
+
+  // §3.1: publish the per-band tables _decompose_and_accumulate just filled,
+  // the same way §2.2 publishes the ladder -- band_sigma/band_nbands are
+  // this pass's own d->sigma/d->nbands, kept alongside so a later query
+  // evaluates the calibration model at the sigmas that actually produced
+  // these energies rather than whatever the picker's current params say.
+  if(have_band_tables)
+  {
+    dt_preview_data_store(&g->band_pd, band_tables.bw + 1, band_tables.bh + 1, piece,
+                          _band_fill_cb, &band_tables);
+
+    dt_iop_gui_enter_critical_section(self);
+    g->band_nbands = d->nbands;
+    memset(g->band_sigma, 0, sizeof(g->band_sigma));
+    memcpy(g->band_sigma, d->sigma, sizeof(float) * MIN(d->nbands, CT_BANDS));
+    dt_iop_gui_leave_critical_section(self);
+  }
+  dt_free_align(band_tables.sat2);
+  dt_free_align(band_tables.sat1);
+  dt_free_align(band_tables.scratch_full);
+  dt_free_align(band_tables.scratch_blk2);
+  dt_free_align(band_tables.scratch_blk1);
 
   // a band's or DETAIL's raw b_k has no gain applied -- gain could be zero
   // -- and no fixed scale, so gating/scaling it here would be meaningless;
@@ -1610,11 +1722,18 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
 // honest.
 #define CT_PROJECT_SMOOTHNESS 0.05
 
+// calibration is §3.1's per-band E_module,k/E_predicted,k ratio (NULL, or any
+// entry at 1.0, means uncalibrated) -- one scalar multiplier on band k's own
+// H_k column, so the solve asks for proportionally more (gain_k - 1) wherever
+// eigf's edge-awareness is known to deliver less than this linear model
+// would (research.md §5.8). Rows are unaffected: the smoothness penalty acts
+// on the {g_k} output directly and has no H_k of its own to calibrate.
 static gboolean _project_to_bands(const double *const restrict lambda_grid,
                                   const double *const restrict g_target,
                                   const int m,
                                   const float *const restrict sigma,
                                   const int nbands,
+                                  const float *const restrict calibration,
                                   float *const restrict gains)
 {
   if(nbands < 2 || m < 2) return FALSE;
@@ -1637,7 +1756,8 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
       const double sigma_k = (double)sigma[k];
       const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
       const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
-      A[j * nbands + k] = (float)(hp_k - hp_km1);
+      const float r = calibration ? calibration[k] : 1.0f;
+      A[j * nbands + k] = (float)(hp_k - hp_km1) * r;
     }
     y[j] = (float)(g_target[j] - 1.0);
   }
@@ -1660,6 +1780,125 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
   dt_free_align(A);
   dt_free_align(y);
   return ok;
+}
+
+// ---------------------------------------------------------------------------
+// §3.1: per-band calibration -- research.md §5.8
+// ---------------------------------------------------------------------------
+//
+// The DoG ladder is linear; eigf is not (§5.8's table: as little as 9% of a
+// hard edge's local deviation reaches the high-pass at the default edge
+// protection). A curve fitted from the linear ladder therefore over-promises
+// wherever the picked box has real local contrast, unless the projection
+// above is told how much of its own H_k a band actually delivers.
+//
+// research.md §2.2's peak wavelength of H_k = HP_k - HP_{k-1}, for an
+// octave-spaced ladder; the finest band (sigma_km1 = 0) is a shelf, not a
+// bump (same section), so its own half-amplitude wavelength stands in.
+static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
+{
+  if(sigma_km1 <= 0.0) return 2.0 * M_PI * sigma_k / sqrt(2.0 * log(2.0));
+  const double num = 2.0 * (sigma_k * sigma_k - sigma_km1 * sigma_km1);
+  const double den = log((sigma_k * sigma_k) / (sigma_km1 * sigma_km1));
+  return M_PI * sqrt(num / den);
+}
+
+// query §3.1's per-band block tables (built alongside the ladder in the same
+// guarded preview pass -- see process()'s comment above the ladder build)
+// for the box the picker used. e_module/sigma_out are filled finest-first,
+// for the first *nbands_out entries only -- sigma_out is band_sigma as of the
+// pass that produced e_module, not the picker's possibly-since-changed
+// current node placement, so the two stay internally consistent with each
+// other even if they drift a little from "right now".
+//
+// Returns FALSE (leaving every output untouched) if there is nothing fresh
+// to offer -- module just opened, or a param change raced the preview pipe.
+// Calibration is a refinement on an already-working picker, not a
+// precondition for one (research.md §5.10's framing for the analogous
+// second-picker question) -- the caller falls back to uncalibrated rather
+// than stalling or refusing the pick over a missing table.
+static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
+                                   double *const restrict e_module,
+                                   double *const restrict sigma_out,
+                                   int *const restrict nbands_out)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+  if(!dt_preview_data_is_fresh(&g->band_pd)) return FALSE;
+
+  dt_iop_gui_enter_critical_section(self);
+
+  const size_t sat_w = g->band_pd.width, sat_h = g->band_pd.height;
+  const gboolean have_data =
+    g->band_pd.buf && sat_w > 1 && sat_h > 1
+    && g->band_pd.components == (size_t)(2 * CT_BANDS) && g->band_nbands > 0;
+
+  if(have_data)
+  {
+    const size_t bw = sat_w - 1, bh = sat_h - 1;
+    const size_t bx0 = MIN(bw, (size_t)MAX(box[0], 0) / CT_BLOCK);
+    size_t bx1 = MIN(bw, (size_t)(MAX(box[2], 0) + CT_BLOCK - 1) / CT_BLOCK);
+    if(bx1 <= bx0) bx1 = MIN(bw, bx0 + 1);
+    const size_t by0 = MIN(bh, (size_t)MAX(box[1], 0) / CT_BLOCK);
+    size_t by1 = MIN(bh, (size_t)(MAX(box[3], 0) + CT_BLOCK - 1) / CT_BLOCK);
+    if(by1 <= by0) by1 = MIN(bh, by0 + 1);
+    // module bands are always full res (direct, or upsampled pyramid alike)
+    // -- step = 1, unlike the ladder's per-rung decimation.
+    const double n_eff =
+      fmax((double)(bx1 - bx0) * (double)(by1 - by0) * (double)(CT_BLOCK * CT_BLOCK), 1.0);
+
+    const int nbands = MIN(g->band_nbands, CT_BANDS);
+    const size_t comps = (size_t)(2 * CT_BANDS);
+    const float *const restrict buf = g->band_pd.buf;
+    for(int k = 0; k < nbands; k++)
+    {
+      const double s2 = buf[(by1 * sat_w + bx1) * comps + 2 * k]
+                       - buf[(by0 * sat_w + bx1) * comps + 2 * k]
+                       - buf[(by1 * sat_w + bx0) * comps + 2 * k]
+                       + buf[(by0 * sat_w + bx0) * comps + 2 * k];
+      e_module[k] = s2 / n_eff;
+      sigma_out[k] = (double)g->band_sigma[k];
+    }
+    *nbands_out = nbands;
+  }
+
+  dt_iop_gui_leave_critical_section(self);
+  return have_data;
+}
+
+// r_k = E_module,k / E_predicted,k, clamped against a near-empty band's
+// E_predicted blowing the ratio up rather than trusted at face value --
+// this is an empirical correction, not a physical law, and both the box and
+// the fit are noisy. Physically eigf never delivers *more* than the linear
+// model predicts (1 - a = eps/(v+eps) <= 1 always), but the fit's own beta
+// need not exactly match the module's own bands, so a little headroom above
+// 1 is left rather than hard-clamped there. calibration defaults every band
+// to 1 (uncalibrated) first, so a stale or missing table just skips the
+// refinement instead of failing the pick.
+#define CT_CALIBRATION_MIN 0.05
+#define CT_CALIBRATION_MAX 3.0
+#define CT_CALIBRATION_FLOOR 1e-9
+
+static void _compute_band_calibration(dt_iop_module_t *self, const int *const box,
+                                      const _ct_fit_t *const fit,
+                                      float *const restrict calibration)
+{
+  for(int k = 0; k < CT_BANDS; k++) calibration[k] = 1.0f;
+
+  double e_module[CT_BANDS], sigma_d[CT_BANDS];
+  int nbands = 0;
+  if(!_query_band_energy(self, box, e_module, sigma_d, &nbands)) return;
+
+  for(int k = 0; k < nbands; k++)
+  {
+    const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1];
+    const double lambda_peak = _band_peak_lambda(sigma_km1, sigma_d[k]);
+
+    double S, N;
+    _ct_fit_eval(fit, lambda_peak, &S, &N);
+    const double e_predicted = fmax(S + N, CT_CALIBRATION_FLOOR);
+
+    calibration[k] = (float)CLAMP(e_module[k] / e_predicted, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
+  }
 }
 
 // §2.2: query the ladder's published SAT tables for the box the picker
@@ -1883,8 +2122,14 @@ void color_picker_apply(dt_iop_module_t *self,
   for(int j = 0; j < CT_PROJECT_GRID; j++)
     target[j] = 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
+  // §3.1: how much of its own linear H_k each band actually delivered over
+  // this same box, last time the module's own bands were measured there --
+  // uncalibrated (all 1s) if that measurement isn't available yet.
+  float calibration[CT_BANDS];
+  _compute_band_calibration(self, box, &fit, calibration);
+
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
-  if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, gains))
+  if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration, gains))
   {
     dt_control_log(_("could not fit a curve to the picked area"));
     return;
@@ -2333,6 +2578,8 @@ void gui_init(dt_iop_module_t *self)
   g->details_display = DT_CT_MASK_OFF;
   g->mask_divisor = 1.0f;
   dt_preview_data_alloc(&g->pd, self);  // §2.2: the frame-wide ladder's SAT tables
+  dt_preview_data_alloc(&g->band_pd, self);  // §3.1: the module's own per-band tables
+  g->band_pd.components = 2 * CT_BANDS;  // fixed forever, unlike the ladder's nrungs -- no resize dance
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _ui_pipe_done);
 
@@ -2479,6 +2726,7 @@ void gui_cleanup(dt_iop_module_t *self)
 
   dt_draw_curve_destroy(g->curve);
   dt_preview_data_free(&g->pd);  // §2.2
+  dt_preview_data_free(&g->band_pd);  // §3.1
 }
 
 // clang-format off
