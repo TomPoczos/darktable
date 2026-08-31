@@ -1964,6 +1964,7 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
 #define CT_CALIBRATION_FLOOR 1e-9
 
 static void _compute_band_calibration(dt_iop_module_t *self, const int *const box,
+                                      const float long_edge,
                                       const _ct_fit_t *const fit,
                                       float *const restrict calibration)
 {
@@ -1977,11 +1978,14 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
   {
     const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1];
     const double lambda_peak = _band_peak_lambda(sigma_km1, sigma_d[k]);
-    // implementation-plan-2.md §3.4: _ct_fit_eval now takes fit's own sigma
-    // convention, not lambda_peak directly (which would silently reintroduce
-    // the old 2*pi mismatch) and not the band's own boundary sigma_d[k]
-    // (a different quantity -- the boundary, not the peak).
-    const double sigma_peak = lambda_peak / CT_SIGMA_TO_LAMBDA;
+    // implementation-plan-2.md §3.4/§4.2: _ct_fit_eval now takes fit's own
+    // (frame-relative, since §4.2) sigma convention, not lambda_peak
+    // directly (which would silently reintroduce the old 2*pi mismatch) and
+    // not the band's own boundary sigma_d[k] (a different quantity -- the
+    // boundary, not the peak). sigma_d[] is physical (pixels of the same
+    // roi_in the ladder was built from), same as lambda_peak, so it needs
+    // the same /long_edge conversion §4.2 applies to the ladder's own sigma.
+    const double sigma_peak = lambda_peak / CT_SIGMA_TO_LAMBDA / (double)long_edge;
 
     double S, N;
     _ct_fit_eval(fit, sigma_peak, &S, &N);
@@ -2011,8 +2015,11 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
 // spectrum_lambda/spectrum_energy/spectrum_nrungs (all optional, NULL to
 // skip) return this box's own raw per-rung measurement -- §3.2's graph
 // overlay wants it alongside the fit itself, to plot what was actually
-// measured next to what the model made of it.
+// measured next to what the model made of it. long_edge (§4.2) is the
+// ladder roi's own long edge, in the same pixels as the ladder's sigma --
+// dividing by it is what makes the returned fit->tau frame-relative.
 static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
+                                    const float long_edge,
                                     _ct_fit_t *const fit, _ct_target_mode_t *const mode,
                                     double *const restrict spectrum_lambda,
                                     double *const restrict spectrum_energy,
@@ -2086,7 +2093,8 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       const double n_indep = fmax(box_w * box_h / (lam * lam), 0.25);
 
       lambda[nrungs] = lam;
-      sigma[nrungs] = g->ladder_sigma[r];
+      // §4.2: frame-relative, so it lines up with §4.1's band sigma
+      sigma[nrungs] = g->ladder_sigma[r] / (double)long_edge;
       energies[nrungs] = s2 / n_eff;
       s1_energy[nrungs] = s1 / n_eff;
       weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
@@ -2334,6 +2342,13 @@ void color_picker_apply(dt_iop_module_t *self,
   const dt_iop_roi_t roi_in = g->ladder_roi_in;
   dt_iop_gui_leave_critical_section(self);
 
+  // implementation-plan-2.md §4.2: the ladder's sigma is in the pixels of
+  // this same roi_in -- dividing by the roi's own long edge (the same
+  // quantity modify_roi_in computes as S * roi_in->scale) is what makes the
+  // fit's tau frame-relative, and so comparable to §4.1's frame-relative
+  // band sigma below.
+  const float long_edge = (float)(MAX(pipe->iwidth, pipe->iheight)) * (float)roi_in.scale;
+
   // region defaults to the whole frame; a box pick narrows it, same
   // fallback picked-region measurement always used.
   int box[4] = { 0, 0, (int)roi_in.width, (int)roi_in.height };
@@ -2350,7 +2365,7 @@ void color_picker_apply(dt_iop_module_t *self,
   _ct_target_mode_t mode;
   double spectrum_lambda[CT_MAX_BANDS], spectrum_energy[CT_MAX_BANDS];
   int spectrum_nrungs = 0;
-  if(!_fit_curve_from_box(self, box, &fit, &mode,
+  if(!_fit_curve_from_box(self, box, long_edge, &fit, &mode,
                           spectrum_lambda, spectrum_energy, &spectrum_nrungs))
   {
     dt_control_log(_("the picked area is too small, or has nothing in it to measure a detail size from"));
@@ -2384,20 +2399,23 @@ void color_picker_apply(dt_iop_module_t *self,
   // would be invisible, so raise it first.
   if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = 1.5f;
 
-  // §2.5: the nominal per-band boundary sigma, in the same (ladder-roi)
-  // pixel units as `lambda` above -- modify_roi_in's own formula (§1.2), but
-  // evaluated at the ladder's roi/scale_shift rather than whatever roi
-  // happens to be piping through when the picker fires, and finest-first
-  // (idx 0) to match `_project_to_bands`'s H_k derivation.
+  // implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
+  // frame-relative (sigma / long edge) and finest-first (idx 0) to match
+  // `_project_to_bands`'s H_k derivation. The band ladder is frame-relative
+  // by construction (node k's nominal wavelength is S * 2^-(D0+k+shift)) --
+  // the "-1" pixel-discretisation term and the roi_in.scale factor belong to
+  // modify_roi_in, where a sigma has to come out in the pixels of an actual
+  // buffer; the projection has no such need, and at preview scale the old
+  // formula put sigma[0] at exactly 0 (a zero H_0 column, the finest band
+  // permanently unreachable from a pick) and spanned 21 octaves, most of it
+  // sub-pixel garbage.
   float sigma[CT_BANDS];
   {
-    const float S = MAX(pipe->iwidth, pipe->iheight);
     int idx = 0;
     for(int k = CT_BANDS - 1; k >= 0; k--)
     {
-      const float D = CT_BAND_D0 + k + 0.5f + p->scale_shift;
-      const float diameter = exp2f(-D) * S * (float)roi_in.scale;
-      sigma[idx++] = fmaxf(0.5f * (diameter - 1.0f), 0.0f);
+      const double D = CT_BAND_D0 + k + 0.5 + p->scale_shift;
+      sigma[idx++] = (float)exp2(-(D + 1.0));  // sigma / long edge; diameter/2, no pixel term
     }
   }
 
@@ -2425,7 +2443,7 @@ void color_picker_apply(dt_iop_module_t *self,
   // this same box, last time the module's own bands were measured there --
   // uncalibrated (all 1s) if that measurement isn't available yet.
   float calibration[CT_BANDS];
-  _compute_band_calibration(self, box, &fit, calibration);
+  _compute_band_calibration(self, box, long_edge, &fit, calibration);
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
   if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration, gains))
