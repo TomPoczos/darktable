@@ -1140,12 +1140,27 @@ void modify_roi_in(dt_iop_module_t *self,
 {
   dt_iop_contrast_data_t *const d = piece->data;
 
-  // Get the scaled window radius for the box average
-  const float max_size = (float)((piece->iwidth > piece->iheight) ? piece->iwidth : piece->iheight);
-  const float base_diameter = d->contrast_scale * max_size * roi_in->scale;
+  // node k's nominal wavelength is S * 2^-(D0+k+shift); boundary k sits half
+  // an octave finer, at the geometric mean of nodes k and k+1 -- see
+  // implementation-plan.md §1.2. Walk from the finest node to the coarsest so
+  // that dropping unresolvable bands (sigma < 0.7px at this roi scale) always
+  // trims off the front and the last band processed is always the coarsest,
+  // which never gets dropped.
+  const float S = MAX(piece->iwidth, piece->iheight);
+  int nbands = 0;
+  for(int k = CT_BANDS - 1; k >= 0; k--)
+  {
+    const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
+    const float diameter = exp2f(-D) * S * roi_in->scale;
+    const float sigma = 0.5f * (diameter - 1.0f);
 
-  const float diameter_local = base_diameter;
-  d->radius_local = (int)((diameter_local - 1.0f) / 2.0f);
+    if(nbands == 0 && sigma < 0.7f) continue;  // unresolvable fine tail: drop
+
+    d->sigma[nbands] = sigma;
+    d->gain[nbands] = d->band[k];
+    nbands++;
+  }
+  d->nbands = nbands;
 }
 
 void commit_params(dt_iop_module_t *self,
@@ -1159,10 +1174,10 @@ void commit_params(dt_iop_module_t *self,
   d->iterations = p->filter_iterations;
   d->gain_local_contrast = p->gain_local_contrast;
   d->noise_bias = p->noise_bias;
-
-  // UI contrast scale is inverse logarithmic with 0 as 100% of image width.
-  // Convert it to a linear scale for processing.
-  d->contrast_scale = powf(2.0f, -p->detail_level);
+  d->scale_shift = p->scale_shift;
+  d->decomposition = p->decomposition;
+  for(int k = 0; k < CT_BANDS; k++)
+    d->band[k] = p->band[k];
 
   // UI feathering is inverted (higher = stricter edge preservation).
   // Adjust the strength based on the number of iterations to maintain a consistent overall effect regardless of iteration count.
