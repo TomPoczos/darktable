@@ -119,11 +119,14 @@ typedef struct dt_iop_contrast_data_t
   dt_iop_contrast_decomposition_t decomposition;
 } dt_iop_contrast_data_t;
 
+// values 0 .. CT_BANDS-1 select one band's own raw b_k (param-space index,
+// coarsest = 0); the two named values above that select an accumulated view
+// instead (implementation-plan.md §1.6).
 typedef enum dt_iop_details_display_t
 {
-  DT_LC_MASK_OFF = -1,
-  DT_LC_MASK_LOCAL = 0,
-  DT_LC_MASK_LAST = 1
+  DT_CT_MASK_OFF = -1,
+  DT_CT_MASK_CORRECTION = CT_BANDS,      // sum (g_k - 1) b_k, i.e. what the module is doing
+  DT_CT_MASK_DETAIL     = CT_BANDS + 1   // sum b_k, i.e. the v1 behaviour
 } dt_iop_details_display_t;
 
 // the journey of one pick between two threads: color_picker_apply() arms it on
@@ -174,6 +177,10 @@ typedef struct dt_iop_contrast_gui_data_t
   // CT_BANDS -- everything resolvable -- until the first preview pass lands.
   int nbands;
   float sigma[CT_BANDS];  // matching pixel sigma, index 0 = finest surviving
+
+  // rms-based divisor of the currently displayed texture mask (a band or
+  // DETAIL, never CORRECTION), published from process() the same way (§1.6)
+  float mask_divisor;
 
   // graph interaction state
   gboolean dragging;
@@ -940,9 +947,13 @@ static inline void compute_luminance(const float *const restrict in,
 // the master gain and the Wiener gate -- both are cheap scalar-per-pixel
 // operations applied once by the caller, rather than folded in here.
 //
-// display_band >= 0 makes this write that one band's b_k into correction
-// instead of accumulating, so the mask view (Phase 1.6) can reuse this same
-// pass rather than a second traversal.
+// display_band selects what correction ends up holding (Phase 1.6):
+// >= 0 writes that one surviving band's raw b_k, instead of accumulating,
+// so the per-band mask view can reuse this same pass rather than a second
+// traversal; -2 accumulates the unweighted sum of every band's b_k (the
+// DETAIL view, i.e. v1's own behaviour, with no gain applied); -1 (or
+// anything else negative) is the normal gain-weighted accumulate, which
+// doubles as the CORRECTION view before the caller's gate and master gain.
 __DT_CLONE_TARGETS__
 static void _decompose_and_accumulate(const float *const restrict lum,
                                       float *const restrict correction,
@@ -978,12 +989,14 @@ static void _decompose_and_accumulate(const float *const restrict lum,
 
     const float gain_minus_one = d->gain[k] - 1.0f;
     const gboolean is_display = (display_band == k);
+    const gboolean detail_mode = (display_band == -2);
 
     DT_OMP_FOR()
     for(size_t p = 0; p < npixels; p++)
     {
       const float b_k = log_lum[p] - log2f(fmaxf(blur[p], NORM_MIN));
       if(is_display) correction[p] = b_k;
+      else if(detail_mode) correction[p] += b_k;
       else if(display_band < 0) correction[p] += gain_minus_one * b_k;
     }
 
@@ -1027,14 +1040,20 @@ static inline void apply_correction(const float *const restrict in,
 }
 
 /*
- Display the correction mask -- what the module is doing to each pixel.
- Output is a grayscale image normalized to [0, 1] where:
- - 0.5 = no correction applied
- - < 0.5 = pixel darkened
- - > 0.5 = pixel brightened
+ Display a mask -- either the correction (what the module is doing to each
+ pixel) or a raw band/DETAIL texture view. Output is a grayscale image
+ normalized to [0, 1] where 0.5 = no signal, < 0.5 = negative, > 0.5 =
+ positive.
+
+ divisor rescales correction_ev before the sigmoid: 1.0 for CORRECTION,
+ where the values are already in the module's own EV units, or a
+ frame-wide rms (research.md §4.2) for a raw band/DETAIL view, which
+ without it reads as flat grey -- those are un-gained EV differences with
+ no fixed scale of their own (implementation-plan.md §1.6).
  */
 __DT_CLONE_TARGETS__
 static inline void display_correction_mask(const float *const restrict correction_ev,
+                                           const float divisor,
                                            float *const restrict out,
                                            const dt_iop_roi_t *const roi_in)
 {
@@ -1043,7 +1062,7 @@ static inline void display_correction_mask(const float *const restrict correctio
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
-    const float y = correction_ev[k];
+    const float y = correction_ev[k] / divisor;
     const float intensity = y / sqrtf(y * y + 1.0f) * 0.5f + 0.5f; // Smooth mapping to [0, 1]
 
     for_each_channel(c)
@@ -1187,25 +1206,65 @@ void process(dt_iop_module_t *self,
       _auto_detail_level(self, g, luminance, roi_in, piece);
   }
 
-  // display_band selection (which single band's b_k to show, rather than the
-  // accumulated correction) is Phase 1.6; for now the mask view always shows
-  // the whole correction.
-  _decompose_and_accumulate(luminance, correction, coarsest, width, height, d, -1);
-
-  // gate the accumulated correction once and fold in the master strength --
-  // gain_local_contrast is a pure multiplier on top of whatever the bands
-  // already summed to, so it belongs here rather than inside the ladder.
-  DT_OMP_FOR()
-  for(size_t k = 0; k < npixels; k++)
+  // Phase 1.6: map the GUI's mask selection onto _decompose_and_accumulate's
+  // display_band. CORRECTION and the normal (non-display) path are the same
+  // -1 accumulate -- CORRECTION is exactly that sum before the gate/master
+  // gain below, "what the module is doing". a band index that isn't
+  // currently resolvable (>= d->nbands, greyed out in the graph) has no
+  // slot in d->sigma/d->gain; fall back to CORRECTION rather than show
+  // nothing.
+  const gboolean showing_mask =
+    g && g->details_display != DT_CT_MASK_OFF && (piece->pipe->type & DT_DEV_PIXELPIPE_FULL);
+  int display_band = -1;
+  gboolean showing_texture = FALSE;
+  if(showing_mask)
   {
-    const float gate = _wiener_gate(coarsest[k], d->noise_bias);
-    correction[k] *= gate * d->gain_local_contrast;
+    if(g->details_display == DT_CT_MASK_DETAIL) { display_band = -2; showing_texture = TRUE; }
+    else if(g->details_display != DT_CT_MASK_CORRECTION && g->details_display < d->nbands)
+    {
+      display_band = d->nbands - 1 - g->details_display;
+      showing_texture = TRUE;
+    }
   }
 
-  // Display output
-  if(g && g->details_display != DT_LC_MASK_OFF && (piece->pipe->type & DT_DEV_PIXELPIPE_FULL))
+  _decompose_and_accumulate(luminance, correction, coarsest, width, height, d, display_band);
+
+  // a band's or DETAIL's raw b_k has no gain applied -- gain could be zero
+  // -- and no fixed scale, so gating/scaling it here would be meaningless;
+  // it gets its own rms-based normalization below instead. CORRECTION and
+  // the real output both want the gate and master strength.
+  if(!showing_texture)
   {
-    display_correction_mask(correction, out, roi_in);
+    // gain_local_contrast is a pure multiplier on top of whatever the bands
+    // already summed to, so it belongs here rather than inside the ladder.
+    DT_OMP_FOR()
+    for(size_t k = 0; k < npixels; k++)
+    {
+      const float gate = _wiener_gate(coarsest[k], d->noise_bias);
+      correction[k] *= gate * d->gain_local_contrast;
+    }
+  }
+
+  if(showing_mask)
+  {
+    float divisor = 1.0f;
+    if(showing_texture)
+    {
+      // scale by the displayed buffer's own frame-wide rms (research.md
+      // §4.2) -- without it a low-amplitude band reads as flat grey.
+      double sum_sq = 0.0;
+      DT_OMP_FOR(reduction(+ : sum_sq))
+      for(size_t k = 0; k < npixels; k++)
+        sum_sq += (double)correction[k] * (double)correction[k];
+      const float rms = sqrtf((float)(sum_sq / (double)npixels));
+      divisor = fmaxf(3.0f * rms, 1e-3f);
+    }
+
+    dt_iop_gui_enter_critical_section(self);
+    g->mask_divisor = divisor;
+    dt_iop_gui_leave_critical_section(self);
+
+    display_correction_mask(correction, divisor, out, roi_in);
     piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
   }
   else
@@ -1373,32 +1432,59 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
   dt_iop_gui_leave_critical_section(self);
 }
 
+// shared by every quad (§1.6): early return if the blend module is already
+// displaying a mask -- unchanged from the module's original single-mode
+// check, now called from both the slider quads and the graph's ctrl+click.
+static gboolean _mask_display_blocked(dt_iop_module_t *self)
+{
+  if(!self->request_mask_display) return FALSE;
+  dt_control_log(_("cannot display masks when the blending mask is displayed"));
+  return TRUE;
+}
+
+// sets g->details_display (toggling it off if it was already showing mode)
+// and keeps every quad's active state in sync with it -- exactly one active
+// at a time, matching what process() will actually display next pass.
+static void _apply_details_display(dt_iop_module_t *self, const dt_iop_details_display_t mode)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  dt_iop_request_focus(self);
+  // Activate the module if it wasn't
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), TRUE);
+
+  g->details_display = (g->details_display == mode) ? DT_CT_MASK_OFF : mode;
+
+  dt_bauhaus_widget_set_quad_active
+    (GTK_WIDGET(g->gain_local_contrast),
+     g->details_display == DT_CT_MASK_CORRECTION || g->details_display == DT_CT_MASK_DETAIL);
+  for(int k = 0; k < CT_BANDS; k++)
+    dt_bauhaus_widget_set_quad_active(GTK_WIDGET(g->band[k]), g->details_display == k);
+
+  dt_iop_refresh_center(self);
+}
+
+// the master gain's quad shows CORRECTION (ctrl+click: DETAIL); each band
+// slider's quad shows that band's own raw texture ("ct-band" data set at
+// creation, gui_init).
 static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self)
 {
-  // early return if blend module is already displaying a mask
-  if(self->request_mask_display)
+  if(_mask_display_blocked(self))
   {
-    dt_control_log(_("cannot display masks when the blending mask is displayed"));
     dt_bauhaus_widget_set_quad_active(GTK_WIDGET(togglebutton), FALSE);
     return;
   }
 
   DT_GUARD_GUI_UPDATE();
-  dt_iop_request_focus(self);
-  // Activate the module if it wasn't
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), TRUE);
 
   dt_iop_contrast_gui_data_t *g = self->gui_data;
-  g->details_display = DT_LC_MASK_OFF;
+  dt_iop_details_display_t mode;
+  if(togglebutton == g->gain_local_contrast)
+    mode = dt_modifier_is(dt_key_modifier_state(), GDK_CONTROL_MASK)
+      ? DT_CT_MASK_DETAIL : DT_CT_MASK_CORRECTION;
+  else
+    mode = (dt_iop_details_display_t)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(togglebutton), "ct-band"));
 
-  const gboolean toggle_is_active = dt_bauhaus_widget_get_quad_active(GTK_WIDGET(togglebutton));
-  if(toggle_is_active)
-  {
-    if(togglebutton == g->gain_local_contrast) g->details_display = DT_LC_MASK_LOCAL;
-  }
-
-  dt_bauhaus_widget_set_quad_active(GTK_WIDGET(g->gain_local_contrast), g->details_display == DT_LC_MASK_LOCAL);
-  dt_iop_refresh_center(self);
+  _apply_details_display(self, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,10 +1554,12 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     (widget,
      g->nbands < CT_BANDS
      ? _("drag a node to set its band's gain; double-click to reset it;\n"
+         "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
+         "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list."));
 
   GtkAllocation allocation;
@@ -1543,6 +1631,42 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     else
       set_color(cr, darktable.bauhaus->graph_bg);
     cairo_fill(cr);
+
+    // §1.6: this band's own texture is the mask currently shown -- the link
+    // that answers "you can only visualize the main detail scale"
+    if(k == g->details_display)
+    {
+      cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+      set_color(cr, darktable.bauhaus->graph_fg);
+      cairo_arc(cr, xn, yn, DT_PIXEL_APPLY_DPI(7.5), 0.0, 2.0 * M_PI);
+      cairo_stroke(cr);
+    }
+  }
+
+  // §1.6: print the divisor a texture mask view was normalized by, so the
+  // view stays quantitative rather than just "brighter means more"
+  if(g->details_display == DT_CT_MASK_DETAIL
+     || (g->details_display >= 0 && g->details_display < CT_BANDS))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    const float divisor = g->mask_divisor;
+    dt_iop_gui_leave_critical_section(self);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "×%.4g", (double)divisor);
+    PangoFontDescription *div_desc = dt_gui_get_font();
+    pango_font_description_set_absolute_size(div_desc, 0.09 * height * PANGO_SCALE);
+    PangoLayout *div_layout = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(div_layout, div_desc);
+    set_color(cr, darktable.bauhaus->graph_fg);
+    pango_layout_set_text(div_layout, buf, -1);
+    PangoRectangle div_ink;
+    pango_layout_get_pixel_extents(div_layout, &div_ink, NULL);
+    cairo_move_to(cr, width - div_ink.width - DT_PIXEL_APPLY_DPI(2),
+                 height - div_ink.height - DT_PIXEL_APPLY_DPI(2));
+    pango_cairo_show_layout(cr, div_layout);
+    g_object_unref(div_layout);
+    pango_font_description_free(div_desc);
   }
 
   // axis labels
@@ -1619,6 +1743,16 @@ static void _area_button_press(GtkGestureSingle *gesture,
   int inset, width, height;
   _graph_geometry(widget, &inset, &width, &height);
   const int k = _graph_band_at(width, x - inset);
+
+  // ctrl+click selects that band's mask view (§1.6) rather than dragging its
+  // value -- the two would otherwise fight over the same click.
+  if(dt_modifier_is(dt_key_modifier_state(), GDK_CONTROL_MASK))
+  {
+    if(!_mask_display_blocked(self))
+      _apply_details_display(self, (dt_iop_details_display_t)k);
+    gtk_widget_queue_draw(widget);
+    return;
+  }
 
   if(n_press >= 2)
   {
@@ -1716,7 +1850,8 @@ static const dt_action_def_t _action_def_ct
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = IOP_GUI_ALLOC(contrast);
-  g->details_display = DT_LC_MASK_OFF;
+  g->details_display = DT_CT_MASK_OFF;
+  g->mask_divisor = 1.0f;
   g->auto_state = CT_AUTO_IDLE;
   g->auto_result = CT_AUTO_NOTHING;
 
@@ -1736,7 +1871,8 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->gain_local_contrast,
                               _("amount of local contrast enhancement"));
   dt_bauhaus_widget_set_quad(g->gain_local_contrast, self, dtgtk_cairo_paint_showmask, TRUE, show_details_callback,
-                             _("visualize details adjusted by the local constrast"));
+                             _("visualize the accumulated correction -- what this module is doing.\n"
+                               "ctrl+click: visualize the raw, un-gained detail sum (v1's behaviour)."));
 
   // Filter settings section
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "filter settings")));
@@ -1784,6 +1920,13 @@ void gui_init(dt_iop_module_t *self)
     char label[64];
     snprintf(label, sizeof(label), _("detail size ~ %.3g%%"), 100.0 * exp2(-(CT_BAND_D0 + k)));
     dt_bauhaus_widget_set_label(g->band[k], NULL, label);
+
+    // §1.6: this quad shows this band's own raw detail texture, whatever its
+    // gain -- "ct-band" is what show_details_callback reads to know which.
+    g_object_set_data(G_OBJECT(g->band[k]), "ct-band", GINT_TO_POINTER(k));
+    dt_bauhaus_widget_set_quad(g->band[k], self, dtgtk_cairo_paint_showmask, TRUE, show_details_callback,
+                               _("visualize this band's own detail texture\n"
+                                 "(the same as ctrl+clicking its node in the graph)"));
   }
 
   g->stack = GTK_STACK(gtk_stack_new());
