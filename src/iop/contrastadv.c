@@ -80,6 +80,17 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_BANDS 9          // detail levels 2..10, one node per octave
 #define CT_BAND_D0 2.0f     // detail level of the coarsest node
 
+// §1.9 FAST: how many of the *finest* (d->sigma[]-space, index 0) bands stay
+// direct-eigf regardless of decomposition. phase0-hybrid-pyramid-summary.md's
+// sweep labels this count `c` -- `H(5)` is the setting that measured safe on
+// all six test images (5 finest direct, coarsest 9-5=4 pyramided when every
+// band survives); implementation-plan.md §1.9's prose describes the same
+// point as "the finest ~5 bands" but its formula ("cutover = nbands - 5")
+// only equals 5 at nbands = 10, not this module's nbands = 9, so it is read
+// here as a slip and this constant follows the tested number instead.
+#define CT_FAST_DIRECT_BANDS 5
+#define CT_FAST_MIN_DIM 8   // floor on a pyramid level's shorter side, px
+
 // the graph: nodes run coarse (left) to fine (right), one per octave, so the
 // x axis is simply k/CT_BANDS; the y axis is gain, soft-ranged to
 // CT_GRAPH_Y_MAX to match the sliders' own soft range (gui_init) even though
@@ -938,6 +949,99 @@ static inline void compute_luminance(const float *const restrict in,
   }
 }
 
+// §1.9 FAST: the coarse tail of the ladder, from research.md §2.4 option B'
+// (phase0-nonrecursive-pyramid.md's winning variant), restricted to the
+// coarse bands per phase0-hybrid-pyramid.md's finding that the pyramid
+// softens dense fine texture but is safe -- and where direct (A)'s own cost
+// concentrates, since sigma is largest there -- on the coarse ones.
+//
+// Builds one shared chain of bases by repeatedly halving the untouched
+// full-resolution luminance -- never a level's own blurred output, that
+// recursive variant is what phase0-pyramid.md rejected in the first place --
+// runs one eigf call per level at that level's own (shrunk) resolution, and
+// upsamples the result back to full res via interpolate_bilinear() before
+// folding it into the same accumulate the direct bands use.
+//
+// The ladder is an exact octave-per-band geometric progression
+// (modify_roi_in, §1.2), so doubling the decimation once per band -- 2x for
+// the first pyramid band, 4x for the next, and so on -- keeps every level's
+// *local* sigma close to constant by construction, matching phase0-
+// nonrecursive-pyramid.md's tested recipe (sigma_local ~= 2.5px at every
+// level) without needing to compute a target and round to it.
+//
+// full_scratch is the caller's full-res "blur" buffer: already allocated,
+// and the direct loop above is done with it by the time this runs.
+__DT_CLONE_TARGETS__
+static void _accumulate_pyramid_bands(const float *const restrict lum,
+                                      const float *const restrict log_lum,
+                                      float *const restrict correction,
+                                      float *const restrict coarsest,
+                                      float *const restrict full_scratch,
+                                      const size_t width, const size_t height,
+                                      const dt_iop_contrast_data_t *const d,
+                                      const int direct_bands,
+                                      const int display_band)
+{
+  const size_t npixels = width * height;
+
+  float *restrict base = NULL;           // owned decimated base, replaced each level
+  const float *restrict base_src = lum;  // this level's source to downsample from
+  size_t base_w = width, base_h = height;
+  int decimation = 1;
+
+  for(int k = direct_bands; k < d->nbands; k++)
+  {
+    const size_t new_w = MAX(base_w / 2, (size_t)CT_FAST_MIN_DIM);
+    const size_t new_h = MAX(base_h / 2, (size_t)CT_FAST_MIN_DIM);
+    if(new_w < base_w && new_h < base_h)
+    {
+      float *const restrict next = dt_alloc_align_float(new_w * new_h);
+      if(next)
+      {
+        interpolate_bilinear(base_src, base_w, base_h, next, new_w, new_h, 1);
+        dt_free_align(base);
+        base = next;
+        base_src = base;
+        base_w = new_w;
+        base_h = new_h;
+        decimation *= 2;
+      }
+    }
+    // else: hit the size floor -- keep reusing this level for every
+    // remaining (coarser) band. their local sigma runs a bit above target,
+    // which is not a correctness problem, just slightly less separation
+    // between them; only happens on very small previews/exports.
+
+    float *const restrict level_blur = dt_alloc_align_float(base_w * base_h);
+    if(!level_blur) break;
+
+    memcpy(level_blur, base_src, base_w * base_h * sizeof(float));
+    const float local_sigma = fmaxf(d->sigma[k] / (float)decimation, 1.0f);
+    fast_eigf_surface_blur(level_blur, base_w, base_h, local_sigma, d->feathering, d->iterations,
+                           DT_GF_BLENDING_LINEAR, 1.0f,
+                           0.0f, NORM_MIN, 4.0f);
+    interpolate_bilinear(level_blur, base_w, base_h, full_scratch, width, height, 1);
+    dt_free_align(level_blur);
+
+    const float gain_minus_one = d->gain[k] - 1.0f;
+    const gboolean is_display = (display_band == k);
+    const gboolean detail_mode = (display_band == -2);
+
+    DT_OMP_FOR()
+    for(size_t p = 0; p < npixels; p++)
+    {
+      const float b_k = log_lum[p] - log2f(fmaxf(full_scratch[p], NORM_MIN));
+      if(is_display) correction[p] = b_k;
+      else if(detail_mode) correction[p] += b_k;
+      else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+    }
+
+    if(k == d->nbands - 1) memcpy(coarsest, full_scratch, npixels * sizeof(float));
+  }
+
+  dt_free_align(base);
+}
+
 // the ladder: every band a direct, full-resolution eigf call against the
 // untouched luminance, accumulated as it goes so no band is ever stored
 // (research.md §2.4 option A; see phase0-hybrid-pyramid.md for why this is
@@ -954,6 +1058,13 @@ static inline void compute_luminance(const float *const restrict in,
 // DETAIL view, i.e. v1's own behaviour, with no gain applied); -1 (or
 // anything else negative) is the normal gain-weighted accumulate, which
 // doubles as the CORRECTION view before the caller's gate and master gain.
+//
+// §1.9: when d->decomposition == FAST, only the finest CT_FAST_DIRECT_BANDS
+// bands take the direct path above; d->nbands - CT_FAST_DIRECT_BANDS coarser
+// bands are missing here, filled in below by _accumulate_pyramid_bands().
+// ACCURATE always runs every band direct -- direct_bands == d->nbands, the
+// loop is untouched from before this section existed, and the call below
+// never executes, so ACCURATE stays bit-identical to 1.3.
 __DT_CLONE_TARGETS__
 static void _decompose_and_accumulate(const float *const restrict lum,
                                       float *const restrict correction,
@@ -980,7 +1091,10 @@ static void _decompose_and_accumulate(const float *const restrict lum,
   for(size_t p = 0; p < npixels; p++)
     log_lum[p] = log2f(fmaxf(lum[p], NORM_MIN));
 
-  for(int k = 0; k < d->nbands; k++)
+  const int direct_bands
+    = (d->decomposition == CT_DECOMPOSITION_FAST) ? MIN(CT_FAST_DIRECT_BANDS, d->nbands) : d->nbands;
+
+  for(int k = 0; k < direct_bands; k++)
   {
     memcpy(blur, lum, npixels * sizeof(float));
     fast_eigf_surface_blur(blur, width, height, d->sigma[k], d->feathering, d->iterations,
@@ -1002,6 +1116,10 @@ static void _decompose_and_accumulate(const float *const restrict lum,
 
     if(k == d->nbands - 1) memcpy(coarsest, blur, npixels * sizeof(float));
   }
+
+  if(direct_bands < d->nbands)
+    _accumulate_pyramid_bands(lum, log_lum, correction, coarsest, blur, width, height,
+                              d, direct_bands, display_band);
 
   dt_free_align(log_lum);
   dt_free_align(blur);
@@ -1995,7 +2113,9 @@ void gui_init(dt_iop_module_t *self)
   g->decomposition = dt_bauhaus_combobox_from_params(self, "decomposition");
   gtk_widget_set_tooltip_text(g->decomposition,
      _("accurate: every band a direct, full-resolution pass. the default.\n"
-       "fast: not implemented yet -- currently behaves identically to accurate."));
+       "fast: the coarsest bands run on a lower-resolution pyramid instead,\n"
+       "about 30% cheaper. can soften dense fine texture (fur, hair) very\n"
+       "slightly -- leave off unless you need the speed."));
 
   g->edge_protection = dt_bauhaus_slider_from_params(self, "edge_protection");
   dt_bauhaus_slider_set_soft_range(g->edge_protection, -2.0, 2.0);
