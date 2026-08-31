@@ -397,25 +397,46 @@ int legacy_params(dt_iop_module_t *self,
 // below this much detail there is nothing in the area worth enhancing and so
 // nothing to size: 0.008 EV rms is half a percent of luminance, and even at
 // this module's largest gain it stays under three percent, which is invisible.
-// clear sky and out-of-focus background sit well below it; the grain of dry
-// asphalt, about the faintest thing anyone would pick deliberately, sits
-// comfortably above.
+// clear sky sits well below it; the grain of dry asphalt, about the faintest
+// thing anyone would pick deliberately, sits comfortably above (~40x margin,
+// implementation-plan-2.md §7.1, re-verified against Phase 1-5's ladder on 19
+// real crops from a mixed image set -- unchanged). Out-of-focus background is
+// *not* reliably below it and that is correct, not a bug: a busy bokeh patch
+// (blown highlights, dark blobs) can carry more real broadband energy than a
+// deliberately-picked faint texture, so forcing it under this floor would
+// also have to swallow real texture and destroy the separation the floor
+// exists for.
 #define CT_FLAT_RMS_EV 0.008
 #define CT_FLAT_ENERGY (CT_FLAT_RMS_EV * CT_FLAT_RMS_EV)
 // grid resolution of the model fit's texture size, per octave
 #define CT_FIT_STEPS_PER_OCTAVE 8.0
-// the fit's other grid: the self-similar spectrum's slope, research.md §5.3's
-// measured spread across scene categories
-#define CT_FIT_BETA_MIN 1.6
-#define CT_FIT_BETA_MAX 3.0
-#define CT_FIT_BETA_STEPS 6  // 7 values, CT_FIT_BETA_MIN .. CT_FIT_BETA_MAX
+// the fit's other grid: the self-similar spectrum's slope. implementation-
+// plan-2.md §7.3: research.md §5.3's figure was for *linear* radiance and
+// this ladder measures log2 luminance, whose slope need not match -- the old
+// [1.6, 3.0] range pegged 8 of 18 real fits (44%) at one of its own bounds,
+// on a 19-crop mixed real-image set. Widened and re-centred from where an
+// unconstrained grid search (deliberately over-wide, [0.2, 6.0]) actually
+// settled real texture content: clean picks (petals, fur, skin, asphalt,
+// foliage, architecture) cluster 1.8-3.4 with no pegging under this range;
+// only genuinely flat/ambiguous content (clear sky, an out-of-focus patch --
+// exactly what CT_FLAT_ENERGY above is supposed to catch first) still rails
+// against the top, which is a property of that content having no real
+// texture to fit, not of the range being too narrow for it.
+#define CT_FIT_BETA_MIN 1.4
+#define CT_FIT_BETA_MAX 4.0
+#define CT_FIT_BETA_STEPS 12  // 13 values, CT_FIT_BETA_MIN .. CT_FIT_BETA_MAX
 // rungs this far below the peak are noise, and in log space they would
 // otherwise dominate the residual
 #define CT_ENERGY_FLOOR 1e-6
 // how far an idealized hump is expected to sit from a real texture's ladder,
 // as a fraction. it is the floor under every rung's error bar: past a couple
 // of hundred independent samples a rung stops getting more trustworthy, so
-// extra pixels stop buying it extra weight.
+// extra pixels stop buying it extra weight. implementation-plan-2.md §7.4:
+// unchanged, re-verified -- across the same 19-crop set, weighting by
+// n_indep (§1.2) instead of a pixel count never produced a fit dominated by
+// the fine rungs (no pathological texture/self_similar split, no fit that
+// ignored the coarse end); this floor is doing its job against the wider
+// weight spread §1.2 introduced.
 #define CT_MODEL_ERROR 0.15
 // what the fit needs to be worth trusting, and so what decides the smallest
 // area that can be measured at all. the hump is located by its flanks, so what
@@ -855,6 +876,14 @@ static void _ladder_build_sat(const double *const restrict blk,
 #define CT_KAPPA_EDGE 2.0                      // sparseness warning threshold, research.md §5.2/§5.9
 #define CT_NOISE_DOMINATED_FRAC 0.15           // S/(S+N) below this at the box's peak rung -> warn
 
+// implementation-plan-2.md §7.2: unchanged, re-verified against Phase 2's
+// ladder on real content, including two deliberately high-ISO/deep-shadow
+// crops (where sensor noise should be most visible if this were going to
+// break) -- every rung above octave 2 (index >= 3*CT_SCALES_PER_OCTAVE)
+// still comes back -1 (no near-Gaussian block found), and
+// _ladder_estimate_noise's min-over-rungs still lands on one of the fine
+// rungs, giving a small, sane N rather than swamping the fit (§7.4 confirms
+// the fits themselves stayed sane downstream of it).
 static double _ladder_rung_noise_floor(const double *const restrict blk2,
                                        const double *const restrict blk1,
                                        const size_t nblocks,
