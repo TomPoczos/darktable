@@ -1992,9 +1992,22 @@ void gui_init(dt_iop_module_t *self)
                                                "only affects dark parts of the image."));
 }
 
+// §1.8: dt_iop_gui_cleanup_module() (develop/imageop.c) already
+// DT_CONTROL_SIGNAL_DISCONNECT_ALL()s every DT_CONTROL_SIGNAL_HANDLE
+// registered in gui_init before calling this, so the preview-pipe-finished
+// and ui-pipe-done handlers need no disconnect of their own here -- verified
+// against the framework rather than assumed, and matches every other iop's
+// gui_cleanup in this tree (atrous, toneequal). dt_preview_data_free() has
+// nothing to free until Phase 2 gives this module a dt_preview_data_t.
 void gui_cleanup(dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = self->gui_data;
+
+  // drop any pick this module still owns, mirroring colorequal.c/toneequal.c
+  // -- if the module is torn down while a pick is armed or in flight,
+  // nothing else clears the global color picker for us.
+  self->request_color_pick = DT_REQUEST_COLORPICK_OFF;
+
   dt_draw_curve_destroy(g->curve);
 }
 
