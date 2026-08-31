@@ -1135,6 +1135,18 @@ void process(dt_iop_module_t *self,
   const dt_iop_contrast_data_t *const d = piece->data;
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
+  // publish which bands survive at this pipe's scale, for the graph's
+  // stripe shading (§1.5). keyed on the FULL pipe, not the preview: the
+  // preview runs at a fixed thumbnail scale that has nothing to do with the
+  // zoom level the graph is meant to describe.
+  if(g && self->dev->gui_attached && (piece->pipe->type & DT_DEV_PIXELPIPE_FULL))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    g->nbands = d->nbands;
+    memcpy(g->sigma, d->sigma, sizeof(g->sigma));
+    dt_iop_gui_leave_critical_section(self);
+  }
+
   const float *const restrict in = (float *const)ivoid;
   float *const restrict out = (float *const)ovoid;
 
@@ -1304,6 +1316,17 @@ static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *
   DT_ENTER_GUI_UPDATE();
   dt_bauhaus_update_from_field(self, NULL, NULL, NULL);
   DT_LEAVE_GUI_UPDATE();
+}
+
+// redraw the graph once a pipe has actually run, so its stripe shading
+// (g->nbands, published from process() above) and node positions track
+// what just got computed rather than the last GUI edit (§1.5; atrous.c's
+// _ui_pipe_done does the same for its own frequency histogram).
+static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(g && !DT_IN_GUI_UPDATE() && self->enabled && self->expanded)
+    gtk_widget_queue_draw(GTK_WIDGET(g->area));
 }
 
 // the area picker lands here once the pipe has sampled its box. we ignore the
@@ -1698,6 +1721,7 @@ void gui_init(dt_iop_module_t *self)
   g->auto_result = CT_AUTO_NOTHING;
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _preview_pipe_finished_callback);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _ui_pipe_done);
 
   // Main container
   self->widget = dt_gui_vbox();
