@@ -2419,20 +2419,21 @@ void color_picker_apply(dt_iop_module_t *self,
     }
   }
 
-  // dense log-lambda grid spanning the node ladder itself, padded two
-  // octaves either side so the projection sees each end band's full
-  // response rather than a truncated one.
+  // implementation-plan-2.md §4.3: dense log-sigma grid spanning the node
+  // ladder itself, padded two octaves either side (sigma[0]*0.25 ..
+  // sigma[CT_BANDS-1]*4, 13 octaves total, none of it below the finest
+  // band) so the projection sees each end band's full response rather than
+  // a truncated one. _target_curve/_ct_fit_eval are evaluated directly on
+  // sigma_grid; _project_to_bands' H_k needs a real wavelength, so
+  // lambda_grid is sigma_grid scaled by CT_SIGMA_TO_LAMBDA.
   double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID];
   double shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
-  const double lo = 2.0 * M_PI * fmax((double)sigma[0], 1e-3) * 0.25;
-  const double hi = 2.0 * M_PI * (double)sigma[CT_BANDS - 1] * 4.0;
+  const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
+  const double hi = (double)sigma[CT_BANDS - 1] * 4.0;
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
-    lambda_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
-    // implementation-plan-2.md §3.2: _target_curve/_ct_fit_eval now take
-    // sigma, via CT_SIGMA_TO_LAMBDA -- this grid moves to being sigma-native
-    // in §4.3, once `sigma[]` above is itself frame-relative.
-    sigma_grid[j] = lambda_grid[j] / CT_SIGMA_TO_LAMBDA;
+    sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+    lambda_grid[j] = sigma_grid[j] * CT_SIGMA_TO_LAMBDA;
   }
 
   _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, shape);
