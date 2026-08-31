@@ -558,7 +558,7 @@ static void _nnls3(const double AtA[3][3],
 // returns FALSE under the same refusals `_fit_texture_scale` used: too few
 // rungs or too narrow a span to trust a fit, or nothing above the noise
 // floor anywhere in the box.
-static gboolean _fit_spectrum(const double *const restrict lambda,
+static gboolean _fit_spectrum(const double *const restrict sigma,
                               const double *const restrict energy,
                               const double *const restrict weight,
                               const int n,
@@ -567,8 +567,10 @@ static gboolean _fit_spectrum(const double *const restrict lambda,
 {
   // the smallest area that can be measured at all covers exactly one octave,
   // so this comparison is met on the nose there and is given a rounding's
-  // worth of slack rather than being left to turn on an ulp.
-  if(n < CT_MIN_BANDS || lambda[n - 1] < CT_MIN_SPAN * lambda[0] * (1.0 - 1e-9))
+  // worth of slack rather than being left to turn on an ulp. sigma and
+  // lambda differ by the fixed CT_SIGMA_TO_LAMBDA factor, so the ratio this
+  // compares is the same either way.
+  if(n < CT_MIN_BANDS || sigma[n - 1] < CT_MIN_SPAN * sigma[0] * (1.0 - 1e-9))
     return FALSE;
 
   double peak_e = 0.0;
@@ -577,11 +579,7 @@ static gboolean _fit_spectrum(const double *const restrict lambda,
   if(peak_e <= CT_FLAT_ENERGY) return FALSE;
 
   double s[CT_MAX_BANDS];  // s = sigma^2, the model's own scale variable
-  for(int i = 0; i < n; i++)
-  {
-    const double sigma_i = lambda[i] / (2.0 * M_PI);
-    s[i] = sigma_i * sigma_i;
-  }
+  for(int i = 0; i < n; i++) s[i] = sigma[i] * sigma[i];
 
   const gboolean fix_noise = noise_prior >= 0.0;
   const gboolean init_active[3] = { !fix_noise, TRUE, TRUE };
@@ -590,8 +588,8 @@ static gboolean _fit_spectrum(const double *const restrict lambda,
   // same range `_fit_texture_scale` scanned and for the same reason -- the
   // top of it puts the hump's peak just past the end of the ladder, as far
   // as the rising flank alone can honestly be pushed.
-  const double lo = (lambda[0] / (2.0 * M_PI)) * 0.5;
-  const double hi = lambda[n - 1] / (2.0 * M_PI);
+  const double lo = sigma[0] * 0.5;
+  const double hi = sigma[n - 1];
   const int tau_steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * log2(hi / lo)), 1);
 
   double best_residual = DBL_MAX;
@@ -693,15 +691,16 @@ static gboolean _fit_spectrum(const double *const restrict lambda,
   return TRUE;
 }
 
-// §2.5/research.md §5.6: S(lambda) = A*G(lambda;tau) + C*lambda^(beta-2) (real
-// scene detail) and N(lambda) = N*G(lambda;0) (noise), evaluated in exactly
-// the (s = sigma^2 = (lambda/2pi)^2) basis _fit_spectrum solved in -- reusing
-// _dog_shape as G is what keeps this consistent with the fit rather than
-// introducing a second, unrelated normalisation.
-static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double lambda,
+// §2.5/research.md §5.6: S(sigma) = A*G(sigma;tau) + C*sigma^(beta-2) (real
+// scene detail) and N(sigma) = N*G(sigma;0) (noise), evaluated in exactly the
+// (s = sigma^2) basis _fit_spectrum solved in -- reusing _dog_shape as G is
+// what keeps this consistent with the fit rather than introducing a second,
+// unrelated normalisation. implementation-plan-2.md §3.2: sigma in, not
+// lambda -- every caller now converts at its own call site (§3.3's table),
+// not here.
+static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double sigma,
                                 double *const S, double *const N)
 {
-  const double sigma = lambda / (2.0 * M_PI);
   const double s = sigma * sigma;
   *S = fit->texture * _dog_shape(s, fit->tau)
      + fit->self_similar * pow(s, (fit->beta - 2.0) * 0.5);
@@ -865,7 +864,7 @@ static double _ladder_rung_noise_floor(const double *const restrict blk2,
 // implied N across the ladder is the least contaminated one -- self-similar
 // or textured content only ever adds energy on top of the true noise floor,
 // never subtracts from it.
-static double _ladder_estimate_noise(const double *const restrict lambda,
+static double _ladder_estimate_noise(const double *const restrict sigma,
                                      const double *const restrict noise_floor,
                                      const int nrungs)
 {
@@ -873,8 +872,7 @@ static double _ladder_estimate_noise(const double *const restrict lambda,
   for(int r = 0; r < nrungs; r++)
   {
     if(noise_floor[r] < 0.0) continue;
-    const double sigma = lambda[r] / (2.0 * M_PI);
-    const double g0 = _dog_shape(sigma * sigma, 0.0);
+    const double g0 = _dog_shape(sigma[r] * sigma[r], 0.0);
     if(g0 <= 0.0) continue;
     const double n_est = noise_floor[r] / g0;
     if(best < 0.0 || n_est < best) best = n_est;
@@ -1733,34 +1731,30 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // by lerping between 1 (no effect) and the master gain along the shape
 // below, so dragging the master gain afterwards keeps behaving predictably.
 
-// §2.5/research.md §5.6: shape(lambda), peak-normalised where the table says
+// §2.5/research.md §5.6: shape(sigma), peak-normalised where the table says
 // so -- T_hat carries its own peak-1 normalisation (over the grid actually
 // evaluated, since that is the only "max(A*G)" available here); DETAIL's
 // S/(S+N) is used exactly as it falls out, per the table, with no further
 // rescaling.
 static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
-                          const double *const restrict lambda_grid, const int m,
+                          const double *const restrict sigma_grid, const int m,
                           double *const restrict shape)
 {
   double peak_tex = 0.0;
   if(mode == CT_TARGET_TEXTURE)
     for(int j = 0; j < m; j++)
-    {
-      const double sigma = lambda_grid[j] / (2.0 * M_PI);
-      peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma * sigma, fit->tau));
-    }
+      peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau));
 
   for(int j = 0; j < m; j++)
   {
     double S, N;
-    _ct_fit_eval(fit, lambda_grid[j], &S, &N);
+    _ct_fit_eval(fit, sigma_grid[j], &S, &N);
     const double wiener = S / fmax(S + N, DBL_MIN);
 
     if(mode == CT_TARGET_TEXTURE)
     {
-      const double sigma = lambda_grid[j] / (2.0 * M_PI);
       const double that = peak_tex > 0.0
-        ? (fit->texture * _dog_shape(sigma * sigma, fit->tau)) / peak_tex : 0.0;
+        ? (fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau)) / peak_tex : 0.0;
       shape[j] = that * wiener;
     }
     else
@@ -1983,9 +1977,14 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
   {
     const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1];
     const double lambda_peak = _band_peak_lambda(sigma_km1, sigma_d[k]);
+    // implementation-plan-2.md §3.4: _ct_fit_eval now takes fit's own sigma
+    // convention, not lambda_peak directly (which would silently reintroduce
+    // the old 2*pi mismatch) and not the band's own boundary sigma_d[k]
+    // (a different quantity -- the boundary, not the peak).
+    const double sigma_peak = lambda_peak / CT_SIGMA_TO_LAMBDA;
 
     double S, N;
-    _ct_fit_eval(fit, lambda_peak, &S, &N);
+    _ct_fit_eval(fit, sigma_peak, &S, &N);
     const double e_predicted = fmax(S + N, CT_CALIBRATION_FLOOR);
 
     calibration[k] = (float)CLAMP(e_module[k] / e_predicted, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
@@ -2021,7 +2020,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
-  double lambda[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
+  double lambda[CT_MAX_BANDS], sigma[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
   double s1_energy[CT_MAX_BANDS];    // §2.4: Sum(|b|)/n_eff over the box, for its own sparseness
   double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
   int nrungs = 0;
@@ -2087,6 +2086,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       const double n_indep = fmax(box_w * box_h / (lam * lam), 0.25);
 
       lambda[nrungs] = lam;
+      sigma[nrungs] = g->ladder_sigma[r];
       energies[nrungs] = s2 / n_eff;
       s1_energy[nrungs] = s1 / n_eff;
       weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
@@ -2105,9 +2105,9 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   // §2.4: fix N from the frame-wide block-minimum estimate rather than
   // fitting it freely -- "stabilises everything else" (research.md §5.5) and
   // stops a genuinely fine texture from getting explained away as noise.
-  const double noise_prior = _ladder_estimate_noise(lambda, noise_floor, nrungs);
+  const double noise_prior = _ladder_estimate_noise(sigma, noise_floor, nrungs);
 
-  if(!_fit_spectrum(lambda, energies, weights, nrungs, noise_prior, fit)) return FALSE;
+  if(!_fit_spectrum(sigma, energies, weights, nrungs, noise_prior, fit)) return FALSE;
 
   // §2.5/research.md §5.6: what the texture term actually delivers over the
   // measured rungs (fit->texture_peak) is negligible next to the box's own
@@ -2125,19 +2125,19 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     int peak_idx = 0;
     for(int r = 1; r < nrungs; r++) if(energies[r] > energies[peak_idx]) peak_idx = r;
     double S, N;
-    _ct_fit_eval(fit, lambda[peak_idx], &S, &N);
+    _ct_fit_eval(fit, sigma[peak_idx], &S, &N);
     if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
       dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
   }
 
   if(*mode == CT_TARGET_TEXTURE)
   {
-    const double target_lambda = 2.0 * M_PI * sqrt(fit->tau);
+    const double target_sigma = sqrt(fit->tau);
     int nearest = 0;
     double best_d = DBL_MAX;
     for(int r = 0; r < nrungs; r++)
     {
-      const double dist = fabs(log(lambda[r] / target_lambda));
+      const double dist = fabs(log(sigma[r] / target_sigma));
       if(dist < best_d) { best_d = dist; nearest = r; }
     }
     if(s1_energy[nearest] > 0.0)
@@ -2289,12 +2289,15 @@ void init_presets(dt_iop_module_so_t *self)
                                   .texture = 0.0, .tau = 0.0 };
     const double lambda_mid = sqrt(lo * hi);
     double s_ref, n_ref;
-    _ct_fit_eval(&synthetic, lambda_mid, &s_ref, &n_ref);
+    // implementation-plan-2.md §3.2: _ct_fit_eval takes sigma now; §5.2
+    // rebuilds this preset's grid as sigma-native, this is the minimal
+    // conversion to keep it correct in the meantime.
+    _ct_fit_eval(&synthetic, lambda_mid / CT_SIGMA_TO_LAMBDA, &s_ref, &n_ref);
     const double alpha = 0.4;
     for(int j = 0; j < CT_PROJECT_GRID; j++)
     {
       double s_hat, n_hat;
-      _ct_fit_eval(&synthetic, lambda_grid[j], &s_hat, &n_hat);
+      _ct_fit_eval(&synthetic, lambda_grid[j] / CT_SIGMA_TO_LAMBDA, &s_hat, &n_hat);
       const double wiener = s_hat / fmax(s_hat + n_hat, DBL_MIN);
       const double eq = pow(s_ref / fmax(s_hat, DBL_MIN), alpha) * wiener;
       target[j] = CLAMP(eq, 0.3, 2.5);
@@ -2401,13 +2404,20 @@ void color_picker_apply(dt_iop_module_t *self,
   // dense log-lambda grid spanning the node ladder itself, padded two
   // octaves either side so the projection sees each end band's full
   // response rather than a truncated one.
-  double lambda_grid[CT_PROJECT_GRID], shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
+  double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID];
+  double shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
   const double lo = 2.0 * M_PI * fmax((double)sigma[0], 1e-3) * 0.25;
   const double hi = 2.0 * M_PI * (double)sigma[CT_BANDS - 1] * 4.0;
   for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
     lambda_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+    // implementation-plan-2.md §3.2: _target_curve/_ct_fit_eval now take
+    // sigma, via CT_SIGMA_TO_LAMBDA -- this grid moves to being sigma-native
+    // in §4.3, once `sigma[]` above is itself frame-relative.
+    sigma_grid[j] = lambda_grid[j] / CT_SIGMA_TO_LAMBDA;
+  }
 
-  _target_curve(&fit, mode, lambda_grid, CT_PROJECT_GRID, shape);
+  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, shape);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
     target[j] = 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
@@ -2699,7 +2709,10 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     {
       const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
       double S, N;
-      _ct_fit_eval(&fit, lambda, &S, &N);
+      // implementation-plan-2.md §3.2: _ct_fit_eval takes sigma, via
+      // CT_SIGMA_TO_LAMBDA -- §4.2 adds a further frame-relative conversion
+      // once fit->tau itself becomes frame-relative.
+      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA, &S, &N);
       const float x = _spectrum_lambda_to_x(lambda, roi_long_edge) * width;
       const float y = height * (1.0f - _spectrum_energy_to_y(S + N, peak));
       if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
