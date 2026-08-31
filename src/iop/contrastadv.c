@@ -883,19 +883,18 @@ static double _measure_detail_scale(const _ct_region_t *const region)
   return _fit_texture_scale(sigmas, energies, weights, nbands);
 }
 
-// Compute smoothed luminance mask using edge-aware filters
+// Compute pixel-wise luminance (no boost) and add the noise bias, exactly as
+// the detail ladder below expects to see it.
 __DT_CLONE_TARGETS__
-static inline void compute_luminance_and_mask(const float *const restrict in,
-                                              float *const restrict luminance,
-                                              float *const restrict smoothed_luminance,
-                                              const dt_iop_roi_t *const roi_in,
-                                              const dt_iop_contrast_data_t *const d)
+static inline void compute_luminance(const float *const restrict in,
+                                     float *const restrict luminance,
+                                     const dt_iop_roi_t *const roi_in,
+                                     const dt_iop_contrast_data_t *const d)
 {
-  size_t width = (size_t)roi_in->width;
-  size_t height = (size_t)roi_in->height;
+  const size_t width = (size_t)roi_in->width;
+  const size_t height = (size_t)roi_in->height;
   const size_t npixels = width * height;
 
-  // First compute pixel-wise luminance (no boost) and add noise bias
   luminance_mask(in, luminance, width, height, DT_TONEEQ_NORM_2, 1.0f, 0.0f, 1.0f);
   const float noise_bias = d->noise_bias;
 
@@ -904,59 +903,97 @@ static inline void compute_luminance_and_mask(const float *const restrict in,
   {
     luminance[k] += noise_bias;
   }
-
-  // Then apply the smoothing filter on a copy
-  memcpy(smoothed_luminance, luminance, npixels * sizeof(float));
-
-  fast_eigf_surface_blur(smoothed_luminance, width, height,
-                         d->radius_local, d->feathering, d->iterations,
-                         DT_GF_BLENDING_LINEAR, 1.0f,
-                         0.0f, NORM_MIN, 4.0f);
 }
 
-// Extract logarithmic high pass detail in log space (EV):
-// How much brighter/darker is this pixel compared to the smooth version
+// the ladder: every band a direct, full-resolution eigf call against the
+// untouched luminance, accumulated as it goes so no band is ever stored
+// (research.md §2.4 option A; see phase0-hybrid-pyramid.md for why this is
+// the only decomposition that ships as the accurate default).
+//
+// correction ends up holding sum_k (gain_k - 1) * b_k, in EV, still missing
+// the master gain and the Wiener gate -- both are cheap scalar-per-pixel
+// operations applied once by the caller, rather than folded in here.
+//
+// display_band >= 0 makes this write that one band's b_k into correction
+// instead of accumulating, so the mask view (Phase 1.6) can reuse this same
+// pass rather than a second traversal.
 __DT_CLONE_TARGETS__
-static inline float extract_details(const float luminance_pixel,
-                                   const float luminance_smoothed,
-                                   const float noise_bias)
+static void _decompose_and_accumulate(const float *const restrict lum,
+                                      float *const restrict correction,
+                                      float *const restrict coarsest,
+                                      const size_t width, const size_t height,
+                                      const dt_iop_contrast_data_t *const d,
+                                      const int display_band)
 {
-  const float log_pixel = log2f(fmaxf(luminance_pixel, NORM_MIN));
-  const float log_smoothed = log2f(fmaxf(luminance_smoothed, NORM_MIN));
+  const size_t npixels = width * height;
 
-  const float noise_power = noise_bias * noise_bias;
-  const float combined_power = luminance_smoothed * luminance_smoothed;
-  const float weiner_gain = fmaxf(combined_power - noise_power, 0.0f) / fmaxf(combined_power, NORM_MIN);
-  return weiner_gain * fmaxf(fminf(log_pixel - log_smoothed, 5.0f), -5.0f);
+  memcpy(coarsest, lum, npixels * sizeof(float));
+  memset(correction, 0, npixels * sizeof(float));
+
+  float *const restrict log_lum = dt_alloc_align_float(npixels);
+  float *const restrict blur = dt_alloc_align_float(npixels);
+  if(!log_lum || !blur)
+  {
+    dt_free_align(log_lum);
+    dt_free_align(blur);
+    return;
+  }
+
+  DT_OMP_FOR()
+  for(size_t p = 0; p < npixels; p++)
+    log_lum[p] = log2f(fmaxf(lum[p], NORM_MIN));
+
+  for(int k = 0; k < d->nbands; k++)
+  {
+    memcpy(blur, lum, npixels * sizeof(float));
+    fast_eigf_surface_blur(blur, width, height, d->sigma[k], d->feathering, d->iterations,
+                           DT_GF_BLENDING_LINEAR, 1.0f,
+                           0.0f, NORM_MIN, 4.0f);
+
+    const float gain_minus_one = d->gain[k] - 1.0f;
+    const gboolean is_display = (display_band == k);
+
+    DT_OMP_FOR()
+    for(size_t p = 0; p < npixels; p++)
+    {
+      const float b_k = log_lum[p] - log2f(fmaxf(blur[p], NORM_MIN));
+      if(is_display) correction[p] = b_k;
+      else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+    }
+
+    if(k == d->nbands - 1) memcpy(coarsest, blur, npixels * sizeof(float));
+  }
+
+  dt_free_align(log_lum);
+  dt_free_align(blur);
 }
 
-// Apply local contrast enhancement
-// The detail (local contrast) is the log-space difference between pixel luminance
-// and smoothed luminance. Boosting this difference amplifies local details.
+// the Wiener gate, gauged off the coarsest band -- the closest thing this
+// module has to v1's single smoothed reference -- and applied once to the
+// whole accumulated correction rather than per band (research.md's noise
+// model is about the local signal level, which the coarsest band already
+// estimates about as well as any finer one would).
 __DT_CLONE_TARGETS__
-static inline void apply_local_contrast(const float *const restrict in,
-                                        const float *const restrict luminance_pixel,
-                                        const float *const restrict luminance_smoothed,
-                                        float *const restrict out,
-                                        const dt_iop_roi_t *const roi_in,
-                                        const dt_iop_contrast_data_t *const d)
+static inline float _wiener_gate(const float coarsest_pixel, const float noise_bias)
+{
+  const float noise_power = noise_bias * noise_bias;
+  const float combined_power = coarsest_pixel * coarsest_pixel;
+  return fmaxf(combined_power - noise_power, 0.0f) / fmaxf(combined_power, NORM_MIN);
+}
+
+// Apply the accumulated, gated correction in linear space.
+__DT_CLONE_TARGETS__
+static inline void apply_correction(const float *const restrict in,
+                                    const float *const restrict correction_ev,
+                                    float *const restrict out,
+                                    const dt_iop_roi_t *const roi_in)
 {
   const size_t npixels = (size_t)roi_in->width * roi_in->height;
-  const float gain_local = (d->gain_local_contrast - 1.0f);
-  const float noise_bias = d->noise_bias;
 
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
-    // High pass detail in log space (EV):
-    // How much brighter/darker is this pixel compared to the smooth version
-    const float local_ev = extract_details(luminance_pixel[k], luminance_smoothed[k], noise_bias);
-
-    // Correction as the scaled ev difference
-    const float correction_ev = gain_local * local_ev;
-
-    // Apply correction in linear space
-    const float multiplier = exp2f(correction_ev);;
+    const float multiplier = exp2f(correction_ev[k]);
     for_each_channel(c)
       out[4 * k + c] = in[4 * k + c] * multiplier;
     out[4 * k + 3] = in[4 * k + 3];
@@ -964,37 +1001,29 @@ static inline void apply_local_contrast(const float *const restrict in,
 }
 
 /*
- Display the detail mask (difference between pixel and smoothed luminance)
+ Display the correction mask -- what the module is doing to each pixel.
  Output is a grayscale image normalized to [0, 1] where:
- - 0.5 = no local detail (pixel matches neighborhood)
- - < 0.5 = pixel darker than neighborhood
- - > 0.5 = pixel brighter than neighborhood
+ - 0.5 = no correction applied
+ - < 0.5 = pixel darkened
+ - > 0.5 = pixel brightened
  */
 __DT_CLONE_TARGETS__
-static inline void display_local_mask(const float *const restrict luminance_pixel,
-                                      const float *const restrict luminance_smoothed,
-                                      float *const restrict out,
-                                      const dt_iop_roi_t *const roi_in,
-                                      const dt_iop_contrast_data_t *const d)
+static inline void display_correction_mask(const float *const restrict correction_ev,
+                                           float *const restrict out,
+                                           const dt_iop_roi_t *const roi_in)
 {
   const size_t npixels = (size_t)roi_in->width * roi_in->height;
-  const float noise_bias = d->noise_bias;
 
   DT_OMP_FOR()
   for(size_t k = 0; k < npixels; k++)
   {
-    const float local_ev = extract_details(luminance_pixel[k], luminance_smoothed[k], noise_bias);
+    const float y = correction_ev[k];
+    const float intensity = y / sqrtf(y * y + 1.0f) * 0.5f + 0.5f; // Smooth mapping to [0, 1]
 
-    // Detail in log space, mapped to [0, 1] for display
-    // Detail range roughly [-2, +2] EV mapped to [0, 1]
-    const float intensity = local_ev / sqrtf(local_ev * local_ev + 1.0f) * 0.5f + 0.5f; // Smooth mapping to [0, 1]
-
-    // Set all RGB channels to the same intensity (grayscale)
     for_each_channel(c)
     {
       out[4 * k + c] = intensity;
     }
-    // Full opacity
     out[4 * k + 3] = 1.0f;
   }
 }
@@ -1037,12 +1066,12 @@ static void _auto_detail_level(dt_iop_module_t *self,
   float level = 0.0f;
   if(wavelength > 0.0)
   {
-    // invert what modify_roi_in() does with the parameter: it builds a box of
-    // contrast_scale * max_size * roi->scale pixels, and detail_level is minus
-    // the log2 of contrast_scale. so asking for a window exactly one texture
-    // wavelength wide -- the shortest box average that removes that texture
-    // from the base layer completely, and so hands all of it to the high pass
-    // without also dragging in anything coarser -- gives the level below.
+    // invert what modify_roi_in() does with a node's placement: node D's
+    // window is 2^-D * max_size * roi->scale pixels wide, so asking for a
+    // window exactly one texture wavelength wide -- the shortest box average
+    // that removes that texture from the base layer completely, and so hands
+    // all of it to the high pass without also dragging in anything coarser --
+    // gives the D below, which the caller folds into scale_shift.
     //
     // the scale factor cancels the fact that this was measured on the preview:
     // what comes out is a fraction of the frame and is carried unchanged to
@@ -1087,18 +1116,20 @@ void process(dt_iop_module_t *self,
   const size_t height = roi_in->height;
   const size_t npixels = width * height;
 
-  float *restrict luminance_pixel = dt_alloc_align_float(npixels);
-  float *restrict luminance_smoothed_local = dt_alloc_align_float(npixels);
+  float *restrict luminance = dt_alloc_align_float(npixels);
+  float *restrict correction = dt_alloc_align_float(npixels);
+  float *restrict coarsest = dt_alloc_align_float(npixels);
 
-  if(!luminance_pixel || !luminance_smoothed_local)
+  if(!luminance || !correction || !coarsest)
   {
     dt_control_log(_("local contrast failed to allocate memory, check your RAM settings"));
-    dt_free_align(luminance_pixel);
-    dt_free_align(luminance_smoothed_local);
+    dt_free_align(luminance);
+    dt_free_align(correction);
+    dt_free_align(coarsest);
     return;
   }
 
-  compute_luminance_and_mask(in, luminance_pixel, luminance_smoothed_local, roi_in, d);
+  compute_luminance(in, luminance, roi_in, d);
 
   // An area measurement needs to see a whole, contiguous frame, so skip it
   // while the pipe hands us one tile at a time -- the request simply stays
@@ -1115,22 +1146,38 @@ void process(dt_iop_module_t *self,
     dt_iop_gui_leave_critical_section(self);
 
     if(claimed)
-      _auto_detail_level(self, g, luminance_pixel, roi_in, piece);
+      _auto_detail_level(self, g, luminance, roi_in, piece);
+  }
+
+  // display_band selection (which single band's b_k to show, rather than the
+  // accumulated correction) is Phase 1.6; for now the mask view always shows
+  // the whole correction.
+  _decompose_and_accumulate(luminance, correction, coarsest, width, height, d, -1);
+
+  // gate the accumulated correction once and fold in the master strength --
+  // gain_local_contrast is a pure multiplier on top of whatever the bands
+  // already summed to, so it belongs here rather than inside the ladder.
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npixels; k++)
+  {
+    const float gate = _wiener_gate(coarsest[k], d->noise_bias);
+    correction[k] *= gate * d->gain_local_contrast;
   }
 
   // Display output
   if(g && g->details_display != DT_LC_MASK_OFF && (piece->pipe->type & DT_DEV_PIXELPIPE_FULL))
   {
-    display_local_mask(luminance_pixel, luminance_smoothed_local, out, roi_in, d);
+    display_correction_mask(correction, out, roi_in);
     piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
   }
   else
   {
-    apply_local_contrast(in, luminance_pixel, luminance_smoothed_local, out, roi_in, d);
+    apply_correction(in, correction, out, roi_in);
   }
 
-  dt_free_align(luminance_pixel);
-  dt_free_align(luminance_smoothed_local);
+  dt_free_align(luminance);
+  dt_free_align(correction);
+  dt_free_align(coarsest);
 }
 
 void modify_roi_in(dt_iop_module_t *self,
@@ -1214,8 +1261,12 @@ static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *
   // below runs under the gui-update guard and so deliberately writes nothing
   // back, which is the whole point of that guard -- it normally runs the other
   // way around, syncing widgets to params that have already changed.
+  //
+  // this only positions the ladder (scale_shift); it does not yet reshape the
+  // bands around the measured size -- that reshaping is Phase 1.7.
   dt_iop_contrast_params_t *p = self->params;
-  p->detail_level = level;
+  const float d = CLAMP(level, CT_BAND_D0, CT_BAND_D0 + CT_BANDS - 1);
+  p->scale_shift = CLAMP(d - roundf(d), -0.5f, 0.5f);
 
   dt_dev_add_history_item(darktable.develop, self, TRUE);
 
@@ -1244,7 +1295,7 @@ void color_picker_apply(dt_iop_module_t *self,
   DT_GUARD_GUI_UPDATE();
 
   dt_iop_contrast_gui_data_t *g = self->gui_data;
-  if(!g || picker != g->detail_level) return;
+  if(!g || picker != g->scale_shift) return;
 
   dt_iop_gui_enter_critical_section(self);
   g->auto_state = CT_AUTO_REQUESTED;
@@ -1328,18 +1379,36 @@ void gui_init(dt_iop_module_t *self)
   // Filter settings section
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "filter settings")));
 
-  g->detail_level = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
-                                        dt_bauhaus_slider_from_params(self, "detail_level"));
-  dt_bauhaus_slider_set_soft_range(g->detail_level, 2.0, 10.0);
-  gtk_widget_set_tooltip_text(g->detail_level,
-     _("detail level adjusted by the local contrast.\n"
-       "higher = more contrast boost in finer details\n"
-       "lower = more contrast boost in coarser details"));
+  // one slider per band, labeled by the node's nominal size -- computed
+  // rather than nine near-identical translated strings, per
+  // implementation-plan.md §1.1. The full graph (node bars, drag-to-set,
+  // stripe shading for bands that don't survive the current roi scale) is
+  // Phase 1.4; this is the plain-slider stand-in until then.
+  for(int k = 0; k < CT_BANDS; k++)
+  {
+    char param[16];
+    snprintf(param, sizeof(param), "band[%d]", k);
+    g->band[k] = dt_bauhaus_slider_from_params(self, param);
+    dt_bauhaus_slider_set_soft_range(g->band[k], 0.0, 2.0);
+    dt_bauhaus_slider_set_digits(g->band[k], 2);
+    dt_bauhaus_slider_set_format(g->band[k], "%");
+    dt_bauhaus_slider_set_factor(g->band[k], 100.0);
+    dt_bauhaus_slider_set_offset(g->band[k], -100.0);
+
+    char label[64];
+    snprintf(label, sizeof(label), _("detail size ~ %.3g%%"), 100.0 * exp2(-(CT_BAND_D0 + k)));
+    dt_bauhaus_widget_set_label(g->band[k], NULL, label);
+  }
+
+  g->scale_shift = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
+                                       dt_bauhaus_slider_from_params(self, "scale_shift"));
+  gtk_widget_set_tooltip_text(g->scale_shift,
+     _("shifts every band's node together, finer or coarser.\n"
+       "half a step moves the whole ladder by half an octave."));
   dt_bauhaus_widget_set_quad_tooltip
-    (g->detail_level,
-     _("pick an area: measure how large the texture in it actually is, and set\n"
-       "the detail level so that texture -- and nothing coarser -- is what gets\n"
-       "boosted.\n"
+    (g->scale_shift,
+     _("pick an area: measure how large the texture in it actually is, and\n"
+       "shift the ladder so a node lands on that size.\n"
        "click to use the whole frame, then drag on the image to work from the\n"
        "subject that matters instead. a small box cannot report structure\n"
        "larger than itself, so pick over as much of the texture as you want\n"
@@ -1349,6 +1418,10 @@ void gui_init(dt_iop_module_t *self)
        "shadow comes back at the finest setting it is reading sensor noise;\n"
        "raise the noise bias below and pick again."));
 
+  g->decomposition = dt_bauhaus_combobox_from_params(self, "decomposition");
+  gtk_widget_set_tooltip_text(g->decomposition,
+     _("accurate: every band a direct, full-resolution pass. the default.\n"
+       "fast: not implemented yet -- currently behaves identically to accurate."));
 
   g->edge_protection = dt_bauhaus_slider_from_params(self, "edge_protection");
   dt_bauhaus_slider_set_soft_range(g->edge_protection, -2.0, 2.0);
