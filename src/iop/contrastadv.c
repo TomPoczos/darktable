@@ -939,17 +939,44 @@ static gboolean _build_ladder(const float *const restrict lum,
   size_t cw = width, ch = height;
   double step = 1.0;
   int nrungs = 0;
+  const float minv = -1.0e6f, maxv = 1.0e6f;
+
+  // §2: bring octave 0's base up to absolute CT_SIGMA_BASE once, so every
+  // octave starts from the same absolute sigma in its own pixel units.
+  // Without this, rung[0] of octave 0 is the raw (unblurred) base while
+  // every later octave's base already carries sigma = CT_SIGMA_BASE from the
+  // previous octave's own rung[CT_SCALES_PER_OCTAVE] (subsampled by two, so
+  // still CT_SIGMA_BASE in the new grid's own units) -- octave 0 alone would
+  // then measure every band a sqrt(1 + (CT_SIGMA_BASE/sigma_s)^2) too wide.
+  // implementation-plan-2.md §2.
+  {
+    dt_gaussian_t *const gs =
+      dt_gaussian_init((int)width, (int)height, 1, &maxv, &minv, CT_SIGMA_BASE,
+                       DT_IOP_GAUSSIAN_ZERO);
+    if(!gs) ok = FALSE;
+    else
+    {
+      dt_gaussian_blur(gs, level, next);
+      dt_gaussian_free(gs);
+      memcpy(level, next, npixels * sizeof(float));
+    }
+  }
 
   for(int octave = 0;
       ok && octave < CT_MAX_OCTAVES && nrungs + CT_SCALES_PER_OCTAVE <= CT_MAX_BANDS;
       octave++)
   {
-    const float minv = -1.0e6f, maxv = 1.0e6f;
-    for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++)
+    // rung[0] **is** the base (already at absolute CT_SIGMA_BASE); every
+    // later rung is an incremental blur from it, not a fresh blur of the
+    // base from sigma 0 -- that incremental step is what keeps every
+    // octave's rungs at the same absolute sigma the labels claim.
+    memcpy(rung[0], level, cw * ch * sizeof(float));
+    for(int s = 1; s <= CT_SCALES_PER_OCTAVE; s++)
     {
-      const float sigma = CT_SIGMA_BASE * exp2f((float)s / CT_SCALES_PER_OCTAVE);
+      const float target = CT_SIGMA_BASE * exp2f((float)s / CT_SCALES_PER_OCTAVE);
+      const float inc = sqrtf(target * target - CT_SIGMA_BASE * CT_SIGMA_BASE);
       dt_gaussian_t *const g =
-        dt_gaussian_init((int)cw, (int)ch, 1, &maxv, &minv, sigma, DT_IOP_GAUSSIAN_ZERO);
+        dt_gaussian_init((int)cw, (int)ch, 1, &maxv, &minv, inc, DT_IOP_GAUSSIAN_ZERO);
       if(!g) { ok = FALSE; break; }
       dt_gaussian_blur(g, level, rung[s]);
       dt_gaussian_free(g);
