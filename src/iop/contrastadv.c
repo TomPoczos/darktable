@@ -80,6 +80,14 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_BANDS 9          // detail levels 2..10, one node per octave
 #define CT_BAND_D0 2.0f     // detail level of the coarsest node
 
+// the graph: nodes run coarse (left) to fine (right), one per octave, so the
+// x axis is simply k/CT_BANDS; the y axis is gain, soft-ranged to
+// CT_GRAPH_Y_MAX to match the sliders' own soft range (gui_init) even though
+// the hard range (band[]'s $MAX) reaches higher -- a node dragged past the
+// top just rides the edge, exactly like the slider it drives.
+#define CT_GRAPH_Y_MAX 2.0f
+#define CT_GRAPH_RES 64      // curve points sampled between nodes, per implementation-plan.md §1.4
+
 typedef enum dt_iop_contrast_decomposition_t
 {
   CT_DECOMPOSITION_ACCURATE = 0, // $DESCRIPTION: "accurate" -- every band direct, no pyramid
@@ -153,6 +161,24 @@ typedef struct dt_iop_contrast_gui_data_t
   GtkWidget *edge_protection;
   GtkWidget *filter_iterations;
   GtkWidget *noise_bias;
+
+  // the graph (implementation-plan.md §1.4): a drawing area showing the nine
+  // nodes as a curve, and a GtkStack toggled by middle-click on the graph
+  // between that graph and the plain slider list.
+  GtkDrawingArea *area;
+  GtkStack *stack;
+  dt_draw_curve_t *curve;
+
+  // which bands survive at the current pipe scale, published from process()
+  // under dt_iop_gui_enter/leave_critical_section (§1.5). nbands defaults to
+  // CT_BANDS -- everything resolvable -- until the first preview pass lands.
+  int nbands;
+  float sigma[CT_BANDS];  // matching pixel sigma, index 0 = finest surviving
+
+  // graph interaction state
+  gboolean dragging;
+  int drag_band;   // node being dragged, -1 if none
+  int hover_band;  // node nearest the pointer, -1 if none or not hovering
 
   // cross-thread hand-off for the detail level area picker. every read and
   // write of these three goes through dt_iop_gui_enter/leave_critical_section.
@@ -1352,6 +1378,318 @@ static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self
   dt_iop_refresh_center(self);
 }
 
+// ---------------------------------------------------------------------------
+// the graph (implementation-plan.md §1.4)
+// ---------------------------------------------------------------------------
+//
+// nodes run coarse (left) to fine (right), evenly spaced -- one per octave,
+// which is exactly what CT_BANDS is -- so a node's x fraction is simply
+// (k + 0.5) / CT_BANDS and needs no lookup. y is gain, soft-ranged to
+// CT_GRAPH_Y_MAX to match the sliders (gui_init); dragging above the visible
+// top still reaches the sliders' hard max, same as overdriving a slider past
+// its soft range.
+//
+// every handler below re-derives the graph's pixel geometry from the
+// widget's current allocation rather than caching it, which is what keeps a
+// resize from desyncing the nodes (§1.4 acceptance).
+
+static void _graph_curve_from_params(dt_draw_curve_t *curve,
+                                     const dt_iop_contrast_params_t *const p)
+{
+  for(int k = 0; k < CT_BANDS; k++)
+    dt_draw_curve_set_point(curve, k, (k + 0.5f) / (float)CT_BANDS,
+                            CLAMP(p->band[k] / CT_GRAPH_Y_MAX, 0.0f, 1.0f));
+}
+
+static void _graph_geometry(GtkWidget *widget, int *inset, int *width, int *height)
+{
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+  *inset = DT_PIXEL_APPLY_DPI(4);
+  *width = allocation.width - 2 * (*inset);
+  *height = allocation.height - 2 * (*inset) - DT_RESIZE_HANDLE_SIZE;
+}
+
+static int _graph_band_at(const int width, const double x)
+{
+  const int k = (int)floor(x / (double)MAX(width, 1) * CT_BANDS);
+  return CLAMP(k, 0, CT_BANDS - 1);
+}
+
+// inverse of the node-drawing map in _area_draw: pixel y (0 at the graph's
+// top) to a gain. left unclamped to CT_GRAPH_Y_MAX on purpose -- dragging
+// above the visible top keeps climbing, all the way to the slider's own hard
+// range, exactly like overdriving a slider past its soft range.
+static float _graph_gain_at(const int height, const double y)
+{
+  const float yfrac = 1.0f - (float)(y / (double)MAX(height, 1));
+  return CLAMP(yfrac * CT_GRAPH_Y_MAX, 0.0f, 5.0f);
+}
+
+static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const float gain)
+{
+  if(k < 0 || k >= CT_BANDS || !g->band[k]) return;
+  dt_bauhaus_slider_set_val(g->band[k], gain);
+}
+
+static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  const dt_iop_contrast_params_t *const p = self->params;
+
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  if(width <= 0 || height <= 0) return FALSE;
+
+  gtk_widget_set_tooltip_text
+    (widget,
+     g->nbands < CT_BANDS
+     ? _("drag a node to set its band's gain; double-click to reset it;\n"
+         "middle-click for the plain slider list.\n"
+         "the shaded bands on the right are too fine to resolve at the\n"
+         "current zoom level and have no effect until you zoom in.")
+     : _("drag a node to set its band's gain; double-click to reset it;\n"
+         "middle-click for the plain slider list."));
+
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+
+  cairo_surface_t *cst =
+    dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, allocation.width, allocation.height);
+  cairo_t *cr = cairo_create(cst);
+
+  GtkStyleContext *context = gtk_widget_get_style_context(widget);
+  gtk_render_background(context, cr, 0, 0, allocation.width, allocation.height);
+  cairo_translate(cr, inset, inset);
+
+  // 1. background grid: one line per octave, i.e. per node
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(0.5));
+  set_color(cr, darktable.bauhaus->graph_border);
+  dt_draw_grid(cr, CT_BANDS, 0, 0, width, height);
+
+  // 2. unresolvable-band shading -- bands beyond g->nbands (§1.5) don't
+  // survive the current pipe scale and have no effect
+  if(g->nbands < CT_BANDS)
+  {
+    const float x0 = (float)g->nbands / (float)CT_BANDS * width;
+    cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                             darktable.bauhaus->graph_border.green,
+                             darktable.bauhaus->graph_border.blue, 0.4);
+    cairo_rectangle(cr, x0, 0, width - x0, height);
+    cairo_fill(cr);
+  }
+
+  // 3. baseline at gain 1.0
+  const float baseline_y = height * (1.0f - 1.0f / CT_GRAPH_Y_MAX);
+  set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  dt_draw_line(cr, 0, baseline_y, width, baseline_y);
+  cairo_stroke(cr);
+
+  // 5. the curve: monotone cubic through the nine nodes (research.md's
+  // Phase 2 spectrum overlay is not built yet, so there is no step 4 here)
+  _graph_curve_from_params(g->curve, p);
+  float xs[CT_GRAPH_RES], ys[CT_GRAPH_RES];
+  dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, xs, ys);
+  set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.0));
+  cairo_move_to(cr, 0, height * (1.0f - ys[0]));
+  for(int i = 1; i < CT_GRAPH_RES; i++)
+    cairo_line_to(cr, i * width / (float)(CT_GRAPH_RES - 1), height * (1.0f - ys[i]));
+  cairo_stroke(cr);
+
+  // 6. node bars + bullets
+  for(int k = 0; k < CT_BANDS; k++)
+  {
+    const float xn = (k + 0.5f) / CT_BANDS * width;
+    const float yfrac = CLAMP(p->band[k] / CT_GRAPH_Y_MAX, 0.0f, 1.0f);
+    const float yn = height * (1.0f - yfrac);
+
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
+    set_color(cr, darktable.bauhaus->color_fill);
+    dt_draw_line(cr, xn, baseline_y, xn, yn);
+    cairo_stroke(cr);
+
+    const gboolean active = (k == g->hover_band || k == g->drag_band);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+    cairo_arc(cr, xn, yn, DT_PIXEL_APPLY_DPI(active ? 5.0 : 3.5), 0.0, 2.0 * M_PI);
+    set_color(cr, darktable.bauhaus->graph_fg);
+    cairo_stroke_preserve(cr);
+    if(k == g->drag_band)
+      set_color(cr, darktable.bauhaus->graph_fg);
+    else
+      set_color(cr, darktable.bauhaus->graph_bg);
+    cairo_fill(cr);
+  }
+
+  // axis labels
+  PangoFontDescription *desc = dt_gui_get_font();
+  pango_font_description_set_absolute_size(desc, 0.09 * height * PANGO_SCALE);
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_font_description(layout, desc);
+  set_color(cr, darktable.bauhaus->graph_fg);
+
+  pango_layout_set_text(layout, _("coarse"), -1);
+  cairo_move_to(cr, DT_PIXEL_APPLY_DPI(2), DT_PIXEL_APPLY_DPI(2));
+  pango_cairo_show_layout(cr, layout);
+
+  PangoRectangle ink;
+  pango_layout_set_text(layout, _("fine"), -1);
+  pango_layout_get_pixel_extents(layout, &ink, NULL);
+  cairo_move_to(cr, width - ink.width - DT_PIXEL_APPLY_DPI(2), DT_PIXEL_APPLY_DPI(2));
+  pango_cairo_show_layout(cr, layout);
+
+  g_object_unref(layout);
+  pango_font_description_free(desc);
+
+  cairo_destroy(cr);
+  cairo_set_source_surface(crf, cst, 0, 0);
+  cairo_paint(crf);
+  cairo_surface_destroy(cst);
+  return FALSE;
+}
+
+static void _area_motion(GtkEventControllerMotion *controller,
+                         gdouble x, gdouble y,
+                         dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  GtkWidget *widget = dt_gui_get_widget(controller);
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  const double gx = x - inset, gy = y - inset;
+
+  g->hover_band = (gx >= 0 && gx <= width) ? _graph_band_at(width, gx) : -1;
+
+  if(g->dragging && g->drag_band >= 0)
+    _area_set_band(g, g->drag_band, _graph_gain_at(height, gy));
+
+  gtk_widget_queue_draw(widget);
+}
+
+static void _area_leave(GtkEventControllerMotion *controller, dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  g->hover_band = -1;
+  gtk_widget_queue_draw(dt_gui_get_widget(controller));
+}
+
+static void _area_button_press(GtkGestureSingle *gesture,
+                               gint n_press,
+                               gdouble x, gdouble y,
+                               dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  GtkWidget *widget = dt_gui_get_widget(gesture);
+  const guint button = gtk_gesture_single_get_current_button(gesture);
+
+  if(button == GDK_BUTTON_MIDDLE)
+  {
+    const gchar *current = gtk_stack_get_visible_child_name(g->stack);
+    gtk_stack_set_visible_child_name(g->stack,
+                                     g_strcmp0(current, "graph") == 0 ? "sliders" : "graph");
+    return;
+  }
+
+  if(button != GDK_BUTTON_PRIMARY) return;
+
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  const int k = _graph_band_at(width, x - inset);
+
+  if(n_press >= 2)
+  {
+    const dt_iop_contrast_params_t *const def = self->default_params;
+    _area_set_band(g, k, def->band[k]);
+    return;
+  }
+
+  g->dragging = TRUE;
+  g->drag_band = k;
+  _area_set_band(g, k, _graph_gain_at(height, y - inset));
+  gtk_widget_queue_draw(widget);
+}
+
+static void _area_button_release(GtkGestureSingle *gesture,
+                                 gint n_press,
+                                 gdouble x, gdouble y,
+                                 dt_iop_module_t *self)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  g->dragging = FALSE;
+  g->drag_band = -1;
+  gtk_widget_queue_draw(dt_gui_get_widget(gesture));
+}
+
+static void _area_scrolled(GtkEventControllerScroll *controller,
+                           gdouble dx, gdouble dy,
+                           dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(g->hover_band < 0 || dy == 0.0) return;
+
+  const dt_iop_contrast_params_t *const p = self->params;
+  const float step = dt_modifier_eq(controller, GDK_CONTROL_MASK) ? 0.01f : 0.05f;
+  _area_set_band(g, g->hover_band, p->band[g->hover_band] - (float)dy * step);
+}
+
+enum
+{
+  DT_ACTION_EFFECT_CT_RESET = DT_ACTION_EFFECT_RESET,
+};
+
+static const dt_action_element_def_t _action_elements_ct[]
+  = { { N_("band 1 (coarsest)"), dt_action_effect_value },
+      { N_("band 2"), dt_action_effect_value },
+      { N_("band 3"), dt_action_effect_value },
+      { N_("band 4"), dt_action_effect_value },
+      { N_("band 5"), dt_action_effect_value },
+      { N_("band 6"), dt_action_effect_value },
+      { N_("band 7"), dt_action_effect_value },
+      { N_("band 8"), dt_action_effect_value },
+      { N_("band 9 (finest)"), dt_action_effect_value },
+      { } };
+
+static float _action_process_ct(gpointer target,
+                                const dt_action_element_t element,
+                                const dt_action_effect_t effect,
+                                float move_size)
+{
+  if(element < 0 || element >= CT_BANDS) return DT_ACTION_NOT_VALID;
+
+  dt_iop_module_t *self = g_object_get_data(G_OBJECT(target), "iop-instance");
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  dt_iop_contrast_params_t *p = self->params;
+  const dt_iop_contrast_params_t *const d = self->default_params;
+
+  if(DT_PERFORM_ACTION(move_size))
+  {
+    switch(effect)
+    {
+      case DT_ACTION_EFFECT_CT_RESET:
+        _area_set_band(g, element, d->band[element]);
+        break;
+      case DT_ACTION_EFFECT_DOWN:
+        move_size *= -1;
+      case DT_ACTION_EFFECT_UP:
+        _area_set_band(g, element, p->band[element] + move_size / 100.0f);
+        break;
+      default:
+        break;
+    }
+    gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  }
+
+  return p->band[element] + DT_VALUE_PATTERN_PLUS_MINUS;
+}
+
+static const dt_action_def_t _action_def_ct
+  = { N_("detail ladder"),
+      _action_process_ct,
+      _action_elements_ct,
+      NULL };
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = IOP_GUI_ALLOC(contrast);
@@ -1379,16 +1717,40 @@ void gui_init(dt_iop_module_t *self)
   // Filter settings section
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "filter settings")));
 
+  // the graph (§1.4): nine nodes, one per octave, drawn as a curve and
+  // draggable directly; a GtkStack toggled by middle-click on the graph
+  // swaps it for the plain slider list, which is what the shortcut system
+  // and anyone chasing an exact value still reach for.
+  g->nbands = CT_BANDS;  // until the first preview pass publishes the real count (§1.5)
+  g->hover_band = -1;
+  g->drag_band = -1;
+  g->dragging = FALSE;
+  g->curve = dt_draw_curve_new(0.0, 1.0, MONOTONE_HERMITE);
+  for(int k = 0; k < CT_BANDS; k++)
+    dt_draw_curve_add_point(g->curve, (k + 0.5f) / (float)CT_BANDS,
+                            CLAMP(((dt_iop_contrast_params_t *)self->default_params)->band[k]
+                                  / CT_GRAPH_Y_MAX, 0.0f, 1.0f));
+
+  g->area = GTK_DRAWING_AREA(dt_ui_resize_wrap
+                             (NULL, 0, "plugins/darkroom/contrastadv/graphheight"));
+  g_object_set_data(G_OBJECT(g->area), "iop-instance", self);
+  dt_action_define_iop(self, NULL, N_("graph"), GTK_WIDGET(g->area), &_action_def_ct);
+  g_signal_connect(G_OBJECT(g->area), "draw", G_CALLBACK(_area_draw), self);
+  dt_gui_connect_click(g->area, _area_button_press, _area_button_release, self);
+  dt_gui_connect_motion(g->area, _area_motion, _area_motion, _area_leave, self);
+  dt_gui_connect_scroll(g->area, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
+                               | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE, _area_scrolled, self);
+
   // one slider per band, labeled by the node's nominal size -- computed
   // rather than nine near-identical translated strings, per
-  // implementation-plan.md §1.1. The full graph (node bars, drag-to-set,
-  // stripe shading for bands that don't survive the current roi scale) is
-  // Phase 1.4; this is the plain-slider stand-in until then.
+  // implementation-plan.md §1.1.
+  GtkWidget *sliders_box = dt_gui_vbox();
+  dt_iop_module_t *section = DT_IOP_SECTION_FOR_PARAMS(self, NC_("section", "bands"), sliders_box);
   for(int k = 0; k < CT_BANDS; k++)
   {
     char param[16];
     snprintf(param, sizeof(param), "band[%d]", k);
-    g->band[k] = dt_bauhaus_slider_from_params(self, param);
+    g->band[k] = dt_bauhaus_slider_from_params(section, param);
     dt_bauhaus_slider_set_soft_range(g->band[k], 0.0, 2.0);
     dt_bauhaus_slider_set_digits(g->band[k], 2);
     dt_bauhaus_slider_set_format(g->band[k], "%");
@@ -1399,6 +1761,14 @@ void gui_init(dt_iop_module_t *self)
     snprintf(label, sizeof(label), _("detail size ~ %.3g%%"), 100.0 * exp2(-(CT_BAND_D0 + k)));
     dt_bauhaus_widget_set_label(g->band[k], NULL, label);
   }
+
+  g->stack = GTK_STACK(gtk_stack_new());
+  gtk_stack_set_homogeneous(g->stack, FALSE);
+  gtk_stack_add_named(g->stack, GTK_WIDGET(g->area), "graph");
+  gtk_stack_add_named(g->stack, sliders_box, "sliders");
+  gtk_stack_set_visible_child_name(g->stack, "graph");
+  dt_action_define_iop(self, NULL, N_("sliders"), GTK_WIDGET(g->stack), NULL);
+  dt_gui_box_add(self->widget, g->stack);
 
   g->scale_shift = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
                                        dt_bauhaus_slider_from_params(self, "scale_shift"));
@@ -1443,6 +1813,12 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_step(g->noise_bias, 0.0001);
   gtk_widget_set_tooltip_text(g->noise_bias, _("add bias to reduce shadow noise amplification.\n"
                                                "only affects dark parts of the image."));
+}
+
+void gui_cleanup(dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  dt_draw_curve_destroy(g->curve);
 }
 
 // clang-format off
