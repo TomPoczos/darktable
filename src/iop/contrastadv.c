@@ -3316,9 +3316,27 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
 
   if(!have_frame && !have_pick) return;
 
+  const _ct_fit_t fit = { .noise = fit_noise, .self_similar = fit_self_similar,
+                          .texture = fit_texture, .tau = fit_tau, .beta = fit_beta };
+
   double peak = 0.0;
   for(int r = 0; r < frame_nrungs; r++) peak = fmax(peak, frame_energy[r]);
   for(int r = 0; r < pick_nrungs; r++) peak = fmax(peak, pick_energy[r]);
+  // implementation-plan-4.md §3.2: now that 3.1 evaluates the model in the
+  // right variable, it can genuinely sit above both measured polylines --
+  // sample it over the same range it is drawn across so peak reflects the
+  // model too, rather than clipping it flat against the top of the plot.
+  if(have_pick)
+  {
+    const double lo = pick_lambda[0], hi = pick_lambda[pick_nrungs - 1];
+    for(int j = 0; j <= CT_GRAPH_RES; j++)
+    {
+      const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
+      double S, N;
+      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA / fmax(roi_long_edge, 1.0), &S, &N);
+      peak = fmax(peak, S + N);
+    }
+  }
   if(peak <= 0.0) return;
 
   cairo_save(cr);
@@ -3344,8 +3362,6 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     // the fitted S(lambda) + N(lambda) model, sampled densely across the
     // picked box's own measured range, dashed to read as "model" rather
     // than "measurement" next to the polyline above.
-    const _ct_fit_t fit = { .noise = fit_noise, .self_similar = fit_self_similar,
-                            .texture = fit_texture, .tau = fit_tau, .beta = fit_beta };
     const double dashes[2] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(3.0) };
     cairo_set_dash(cr, dashes, 2, 0.0);
     gboolean started = FALSE;
