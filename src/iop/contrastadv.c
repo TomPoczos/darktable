@@ -2416,6 +2416,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
   int nrungs = 0;
   double ladder_lambda0 = 0.0;       // §6.1: finest rung's own wavelength, set below
+  double window_lambda_max = 0.0;    // §7: the window's own achievable span, set below
 
   dt_iop_gui_enter_critical_section(self);
 
@@ -2444,6 +2445,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     const double box_w = (double)(bx1 - bx0) * CT_BLOCK;
     const double box_h = (double)(by1 - by0) * CT_BLOCK;
     const double lambda_max = fmin(box_w, box_h);
+    window_lambda_max = lambda_max;
     // §6.1: the ladder's own finest rung, independent of the window above --
     // needed even when the box is too small to keep a single rung, to quote
     // the smallest box that would have worked.
@@ -2570,6 +2572,34 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     if(target_sigma >= sigma[nrungs - 1] / M_SQRT2)
       dt_control_log(_("the measured size sits at the edge of what this box can see -- "
                         "it may be larger than reported"));
+
+    // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure --
+    // the box is too small to *contain* the feature, so the fit can't place
+    // any peak inside what it measured and instead collapses tau toward the
+    // ladder's finest rung, railing beta high to explain the rest. Unlike
+    // §6.2 above this produces no complaint on its own: sqrt(fit->tau) reads
+    // as a small, confident number instead of an edge value.
+    //
+    // A plain half-octave mirror of §6.2's own margin (target_sigma <=
+    // sigma[0]*M_SQRT2) was measured first, on dig_window_sweep.c's known-
+    // truth cases (findings.md): it catches the W=100 row of the "bump at
+    // 45.7px" case (ratio to sigma[0] = 1.41) but misses W=150 (ratio 1.68),
+    // which also needs to warn. fit->texture_peak was measured as the other
+    // candidate and rejected -- on these same cases its ratio to peak_e
+    // (0.04-0.07 for the collapsed W=100/150 rows) sits in the same range as
+    // a pure power law with no bump at all fit through an equally small
+    // window (0.03-0.04), so no threshold on it separates a real collapsed
+    // feature from ordinary small-window noise; position does. A full-octave
+    // margin catches both W=100 and W=150 (ratios 1.41 and 1.68) while
+    // staying well clear of the legitimate fine-texture pick (sigma_t =
+    // 3.4px, ratio 2.4-2.8 across the same window sizes) -- see findings.md
+    // for the full sweep.
+    if(target_sigma <= sigma[0] * 2.0)
+    {
+      const double min_side = 2.0 * window_lambda_max;
+      dt_control_log(_("the box is too small to see how big this is -- "
+                        "try at least %.0f x %.0f px"), min_side, min_side);
+    }
 
     int nearest = 0;
     double best_d = DBL_MAX;
