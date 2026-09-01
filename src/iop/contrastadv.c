@@ -120,6 +120,29 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_MAX_OCTAVES 12
 #define CT_MAX_BANDS (CT_MAX_OCTAVES * CT_SCALES_PER_OCTAVE)
 
+// implementation-plan-3.md §1.1: dt_gaussian_blur is Deriche's second-order
+// recursive smoother with alpha = 1.695/sigma (src/common/gaussian.c,
+// _compute_gauss_params). The operator it approximates,
+// k*(alpha|x| + 1)*exp(-alpha|x|), has variance 4/alpha^2 -- so its standard
+// deviation is 2/alpha = 1.1799*sigma, not sigma: 1.695 is Deriche's constant
+// for the best *shape* match to a Gaussian, which is not the same criterion
+// as matching its second moment, and gaussian.c does not say which one it
+// wanted. Measured on the shipped recursion itself (delta impulse through
+// exactly its forward/backward passes, picker-regression/harness_v2/
+// dig_gaussian_sigma.py): 1.1799 for sigma >= 1.5, 1.1763 at sigma = 1.2,
+// 1.169 at 0.92 -- uniform to 0.4% over every sigma this ladder uses, with DC
+// gain exactly 1 and mean exactly 0.
+//
+// The ladder's rung *ratios* are unaffected (the factor is constant, and
+// §2's incremental construction and its decimation step both carry it through
+// unchanged); only the absolute label is, by 0.236 octave, always toward
+// fine. Correct the label rather than pre-dividing the requested sigma: the
+// factor is not constant below sigma ~= 0.8, so pre-dividing would need a
+// per-sigma inversion and would still land the finest rung on the part of the
+// curve where it is least uniform. Not applied to sigmas that have no
+// dt_gaussian_blur behind them -- see _preset_nominal_sigma.
+#define CT_GAUSSIAN_SIGMA_FACTOR 1.1799
+
 // implementation-plan-2.md §3.1: peak wavelength of the DoG between sigma and
 // 2^(1/CT_SCALES_PER_OCTAVE)*sigma -- lambda = pi*sqrt(2*(k2-1)/ln k2) * sigma,
 // k2 = 2^(2/CT_SCALES_PER_OCTAVE) -- _band_peak_lambda's formula specialised
