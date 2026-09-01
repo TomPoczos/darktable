@@ -457,6 +457,16 @@ int legacy_params(dt_iop_module_t *self,
 // exactly what CT_FLAT_ENERGY above is supposed to catch first) still rails
 // against the top, which is a property of that content having no real
 // texture to fit, not of the range being too narrow for it.
+// implementation-plan-3.md §8.1: re-checked with §2.1's refinement pass in
+// place, on the twelve Phase 9.2 whole-crop picks (picker-regression/
+// findings.md's Phase 2 section table). Real-texture crops land 2.10-3.40,
+// margin intact on both bounds, shifting <=0.08 from the coarse-grid values
+// above -- inside the coarse grid's own 0.2167 step, i.e. the refinement
+// resolving quantisation rather than moving the cluster. The two genuinely
+// flat/ambiguous crops (an out-of-focus background, a near-uniform sky)
+// still peg at exactly 4.0 under refinement too, exactly as predicted above:
+// beta is undetermined on content with no real texture, regardless of grid
+// resolution. [1.4, 4.0] still brackets real content, not pegs it.
 #define CT_FIT_BETA_MIN 1.4
 #define CT_FIT_BETA_MAX 4.0
 #define CT_FIT_BETA_STEPS 12  // 13 values, CT_FIT_BETA_MIN .. CT_FIT_BETA_MAX
