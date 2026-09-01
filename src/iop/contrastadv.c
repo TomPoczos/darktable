@@ -1084,7 +1084,12 @@ static gboolean _build_ladder(const float *const restrict lum,
       // DoG's actual peak sits at CT_SIGMA_TO_LAMBDA * sigma_lower (the exact
       // formula, not "within a percent"), which is 1.41x finer than the old
       // geometric-mean label claimed.
-      const double sigma_s = CT_SIGMA_BASE * exp2((double)s / CT_SCALES_PER_OCTAVE);
+      // implementation-plan-3.md §1.2: label the rung with the sigma the blur
+      // actually realised, not the one it was asked for -- the requested
+      // sigmas above stay as they are, and the factor cancels out of
+      // _dog_shape's k2 = 2^(2/3) rung ratio, so only this label moves.
+      const double sigma_s = CT_SIGMA_BASE * CT_GAUSSIAN_SIGMA_FACTOR
+                             * exp2((double)s / CT_SCALES_PER_OCTAVE);
       ladder->sigma[nrungs] = sigma_s * step;
       ladder->lambda[nrungs] = ladder->sigma[nrungs] * CT_SIGMA_TO_LAMBDA;
       ladder->step[nrungs] = step;
