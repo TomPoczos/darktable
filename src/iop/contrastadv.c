@@ -290,6 +290,13 @@ typedef struct dt_iop_contrast_gui_data_t
   double spectrum_lambda[CT_MAX_BANDS];
   double spectrum_energy[CT_MAX_BANDS];
   double spectrum_noise, spectrum_self_similar, spectrum_texture, spectrum_tau, spectrum_beta;
+
+  // a pick that landed while g->pd was stale (DT_SIGNAL_CONTROL_PICKERDATA_READY
+  // is dispatched async -- see color_picker_apply -- so the GUI thread can
+  // observe g->pd a preview pass behind the pipe it just raced). Retried by
+  // _preview_pipe_finished_retry_pick once a fresh pass actually lands,
+  // rather than silently dropped.
+  gboolean pick_pending;
 } dt_iop_contrast_gui_data_t;
 
 
@@ -2812,26 +2819,23 @@ void init_presets(dt_iop_module_so_t *self)
 }
 
 // §2.2: synchronous now that the ladder is frame-wide and pre-published
-// (§2.1/§2.2 above) -- no more arming a pick and waiting for a preview pass
-// to claim and measure it (research.md §5.11). the box maps straight from
-// the color picker's sample to the ladder's own roi, the SAT query is a
-// handful of lookups, and the fit is a grid search over ~80 points: all fast
-// enough to run inline on the GUI thread instead of round-tripping through
-// another preview pass.
-void color_picker_apply(dt_iop_module_t *self,
-                        GtkWidget *picker,
-                        dt_dev_pixelpipe_t *pipe)
+// (§2.1/§2.2 above) -- no more *deliberately* arming a pick and waiting for
+// a preview pass to claim and measure it (research.md §5.11). the box maps
+// straight from the color picker's sample to the ladder's own roi, the SAT
+// query is a handful of lookups, and the fit is a grid search over ~80
+// points: all fast enough to run inline on the GUI thread instead of
+// round-tripping through another preview pass. color_picker_apply below
+// still has to cope with one *involuntary* wait -- g->pd occasionally
+// racing the pick itself stale, see there -- but that path is the
+// exception, not the normal one this function serves.
+//
+// does the actual fit-and-apply once g->pd is known fresh -- factored out of
+// color_picker_apply so the same work can be retried later, off a signal
+// rather than off the picker callback itself (see there).
+static void _color_picker_apply_now(dt_iop_module_t *self,
+                                    dt_dev_pixelpipe_t *pipe)
 {
-  DT_GUARD_GUI_UPDATE();
-
   dt_iop_contrast_gui_data_t *g = self->gui_data;
-  if(!g || picker != g->scale_shift) return;
-
-  if(!dt_preview_data_is_fresh(&g->pd))
-  {
-    dt_control_log(_("wait for the preview to finish recomputing"));
-    return;
-  }
 
   dt_iop_gui_enter_critical_section(self);
   const dt_iop_roi_t roi_in = g->ladder_roi_in;
@@ -2995,9 +2999,68 @@ void color_picker_apply(dt_iop_module_t *self,
   DT_LEAVE_GUI_UPDATE();
 }
 
+void color_picker_apply(dt_iop_module_t *self,
+                        GtkWidget *picker,
+                        dt_dev_pixelpipe_t *pipe)
+{
+  DT_GUARD_GUI_UPDATE();
+
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(!g || picker != g->scale_shift) return;
+
+  if(!dt_preview_data_is_fresh(&g->pd))
+  {
+    // DT_SIGNAL_CONTROL_PICKERDATA_READY (gui/color_picker_proxy.c) is
+    // dispatched through a GLib idle source rather than run synchronously
+    // on the pipe thread that raised it, so by the time this runs on the
+    // GUI thread the live pipe g->pd is checked against can already have
+    // moved past the pass that filled g->pd -- a race, not a "the preview
+    // hasn't started yet" case, and it doesn't self-heal: the picker only
+    // re-fires this callback when the box itself changes
+    // (_record_point_area in that same file), so a pick that lands in this
+    // window would otherwise sit dropped until the user re-arms the picker
+    // by hand. Remember it and force a fresh preview pass; the pass's own
+    // finished signal retries it below.
+    g->pick_pending = TRUE;
+    dt_control_log(_("wait for the preview to finish recomputing"));
+    dt_dev_reprocess_preview(self->dev, self->iop_order);
+    return;
+  }
+
+  g->pick_pending = FALSE;
+  _color_picker_apply_now(self, pipe);
+}
+
+// retries a pick color_picker_apply had to defer because g->pd was still
+// stale -- see the race described there. Connected to
+// DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED in gui_init.
+static void _preview_pipe_finished_retry_pick(gpointer instance, dt_iop_module_t *self)
+{
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(!g || !g->pick_pending) return;
+
+  // the picker may have been disarmed, or handed to a different widget or
+  // module, while this pick waited on a fresh pass -- applying data nobody
+  // is asking for any more would be worse than the bug this is fixing.
+  const dt_iop_color_picker_t *const picker = darktable.lib->proxy.colorpicker.picker_proxy;
+  if(!picker || picker->module != self || picker->colorpick != g->scale_shift)
+  {
+    g->pick_pending = FALSE;
+    return;
+  }
+
+  if(!dt_preview_data_is_fresh(&g->pd)) return;  // still catching up: wait for the next signal
+
+  g->pick_pending = FALSE;
+  _color_picker_apply_now(self, self->dev->preview_pipe);
+}
+
 void gui_focus(dt_iop_module_t *self, gboolean in)
 {
   if(in) return;
+
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(g) g->pick_pending = FALSE;
 
   dt_iop_color_picker_reset(self, TRUE);
 }
@@ -3130,7 +3193,7 @@ static float _graph_gain_at(const int height, const double y)
 static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const float gain)
 {
   if(k < 0 || k >= CT_BANDS || !g->band[k]) return;
-  dt_bauhaus_slider_set_val(g->band[k], gain);
+  dt_bauhaus_slider_set(g->band[k], gain);
 }
 
 // ---------------------------------------------------------------------------
@@ -3756,6 +3819,7 @@ void gui_init(dt_iop_module_t *self)
   g->band_pd.components = 2 * CT_BANDS;  // fixed forever, unlike the ladder's nrungs -- no resize dance
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _ui_pipe_done);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _preview_pipe_finished_retry_pick);
 
   // Main container
   self->widget = dt_gui_vbox();
