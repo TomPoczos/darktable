@@ -1878,15 +1878,23 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // -- not a [0,1] boost shape with a separate strength knob. shape[] here for
 // CT_TARGET_EQUALIZE *is* that curve directly: the caller must use it as the
 // target curve as-is, not lerp it between 1 and a master gain the way
-// TEXTURE/DETAIL's shape[] is. E_ref is evaluated at the same geometric-mean-
-// of-the-grid reference point the preset uses, against this box's own fit
-// rather than the preset's synthetic self-similar assumption.
+// TEXTURE/DETAIL's shape[] is.
+//
+// implementation-plan-3.md §5.1: E_ref used to be evaluated at the geometric
+// mean of the *projection grid*'s own bounds, which only equalled the band
+// ladder's own geometric mean because the grid's padding factors (0.25 and
+// 4.0) were reciprocal. §3.1 breaks that coincidence by trimming the grid's
+// coarse end to the frame, so E_ref is now derived from the band ladder
+// directly (sigma_ref, the caller's sqrt(sigma[0]*sigma[nbands-1])) rather
+// than from whatever the grid's bounds happen to be this call -- the curve's
+// level must not move just because the grid's bounds do.
 #define CT_EQUALIZE_ALPHA 0.4
 #define CT_EQUALIZE_GAIN_LO 0.3
 #define CT_EQUALIZE_GAIN_HI 2.5
 
 static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
                           const double *const restrict sigma_grid, const int m,
+                          const double sigma_ref,
                           double *const restrict shape)
 {
   double peak_tex = 0.0;
@@ -1895,11 +1903,8 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
       peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau));
 
   double s_ref = 0.0, n_ref = 0.0;
-  if(mode == CT_TARGET_EQUALIZE && m > 0)
-  {
-    const double sigma_mid = sqrt(sigma_grid[0] * sigma_grid[m - 1]);
-    _ct_fit_eval(fit, sigma_mid, &s_ref, &n_ref);
-  }
+  if(mode == CT_TARGET_EQUALIZE)
+    _ct_fit_eval(fit, sigma_ref, &s_ref, &n_ref);
 
   for(int j = 0; j < m; j++)
   {
@@ -2554,7 +2559,10 @@ void init_presets(dt_iop_module_so_t *self)
   {
     const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.4, .noise = 0.02,
                                   .texture = 0.0, .tau = 0.0 };
-    _target_curve(&synthetic, CT_TARGET_EQUALIZE, sigma_grid, CT_PROJECT_GRID, target);
+    // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
+    // geometric mean, not the grid's -- see _target_curve's comment.
+    const double sigma_ref = sqrt((double)sigma[0] * (double)sigma[CT_BANDS - 1]);
+    _target_curve(&synthetic, CT_TARGET_EQUALIZE, sigma_grid, CT_PROJECT_GRID, sigma_ref, target);
   }
   if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI, &p))
     dt_gui_presets_add_generic(_("flatten spectrum"), self->op, self->version(), &p, sizeof(p), TRUE,
@@ -2680,7 +2688,10 @@ void color_picker_apply(dt_iop_module_t *self,
     lambda_grid[j] = sigma_grid[j] * CT_SIGMA_TO_LAMBDA;
   }
 
-  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, shape);
+  // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
+  // geometric mean, not the grid's -- see _target_curve's comment.
+  const double sigma_ref = sqrt((double)sigma[0] * (double)sigma[CT_BANDS - 1]);
+  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, sigma_ref, shape);
   // §8.1: CT_TARGET_EQUALIZE's shape[] is already the bounded absolute
   // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
   // target[] as-is, not lerped between 1 and master the way TEXTURE/DETAIL's
