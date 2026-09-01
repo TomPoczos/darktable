@@ -1895,6 +1895,27 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // directly (sigma_ref, the caller's sqrt(sigma[0]*sigma[nbands-1])) rather
 // than from whatever the grid's bounds happen to be this call -- the curve's
 // level must not move just because the grid's bounds do.
+//
+// implementation-plan-3.md §5: EQUALIZE is a power law in sigma with
+// exponent CT_EQUALIZE_ALPHA*(beta-2). Its dynamic range over this grid is
+// 2^(alpha*(beta-2)*span), which passes log2(HI/LO) = 3.06 octaves at
+// beta ~= 2.68 on today's 11.18-octave grid (span shrank from 12.0 to this
+// after §3.1's trim; recompute from the grid's actual bounds if that trim
+// ever moves) -- so on any content the fit reads as steeper than about 2.7
+// the envelope is reached by arithmetic, not by anything about the picked
+// area. A hard CLAMP there does not bound the *shape*, it deletes it: two,
+// three, four adjacent bands can land on the same rail. Squash the log gain
+// by L*tanh(log_gain/L) instead, with L set independently on each side to
+// the rail's own log distance from 1.0 -- |log_gain| << L passes through
+// untouched and only the excursions that would otherwise rail get bent. The
+// CLAMP below becomes a safety net (tanh's own range keeps it from ever
+// firing) rather than a working part of the curve. This also squashes the
+// wiener factor, not only the flattening exponent -- deliberate, and the
+// variant that measured best against the twelve recorded picks
+// (picker-regression/harness_v2/dig_candidate_fixes.c): the alternative
+// (squash the exponent alone, let wiener push freely into the rail) leaves a
+// noisy pick railing at the floor for an honest reason but with the same
+// unreadable graph.
 #define CT_EQUALIZE_ALPHA 0.4
 #define CT_EQUALIZE_GAIN_LO 0.3
 #define CT_EQUALIZE_GAIN_HI 2.5
@@ -1910,8 +1931,13 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
       peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau));
 
   double s_ref = 0.0, n_ref = 0.0;
+  double Lhi = 0.0, Llo = 0.0;
   if(mode == CT_TARGET_EQUALIZE)
+  {
     _ct_fit_eval(fit, sigma_ref, &s_ref, &n_ref);
+    Lhi = log(CT_EQUALIZE_GAIN_HI);
+    Llo = log(CT_EQUALIZE_GAIN_LO);
+  }
 
   for(int j = 0; j < m; j++)
   {
@@ -1927,8 +1953,9 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
     }
     else if(mode == CT_TARGET_EQUALIZE)
     {
-      const double eq = pow(s_ref / fmax(S, DBL_MIN), CT_EQUALIZE_ALPHA) * wiener;
-      shape[j] = CLAMP(eq, CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI);
+      double p = CT_EQUALIZE_ALPHA * log(s_ref / fmax(S, DBL_MIN)) + log(fmax(wiener, DBL_MIN));
+      p = (p >= 0.0) ? Lhi * tanh(p / Lhi) : Llo * tanh(p / Llo);
+      shape[j] = CLAMP(exp(p), CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI);
     }
     else
     {
