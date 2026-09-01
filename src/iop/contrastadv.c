@@ -1999,22 +1999,59 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
 
   memset(A, 0, rows * (size_t)nbands * sizeof(float));
 
+  double sum_rw2 = 0.0;
   for(int j = 0; j < m; j++)
   {
     const double lambda = lambda_grid[j];
+    double h[CT_BANDS], sum_h = 0.0;
     for(int k = 0; k < nbands; k++)
     {
       const double sigma_km1 = (k == 0) ? 0.0 : (double)sigma[k - 1];
       const double sigma_k = (double)sigma[k];
       const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
       const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
-      const float r = calibration ? calibration[k] : 1.0f;
-      A[j * nbands + k] = (float)(hp_k - hp_km1) * r;
+      h[k] = hp_k - hp_km1;
+      sum_h += h[k];
     }
-    y[j] = (float)(g_target[j] - 1.0);
+    // implementation-plan-3.md §3.2: sum_k H_k is the fraction of the energy
+    // at this wavelength the whole band ladder touches at all -- 1.0 from the
+    // fine end through the ladder, then falling away past the coarsest band,
+    // where there is simply no band left to respond. §3.1 has already
+    // dropped the rows where it is hopeless; these are the ones where it is
+    // partial. Unweighted they are answered the only way the solve can: by
+    // driving the coarsest band far past what the target asked for.
+    // Weighting costs those rows their vote in proportion to how little the
+    // ladder can do about them.
+    //
+    // Scaling both the A row and y by rw makes the *residual* carry weight
+    // rw, hence the squared residual rw^2 -- i.e. this is weighted least
+    // squares with w_j = sum_h^2, not sum_h.
+    const double rw = sum_h;
+    sum_rw2 += rw * rw;
+    for(int k = 0; k < nbands; k++)
+    {
+      const float r = calibration ? calibration[k] : 1.0f;
+      A[j * nbands + k] = (float)(h[k] * rw) * r;
+    }
+    y[j] = (float)((g_target[j] - 1.0) * rw);
   }
 
-  const double w = sqrt(CT_PROJECT_SMOOTHNESS * (double)m);
+  // implementation-plan-3.md §3.2/§8.4: CT_PROJECT_SMOOTHNESS was picked by
+  // eye against a unit row weight -- the m unweighted rows above each
+  // contributed mass 1^2 = 1 to the solve, total mass m. A weighted row now
+  // contributes mass rw^2 (its squared residual's own weight, per the
+  // comment above), so sum_j rw_j^2 is the same total-mass quantity the
+  // constant was tuned against, not m; when weighting is off every rw is 1
+  // and sum_rw2 == m, so this is a no-op there. Measured
+  // (picker-regression/harness_v2/dig_phase3.c): normalising this way
+  // slightly *reduces* the effective smoothness relative to leaving it at m
+  // (12 pegged bands / 7 crops on the twelve recovered fits, vs 11 / 7
+  // un-normalised) -- the two-to-three-band ringing implementation-plan-2.md
+  // §4.4's own comment already documents as the clamp's job, not this
+  // penalty's, so a marginally looser penalty here is not a new failure
+  // mode, and normalising to what the constant was actually tuned against is
+  // the more honest choice.
+  const double w = sqrt(CT_PROJECT_SMOOTHNESS * sum_rw2);
   for(int r = 0; r < nreg; r++)
   {
     const int row = m + r;
