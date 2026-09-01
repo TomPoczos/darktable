@@ -431,7 +431,12 @@ int legacy_params(dt_iop_module_t *self,
 // exists for.
 #define CT_FLAT_RMS_EV 0.008
 #define CT_FLAT_ENERGY (CT_FLAT_RMS_EV * CT_FLAT_RMS_EV)
-// grid resolution of the model fit's texture size, per octave
+// grid resolution of the model fit's texture size, per octave.
+// implementation-plan-3.md §2.2: already finer than the 0.15-octave
+// tolerance implementation-plan.md §2 accepts on tau (0.125 octave here,
+// against beta's coarse grid, which needed the refinement pass added at
+// §2.1) -- this one needs no change, and this comment is that check, not
+// a placeholder for one.
 #define CT_FIT_STEPS_PER_OCTAVE 8.0
 // the fit's other grid: the self-similar spectrum's slope. implementation-
 // plan-2.md §7.3: research.md §5.3's figure was for *linear* radiance and
