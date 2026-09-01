@@ -2079,6 +2079,40 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
 }
 
 // ---------------------------------------------------------------------------
+// implementation-plan-3.md §4.2: the projection grid's own geometry --
+// shared by color_picker_apply, init_presets and the graph's x axis so none
+// of the three can ever disagree about where the grid's bounds sit.
+// ---------------------------------------------------------------------------
+
+// implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
+// frame-relative (sigma / long edge) and finest-first (idx 0), for a given
+// scale_shift -- the band ladder is frame-relative by construction (node
+// k's nominal wavelength is S * 2^-(D0+k+shift)), so no pixel term is
+// needed here the way modify_roi_in's own sigma[] needs one.
+static void _ct_band_sigma(float *const restrict sigma, const float scale_shift)
+{
+  int idx = 0;
+  for(int k = CT_BANDS - 1; k >= 0; k--)
+  {
+    const double D = CT_BAND_D0 + k + 0.5 + scale_shift;
+    sigma[idx++] = (float)exp2(-(D + 1.0));
+  }
+}
+
+// implementation-plan-2.md §4.3/implementation-plan-3.md §3.1: the dense
+// log-sigma projection grid's own bounds -- two octaves of fine padding
+// below band 0 (none of it below the finest band, so sum_k H_k is exactly 1
+// out to the grid's fine end) and the coarse end trimmed to the frame's own
+// long edge (past which nothing was measured and nothing can be applied,
+// rather than the old sigma[CT_BANDS-1]*4.0, which reached 2.62 octaves
+// outside the frame).
+static void _ct_grid_bounds(const float *const restrict sigma, double *const lo, double *const hi)
+{
+  *lo = fmax((double)sigma[0], 1e-6) * 0.25;
+  *hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
+}
+
+// ---------------------------------------------------------------------------
 // §3.1: per-band calibration -- research.md §5.8
 // ---------------------------------------------------------------------------
 //
@@ -2107,12 +2141,12 @@ static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
 #define CT_BAND_PEAK_FACTOR 6.5357852
 
 // map a wavelength (in some roi's own pixels, or a frame-relative fraction
-// of the long edge if roi_long_edge is 1.0) to a graph x fraction. Node k is
-// drawn at (k+0.5)/CT_BANDS (_graph_curve_from_params); band k's own H_k
-// actually peaks at CT_BAND_PEAK_FACTOR * sigma_lower, sigma_lower being
-// the next-finer band's own boundary sigma (half of band k's own, under
-// §4.1's octave-spaced frame-relative ladder) -- working through §4.1's
-// sigma[k] = 2^-(D0+k+1.5) puts that peak at
+// of the long edge if roi_long_edge is 1.0) to a *raw*, unclamped x
+// fraction. Node k is drawn at (k+0.5)/CT_BANDS (_graph_curve_from_params);
+// band k's own H_k actually peaks at CT_BAND_PEAK_FACTOR * sigma_lower,
+// sigma_lower being the next-finer band's own boundary sigma (half of band
+// k's own, under §4.1's octave-spaced frame-relative ladder) -- working
+// through §4.1's sigma[k] = 2^-(D0+k+1.5) puts that peak at
 // 2^-(D0+k+0.5) * (CT_BAND_PEAK_FACTOR/4). Anchoring the axis there,
 // instead of at the nominal detail level the old formula used, is what
 // makes a rung/preset shape and the node whose H_k actually responds to it
@@ -2126,11 +2160,68 @@ static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
 // the nodes' own fixed screen positions do, so a rung/preset shape and the
 // node it nominally corresponds to line up regardless of where scale_shift
 // has since moved the *physical* meaning of that node. Shared by §3.2's
-// graph overlay and §3.4's analytic preset shapes.
-static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
+// graph overlay and §3.4's analytic preset shapes -- and, unclamped, by
+// implementation-plan-3.md §4.2's axis (below), which is what needs to see
+// the projection grid's own overhang past the node ladder rather than have
+// it piled at a clamped edge.
+static double _spectrum_lambda_to_raw_x(const double lambda, const double roi_long_edge)
 {
   const double d = -log2(lambda / fmax(roi_long_edge, 1.0)) + log2(CT_BAND_PEAK_FACTOR / 4.0);
-  return CLAMP((float)((d - CT_BAND_D0) / (double)CT_BANDS), 0.0f, 1.0f);
+  return (d - CT_BAND_D0) / (double)CT_BANDS;
+}
+
+// the presets (§3.4) build their target shapes against the node ladder's
+// own [0,1] span, clamped -- they have no screen to draw on, so the grid's
+// overhang past the ladder is simply not addressable there and clamping it
+// to the nearest node is the right behaviour, unchanged from before §4.2.
+static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
+{
+  return CLAMP((float)_spectrum_lambda_to_raw_x(lambda, roi_long_edge), 0.0f, 1.0f);
+}
+
+// implementation-plan-3.md §4.2: the graph's x axis is the projection grid
+// -- x0/x1 are that grid's own raw-x bounds (coarse/screen-left and
+// fine/screen-right), sourced from the same _ct_band_sigma/_ct_grid_bounds
+// color_picker_apply and init_presets build their grid from, so the axis
+// and the grid it is drawn over can never disagree. If the grid's bounds
+// ever move, re-derive from here rather than copying new numbers in.
+typedef struct _ct_axis_t { double x0, x1; } _ct_axis_t;
+
+static _ct_axis_t _graph_axis(const dt_iop_contrast_params_t *const p)
+{
+  float sigma[CT_BANDS];
+  _ct_band_sigma(sigma, p->scale_shift);
+  double lo, hi;
+  _ct_grid_bounds(sigma, &lo, &hi);
+  const _ct_axis_t axis = { _spectrum_lambda_to_raw_x(hi * CT_SIGMA_TO_LAMBDA, 1.0),
+                            _spectrum_lambda_to_raw_x(lo * CT_SIGMA_TO_LAMBDA, 1.0) };
+  return axis;
+}
+
+// a raw x fraction (node space, (k+0.5)/CT_BANDS for node k, or the output
+// of _spectrum_lambda_to_raw_x for a wavelength) run through the axis to a
+// screen x fraction -- every other mapping below is this plus a conversion
+// to raw x.
+static float _graph_raw_to_x(const double raw, const _ct_axis_t *const axis)
+{
+  return CLAMP((float)((raw - axis->x0) / fmax(axis->x1 - axis->x0, 1e-9)), 0.0f, 1.0f);
+}
+
+// map a wavelength to a screen x fraction on the given axis -- the drawing
+// counterpart of _spectrum_lambda_to_x above, used everywhere the graph
+// actually renders (implementation-plan-3.md §4.2).
+static float _graph_lambda_to_x(const double lambda, const double roi_long_edge,
+                                const _ct_axis_t *const axis)
+{
+  return _graph_raw_to_x(_spectrum_lambda_to_raw_x(lambda, roi_long_edge), axis);
+}
+
+// a node's own fixed raw-x position, (k+0.5)/CT_BANDS, run through the same
+// axis -- keeps node placement, the curve and the spectrum overlay all on
+// the same map.
+static float _graph_node_x(const int k, const _ct_axis_t *const axis)
+{
+  return _graph_raw_to_x(((double)k + 0.5) / (double)CT_BANDS, axis);
 }
 
 // query §3.1's per-band block tables (built alongside the ladder in the same
@@ -2865,10 +2956,13 @@ static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self
 // the graph (implementation-plan.md §1.4)
 // ---------------------------------------------------------------------------
 //
-// nodes run coarse (left) to fine (right), evenly spaced -- one per octave,
-// which is exactly what CT_BANDS is -- so a node's x fraction is simply
-// (k + 0.5) / CT_BANDS and needs no lookup (implementation-plan-3.md §4.2
-// replaces this -- see _spectrum_lambda_to_raw_x). y is log2 gain (§4.1),
+// nodes run coarse (left) to fine (right), evenly spaced in *raw* x -- one
+// per octave at (k + 0.5) / CT_BANDS, which is exactly what CT_BANDS is --
+// but implementation-plan-3.md §4.2 makes the x axis the projection grid's
+// own span rather than [0,1] directly, so a node's *screen* x fraction is
+// that raw position run through _graph_axis/_graph_node_x, and the nodes
+// occupy only the axis's own middle stretch (the grid's fine/coarse padding
+// takes the rest -- see _graph_axis's comment). y is log2 gain (§4.1),
 // symmetric about CT_GRAPH_LOG_HALF; a node dragged past the visible top or
 // bottom now rides the axis edge exactly, since the axis *is* the slider's
 // own hard range [0.2, 5.0] -- see _graph_gain_at.
@@ -2886,10 +2980,11 @@ static float _graph_gain_to_yfrac(const float gain)
 }
 
 static void _graph_curve_from_params(dt_draw_curve_t *curve,
-                                     const dt_iop_contrast_params_t *const p)
+                                     const dt_iop_contrast_params_t *const p,
+                                     const _ct_axis_t *const axis)
 {
   for(int k = 0; k < CT_BANDS; k++)
-    dt_draw_curve_set_point(curve, k, (k + 0.5f) / (float)CT_BANDS,
+    dt_draw_curve_set_point(curve, k, _graph_node_x(k, axis),
                             _graph_gain_to_yfrac(p->band[k]));
 }
 
@@ -2902,9 +2997,15 @@ static void _graph_geometry(GtkWidget *widget, int *inset, int *width, int *heig
   *height = allocation.height - 2 * (*inset) - DT_RESIZE_HANDLE_SIZE;
 }
 
-static int _graph_band_at(const int width, const double x)
+// inverse of _graph_node_x: a screen x fraction back to the band whose
+// octave cell it falls in -- implementation-plan-3.md §4.2's axis is an
+// affine map of raw x, so this is the same inversion as before, just
+// through the axis first.
+static int _graph_band_at(const int width, const double x, const _ct_axis_t *const axis)
 {
-  const int k = (int)floor(x / (double)MAX(width, 1) * CT_BANDS);
+  const double xfrac = x / (double)MAX(width, 1);
+  const double raw = axis->x0 + xfrac * (axis->x1 - axis->x0);
+  const int k = (int)floor(raw * (double)CT_BANDS);
   return CLAMP(k, 0, CT_BANDS - 1);
 }
 
@@ -2990,13 +3091,14 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
 static void _draw_spectrum_curve(cairo_t *cr, const int width, const int height,
                                  const double *const restrict lambda,
                                  const double *const restrict energy,
-                                 const int n, const double roi_long_edge, const double peak)
+                                 const int n, const double roi_long_edge, const double peak,
+                                 const _ct_axis_t *const axis)
 {
   if(n < 1) return;
   gboolean started = FALSE;
   for(int r = 0; r < n; r++)
   {
-    const float x = _spectrum_lambda_to_x(lambda[r], roi_long_edge) * width;
+    const float x = _graph_lambda_to_x(lambda[r], roi_long_edge, axis) * width;
     const float y = height * (1.0f - _spectrum_energy_to_y(energy[r], peak));
     if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
     else cairo_line_to(cr, x, y);
@@ -3005,7 +3107,8 @@ static void _draw_spectrum_curve(cairo_t *cr, const int width, const int height,
 }
 
 static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
-                                   const int width, const int height)
+                                   const int width, const int height,
+                                   const _ct_axis_t *const axis)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
@@ -3047,7 +3150,7 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
                              darktable.bauhaus->graph_border.green,
                              darktable.bauhaus->graph_border.blue, 0.8);
     _draw_spectrum_curve(cr, width, height, frame_lambda, frame_energy, frame_nrungs,
-                         roi_long_edge, peak);
+                         roi_long_edge, peak, axis);
   }
 
   if(have_pick)
@@ -3056,7 +3159,7 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
                              darktable.bauhaus->color_fill.green,
                              darktable.bauhaus->color_fill.blue, 0.9);
     _draw_spectrum_curve(cr, width, height, pick_lambda, pick_energy, pick_nrungs,
-                         roi_long_edge, peak);
+                         roi_long_edge, peak, axis);
 
     // the fitted S(lambda) + N(lambda) model, sampled densely across the
     // picked box's own measured range, dashed to read as "model" rather
@@ -3075,7 +3178,7 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
       // CT_SIGMA_TO_LAMBDA -- §4.2 adds a further frame-relative conversion
       // once fit->tau itself becomes frame-relative.
       _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA, &S, &N);
-      const float x = _spectrum_lambda_to_x(lambda, roi_long_edge) * width;
+      const float x = _graph_lambda_to_x(lambda, roi_long_edge, axis) * width;
       const float y = height * (1.0f - _spectrum_energy_to_y(S + N, peak));
       if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
       else cairo_line_to(cr, x, y);
@@ -3091,6 +3194,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
 {
   dt_iop_contrast_gui_data_t *g = self->gui_data;
   const dt_iop_contrast_params_t *const p = self->params;
+  const _ct_axis_t axis = _graph_axis(p);
 
   int inset, width, height;
   _graph_geometry(widget, &inset, &width, &height);
@@ -3121,16 +3225,31 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   gtk_render_background(context, cr, 0, 0, allocation.width, allocation.height);
   cairo_translate(cr, inset, inset);
 
-  // 1. background grid: one line per octave, i.e. per node
+  // 1. background grid: horizontal reference lines (visual density only,
+  // unrelated to the x axis) plus one vertical line per octave boundary,
+  // positioned on the same axis (§4.2, below) the curve and nodes use --
+  // dt_draw_grid's own even spacing no longer matches now that the grid's
+  // overhang takes up part of the width.
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(0.5));
   set_color(cr, darktable.bauhaus->graph_border);
-  dt_draw_grid(cr, CT_BANDS, 0, 0, width, height);
+  for(int k = 1; k < CT_BANDS; k++)
+  {
+    const float hy = k / (float)CT_BANDS * height;
+    dt_draw_line(cr, 0, hy, width, hy);
+    cairo_stroke(cr);
+  }
+  for(int k = 1; k < CT_BANDS; k++)
+  {
+    const float vx = _graph_raw_to_x((double)k / (double)CT_BANDS, &axis) * width;
+    dt_draw_line(cr, vx, 0, vx, height);
+    cairo_stroke(cr);
+  }
 
   // 2. unresolvable-band shading -- bands beyond g->nbands (§1.5) don't
   // survive the current pipe scale and have no effect
   if(g->nbands < CT_BANDS)
   {
-    const float x0 = (float)g->nbands / (float)CT_BANDS * width;
+    const float x0 = _graph_raw_to_x((double)g->nbands / (double)CT_BANDS, &axis) * width;
     cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
                              darktable.bauhaus->graph_border.green,
                              darktable.bauhaus->graph_border.blue, 0.4);
@@ -3155,7 +3274,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
 
     if(have_pick_window)
     {
-      const float x1 = _spectrum_lambda_to_x(pick_coarsest_lambda, window_roi_long_edge) * width;
+      const float x1 = _graph_lambda_to_x(pick_coarsest_lambda, window_roi_long_edge, &axis) * width;
       if(x1 > 0.0f)
       {
         cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
@@ -3194,10 +3313,10 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
 
   // 4. the measured spectrum (§3.2): frame-wide ladder always in the
   // background, the last pick's own spectrum + fitted model on top of it.
-  _draw_spectrum_overlay(cr, self, width, height);
+  _draw_spectrum_overlay(cr, self, width, height, &axis);
 
   // 5. the curve: monotone cubic through the nine nodes
-  _graph_curve_from_params(g->curve, p);
+  _graph_curve_from_params(g->curve, p, &axis);
   float xs[CT_GRAPH_RES], ys[CT_GRAPH_RES];
   dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, xs, ys);
   set_color(cr, darktable.bauhaus->graph_fg);
@@ -3210,7 +3329,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   // 6. node bars + bullets
   for(int k = 0; k < CT_BANDS; k++)
   {
-    const float xn = (k + 0.5f) / CT_BANDS * width;
+    const float xn = _graph_node_x(k, &axis) * width;
     const float yfrac = _graph_gain_to_yfrac(p->band[k]);
     const float yn = height * (1.0f - yfrac);
 
@@ -3303,8 +3422,9 @@ static void _area_motion(GtkEventControllerMotion *controller,
   int inset, width, height;
   _graph_geometry(widget, &inset, &width, &height);
   const double gx = x - inset, gy = y - inset;
+  const _ct_axis_t axis = _graph_axis((const dt_iop_contrast_params_t *)self->params);
 
-  g->hover_band = (gx >= 0 && gx <= width) ? _graph_band_at(width, gx) : -1;
+  g->hover_band = (gx >= 0 && gx <= width) ? _graph_band_at(width, gx, &axis) : -1;
 
   if(g->dragging && g->drag_band >= 0)
     _area_set_band(g, g->drag_band, _graph_gain_at(height, gy));
@@ -3340,7 +3460,8 @@ static void _area_button_press(GtkGestureSingle *gesture,
 
   int inset, width, height;
   _graph_geometry(widget, &inset, &width, &height);
-  const int k = _graph_band_at(width, x - inset);
+  const _ct_axis_t axis = _graph_axis((const dt_iop_contrast_params_t *)self->params);
+  const int k = _graph_band_at(width, x - inset, &axis);
 
   // ctrl+click selects that band's mask view (§1.6) rather than dragging its
   // value -- the two would otherwise fight over the same click.
@@ -3484,10 +3605,12 @@ void gui_init(dt_iop_module_t *self)
   g->drag_band = -1;
   g->dragging = FALSE;
   g->curve = dt_draw_curve_new(0.0, 1.0, MONOTONE_HERMITE);
-  for(int k = 0; k < CT_BANDS; k++)
-    dt_draw_curve_add_point(g->curve, (k + 0.5f) / (float)CT_BANDS,
-                            _graph_gain_to_yfrac
-                              (((dt_iop_contrast_params_t *)self->default_params)->band[k]));
+  {
+    const dt_iop_contrast_params_t *const def = (dt_iop_contrast_params_t *)self->default_params;
+    const _ct_axis_t axis = _graph_axis(def);
+    for(int k = 0; k < CT_BANDS; k++)
+      dt_draw_curve_add_point(g->curve, _graph_node_x(k, &axis), _graph_gain_to_yfrac(def->band[k]));
+  }
 
   g->area = GTK_DRAWING_AREA(dt_ui_resize_wrap
                              (NULL, 0, "plugins/darkroom/contrastadv/graphheight"));
