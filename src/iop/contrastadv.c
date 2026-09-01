@@ -1926,6 +1926,23 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // (squash the exponent alone, let wiener push freely into the rail) leaves a
 // noisy pick railing at the floor for an honest reason but with the same
 // unreadable graph.
+//
+// implementation-plan-3.md §8.2: re-checked after §3's trim+weight and this
+// section's own soft limit, on the same twelve crops
+// (picker-regression/harness_v2/dig_phase5.c): pegged bands 15->8/108, crops
+// with any peg 10->6/12, and never the *target curve* itself (dig_phase5.c
+// asserts that directly) -- every remaining peg is _project_to_bands' own
+// final CLAMP on the least-squares solution below, not this curve railing.
+// Three of the eight are one high-beta crop's coarsest bands (recovered
+// beta 4.00 -- honest content wanting more cut than any reasonable envelope
+// gives without compromising the rest, the residual this phase predicted).
+// The other five are single-band pegs on either near-flat content (whose own
+// beta pegs per §8.1 -- content the fit cannot resolve to begin with) or an
+// otherwise-clean crop taking one real, strong correction at an end band.
+// Left at [0.3, 2.5]: widening would give the least-trustworthy crops more
+// room precisely where they are least meaningful, and §4.1 already put both
+// rails on screen with a settled answer (§4.5) for what a railed node looks
+// like, so a genuine peg now reads as legible feedback, not a hidden clamp.
 #define CT_EQUALIZE_ALPHA 0.4
 #define CT_EQUALIZE_GAIN_LO 0.3
 #define CT_EQUALIZE_GAIN_HI 2.5
