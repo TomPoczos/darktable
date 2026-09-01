@@ -2372,6 +2372,16 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 // large "frame size" this used to need (to keep modify_roi_in's own "-1"
 // pixel-discretisation term negligible) was never necessary, and neither
 // was the term itself. scale_shift = 0: presets sit on the standard ladder.
+//
+// implementation-plan-3.md §1.3: CT_GAUSSIAN_SIGMA_FACTOR does **not** belong
+// here, and the next person to find it will want to sprinkle it in. These
+// sigmas are pure geometry -- a detail level turned into a frame-relative
+// size, with no dt_gaussian_blur behind them to have widened anything --
+// exactly like color_picker_apply's own band sigma[]. The correction they
+// eventually drive is applied by fast_eigf_surface_blur at d->sigma[k], which
+// is a guided filter, not Deriche's smoother, so it does not inherit the
+// factor either. _build_ladder's two dt_gaussian_init calls are the module's
+// only ones, and its rung labels are the only thing the factor applies to.
 static void _preset_nominal_sigma(float *const restrict sigma)  // CT_BANDS, finest-first
 {
   int idx = 0;
