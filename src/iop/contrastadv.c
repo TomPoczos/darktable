@@ -3354,10 +3354,16 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     {
       const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
       double S, N;
-      // implementation-plan-2.md §3.2: _ct_fit_eval takes sigma, via
-      // CT_SIGMA_TO_LAMBDA -- §4.2 adds a further frame-relative conversion
-      // once fit->tau itself becomes frame-relative.
-      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA, &S, &N);
+      // implementation-plan-4.md §3.1: fit->tau/self_similar/noise were solved
+      // against _fit_curve_from_box's frame-relative sigma
+      // (ladder_sigma[r]/long_edge); lambda here is in the ladder roi's own
+      // pixels. Without the /roi_long_edge the model is evaluated L times too
+      // far out: the self-similar term is scaled by L^(beta-2) -- +4.2 stops
+      // at beta 2.4, +10.5 at beta 3.0 on a 10-stop axis, exact only at
+      // beta = 2 -- and the noise and texture terms by 1/L^2, i.e. erased.
+      // implementation-plan-2.md §3.2's comment predicted this conversion;
+      // §4.2 made fit->tau frame-relative and never added it.
+      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA / fmax(roi_long_edge, 1.0), &S, &N);
       const float x = _graph_lambda_to_x(lambda, roi_long_edge, axis) * width;
       const float y = height * (1.0f - _spectrum_energy_to_y(S + N, peak));
       if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
