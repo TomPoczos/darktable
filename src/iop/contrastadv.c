@@ -3228,12 +3228,14 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
+         "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
-         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower."));
+         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
+         "dashed nodes were extrapolated, not measured, by the last pick."));
 
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
@@ -3381,11 +3383,32 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   cairo_stroke(cr);
 
   // 6. node bars + bullets
+  //
+  // implementation-plan-3.md §4.4: which nodes the last pick's own window
+  // (§1.1) actually measured, vs. which ones the fit's power law only
+  // extrapolates to -- the same window §2b already shades on the axis
+  // itself, now also marked on the nodes it covers. Raw x, not screen x:
+  // this is a comparison of positions along the ladder, so it needs to
+  // happen before the axis's own screen clamping.
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean have_pick_window = g->spectrum_valid && g->spectrum_nrungs > 0;
+  double window_lo_raw = 0.0, window_hi_raw = 0.0;  // coarsest .. finest measured, raw x
+  if(have_pick_window)
+  {
+    const double long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
+    window_lo_raw = _spectrum_lambda_to_raw_x(g->spectrum_lambda[g->spectrum_nrungs - 1], long_edge);
+    window_hi_raw = _spectrum_lambda_to_raw_x(g->spectrum_lambda[0], long_edge);
+  }
+  dt_iop_gui_leave_critical_section(self);
+
   for(int k = 0; k < CT_BANDS; k++)
   {
     const float xn = _graph_node_x(k, &axis) * width;
     const float yfrac = _graph_gain_to_yfrac(p->band[k]);
     const float yn = height * (1.0f - yfrac);
+    const double node_raw = ((double)k + 0.5) / (double)CT_BANDS;
+    const gboolean extrapolated =
+      have_pick_window && (node_raw < window_lo_raw || node_raw > window_hi_raw);
 
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
     set_color(cr, darktable.bauhaus->color_fill);
@@ -3395,8 +3418,16 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     const gboolean active = (k == g->hover_band || k == g->drag_band);
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
     cairo_arc(cr, xn, yn, DT_PIXEL_APPLY_DPI(active ? 5.0 : 3.5), 0.0, 2.0 * M_PI);
-    set_color(cr, darktable.bauhaus->graph_fg);
+    if(extrapolated)
+    {
+      const double dashes[2] = { DT_PIXEL_APPLY_DPI(1.5), DT_PIXEL_APPLY_DPI(1.5) };
+      cairo_set_dash(cr, dashes, 2, 0.0);
+      set_color(cr, darktable.bauhaus->graph_border);
+    }
+    else
+      set_color(cr, darktable.bauhaus->graph_fg);
     cairo_stroke_preserve(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
     if(k == g->drag_band)
       set_color(cr, darktable.bauhaus->graph_fg);
     else
