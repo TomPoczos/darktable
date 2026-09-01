@@ -2493,12 +2493,14 @@ void init_presets(dt_iop_module_so_t *self)
   // implementation-plan-2.md §5.2/§4.3: sigma-native grid, frame-relative
   // (long edge = 1.0 throughout -- _spectrum_lambda_to_x's roi_long_edge
   // argument, and _preset_nominal_sigma above), matching the picker's own
-  // §4.3 grid exactly.
+  // §4.3 grid exactly -- implementation-plan-3.md §3.1's coarse trim
+  // (see color_picker_apply's own grid comment) included, since §3.3 depends
+  // on the two staying identical.
   float sigma[CT_BANDS];
   _preset_nominal_sigma(sigma);
   double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
   const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
-  const double hi = (double)sigma[CT_BANDS - 1] * 4.0;
+  const double hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
     sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
@@ -2672,16 +2674,34 @@ void color_picker_apply(dt_iop_module_t *self,
   }
 
   // implementation-plan-2.md §4.3: dense log-sigma grid spanning the node
-  // ladder itself, padded two octaves either side (sigma[0]*0.25 ..
-  // sigma[CT_BANDS-1]*4, 13 octaves total, none of it below the finest
-  // band) so the projection sees each end band's full response rather than
-  // a truncated one. _target_curve/_ct_fit_eval are evaluated directly on
-  // sigma_grid; _project_to_bands' H_k needs a real wavelength, so
-  // lambda_grid is sigma_grid scaled by CT_SIGMA_TO_LAMBDA.
+  // ladder itself, padded two octaves at the fine end (sigma[0]*0.25, none
+  // of it below the finest band) so the projection sees that end band's
+  // full response rather than a truncated one. _target_curve/_ct_fit_eval
+  // are evaluated directly on sigma_grid; _project_to_bands' H_k needs a
+  // real wavelength, so lambda_grid is sigma_grid scaled by
+  // CT_SIGMA_TO_LAMBDA.
+  //
+  // implementation-plan-3.md §3.1: the fine padding above is real -- band 0
+  // is a shelf (HP_0 relative to sigma = 0), so sum_k H_k is exactly 1 out
+  // to the grid's fine end and every one of those rows is answerable. The
+  // coarse padding was not symmetric with it: the basis telescopes to
+  // HP_{n-1}, which decays to zero, and sigma[CT_BANDS-1]*4 put the grid's
+  // coarse end at lambda = 1.771 long edges -- 2.62 octaves past the
+  // coarsest band's own peak response (CT_BAND_PEAK_FACTOR*sigma[7] =
+  // 0.2889 long edges) and outside the frame entirely, where nothing was
+  // measured and nothing can be applied. Stop at the long edge instead;
+  // §3.2 below weights the in-frame remainder that the ladder can still
+  // only partly reach.
+  //
+  // Not the windowing implementation-plan-3.md's Issue 2 (f) measured and
+  // rejected: that one moved the grid per pick, with the box, which is what
+  // moved s_ref (§5.1) and let the outermost band absorb the tail. This
+  // bound is fixed, frame-relative, and identical for every pick and every
+  // preset.
   double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID];
   double shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
   const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
-  const double hi = (double)sigma[CT_BANDS - 1] * 4.0;
+  const double hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
     sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
