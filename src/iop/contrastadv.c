@@ -3351,9 +3351,16 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
 
   // 3b. implementation-plan-3.md §4.1: the EQUALIZE envelope rails, dashed,
   // in the same weight as the baseline above -- a node railed against one of
-  // these is now a node visibly touching a drawn line (§4.5: decided that is
-  // the whole answer to "what does a railed node look like", nothing further
-  // to draw once these rails and the log axis are both in place).
+  // these is now a node visibly touching a drawn line.
+  //
+  // §4.5 (was Phase 6.2): decided this is the whole answer to "what does a
+  // node on the envelope look like", nothing further to draw, once these
+  // rails and the log axis (§4.1) are both in place -- re-confirmed after
+  // §4.3/§4.4 landed too, since a node can now also be dashed (extrapolated,
+  // §4.4) at the same time it touches a rail. The two marks read as separate
+  // questions ("was this measured" vs. "is this at its limit") on different
+  // parts of the node (outline dash pattern vs. y position against a drawn
+  // line), so no combined case needs handling.
   {
     const float lo_y = height * (1.0f - _graph_gain_to_yfrac(CT_EQUALIZE_GAIN_LO));
     const float hi_y = height * (1.0f - _graph_gain_to_yfrac(CT_EQUALIZE_GAIN_HI));
