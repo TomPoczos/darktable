@@ -105,11 +105,18 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_FAST_MIN_DIM 8   // floor on a pyramid level's shorter side, px
 
 // the graph: nodes run coarse (left) to fine (right), one per octave, so the
-// x axis is simply k/CT_BANDS; the y axis is gain, soft-ranged to
-// CT_GRAPH_Y_MAX to match the sliders' own soft range (gui_init) even though
-// the hard range (band[]'s $MAX) reaches higher -- a node dragged past the
-// top just rides the edge, exactly like the slider it drives.
-#define CT_GRAPH_Y_MAX 2.0f
+// x axis is simply k/CT_BANDS (implementation-plan-3.md §4.2 replaces this
+// with the projection grid's own span -- see _spectrum_lambda_to_raw_x).
+//
+// implementation-plan-3.md §4.1: the y axis is log2 gain, symmetric about
+// the neutral 1.0, half-range log2(5.0) -- so the axis runs 0.2 .. 5.0 and
+// is exactly the band parameter's own hard range ($MAX 5.0 and its
+// reciprocal). The old linear CT_GRAPH_Y_MAX = 2.0 could not draw
+// CT_EQUALIZE_GAIN_HI at all (2.5 clamped to the top edge, pixel-identical
+// to 2.0) and split the envelope 35%/50% of the height between its
+// 1.737-octave cut half and its 1.0-octave boost half, on a quantity where
+// a factor is a factor either way.
+#define CT_GRAPH_LOG_HALF 2.3219281   // log2(5.0)
 #define CT_GRAPH_RES 64      // curve points sampled between nodes, per implementation-plan.md §1.4
 
 // the detail-scale ladder (picked-region measurement below, and the §2.1
@@ -2860,21 +2867,30 @@ static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self
 //
 // nodes run coarse (left) to fine (right), evenly spaced -- one per octave,
 // which is exactly what CT_BANDS is -- so a node's x fraction is simply
-// (k + 0.5) / CT_BANDS and needs no lookup. y is gain, soft-ranged to
-// CT_GRAPH_Y_MAX to match the sliders (gui_init); dragging above the visible
-// top still reaches the sliders' hard max, same as overdriving a slider past
-// its soft range.
+// (k + 0.5) / CT_BANDS and needs no lookup (implementation-plan-3.md §4.2
+// replaces this -- see _spectrum_lambda_to_raw_x). y is log2 gain (§4.1),
+// symmetric about CT_GRAPH_LOG_HALF; a node dragged past the visible top or
+// bottom now rides the axis edge exactly, since the axis *is* the slider's
+// own hard range [0.2, 5.0] -- see _graph_gain_at.
 //
 // every handler below re-derives the graph's pixel geometry from the
 // widget's current allocation rather than caching it, which is what keeps a
 // resize from desyncing the nodes (§1.4 acceptance).
+
+// implementation-plan-3.md §4.1: gain -> the graph's y fraction (0 at the
+// bottom, 1 at the top) on the log axis. Shared by node placement and the
+// envelope rails below.
+static float _graph_gain_to_yfrac(const float gain)
+{
+  return CLAMP(0.5f + log2f(fmaxf(gain, 1e-6f)) / (2.0f * CT_GRAPH_LOG_HALF), 0.0f, 1.0f);
+}
 
 static void _graph_curve_from_params(dt_draw_curve_t *curve,
                                      const dt_iop_contrast_params_t *const p)
 {
   for(int k = 0; k < CT_BANDS; k++)
     dt_draw_curve_set_point(curve, k, (k + 0.5f) / (float)CT_BANDS,
-                            CLAMP(p->band[k] / CT_GRAPH_Y_MAX, 0.0f, 1.0f));
+                            _graph_gain_to_yfrac(p->band[k]));
 }
 
 static void _graph_geometry(GtkWidget *widget, int *inset, int *width, int *height)
@@ -2893,13 +2909,16 @@ static int _graph_band_at(const int width, const double x)
 }
 
 // inverse of the node-drawing map in _area_draw: pixel y (0 at the graph's
-// top) to a gain. left unclamped to CT_GRAPH_Y_MAX on purpose -- dragging
-// above the visible top keeps climbing, all the way to the slider's own hard
-// range, exactly like overdriving a slider past its soft range.
+// top) to a gain. implementation-plan-3.md §4.1: the top of the axis *is*
+// the slider's own hard range now (5.0, and 1/5.0 at the bottom), so this is
+// a plain clamp rather than the open-ended climb the old linear axis needed
+// -- a node dragged to the floor lands on 0.2, not 0 (the graph cannot draw
+// gain = 0; the slider still reaches it, and double-click still resets to
+// 1.0, so nothing is unreachable, just not draggable to that exact edge).
 static float _graph_gain_at(const int height, const double y)
 {
-  const float yfrac = 1.0f - (float)(y / (double)MAX(height, 1));
-  return CLAMP(yfrac * CT_GRAPH_Y_MAX, 0.0f, 5.0f);
+  const float yfrac = CLAMP(1.0f - (float)(y / (double)MAX(height, 1)), 0.0f, 1.0f);
+  return (float)exp2((yfrac - 0.5f) * 2.0f * CT_GRAPH_LOG_HALF);
 }
 
 static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const float gain)
@@ -3083,11 +3102,13 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
      ? _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
+         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
-         "middle-click for the plain slider list."));
+         "middle-click for the plain slider list.\n"
+         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower."));
 
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
@@ -3147,11 +3168,29 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   }
 
   // 3. baseline at gain 1.0
-  const float baseline_y = height * (1.0f - 1.0f / CT_GRAPH_Y_MAX);
+  const float baseline_y = height * (1.0f - _graph_gain_to_yfrac(1.0f));
   set_color(cr, darktable.bauhaus->graph_fg);
   cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
   dt_draw_line(cr, 0, baseline_y, width, baseline_y);
   cairo_stroke(cr);
+
+  // 3b. implementation-plan-3.md §4.1: the EQUALIZE envelope rails, dashed,
+  // in the same weight as the baseline above -- a node railed against one of
+  // these is now a node visibly touching a drawn line (§4.5: decided that is
+  // the whole answer to "what does a railed node look like", nothing further
+  // to draw once these rails and the log axis are both in place).
+  {
+    const float lo_y = height * (1.0f - _graph_gain_to_yfrac(CT_EQUALIZE_GAIN_LO));
+    const float hi_y = height * (1.0f - _graph_gain_to_yfrac(CT_EQUALIZE_GAIN_HI));
+    const double dashes[2] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(3.0) };
+    set_color(cr, darktable.bauhaus->graph_fg);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+    cairo_set_dash(cr, dashes, 2, 0.0);
+    dt_draw_line(cr, 0, lo_y, width, lo_y);
+    dt_draw_line(cr, 0, hi_y, width, hi_y);
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
+  }
 
   // 4. the measured spectrum (§3.2): frame-wide ladder always in the
   // background, the last pick's own spectrum + fitted model on top of it.
@@ -3172,7 +3211,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   for(int k = 0; k < CT_BANDS; k++)
   {
     const float xn = (k + 0.5f) / CT_BANDS * width;
-    const float yfrac = CLAMP(p->band[k] / CT_GRAPH_Y_MAX, 0.0f, 1.0f);
+    const float yfrac = _graph_gain_to_yfrac(p->band[k]);
     const float yn = height * (1.0f - yfrac);
 
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
@@ -3447,8 +3486,8 @@ void gui_init(dt_iop_module_t *self)
   g->curve = dt_draw_curve_new(0.0, 1.0, MONOTONE_HERMITE);
   for(int k = 0; k < CT_BANDS; k++)
     dt_draw_curve_add_point(g->curve, (k + 0.5f) / (float)CT_BANDS,
-                            CLAMP(((dt_iop_contrast_params_t *)self->default_params)->band[k]
-                                  / CT_GRAPH_Y_MAX, 0.0f, 1.0f));
+                            _graph_gain_to_yfrac
+                              (((dt_iop_contrast_params_t *)self->default_params)->band[k]));
 
   g->area = GTK_DRAWING_AREA(dt_ui_resize_wrap
                              (NULL, 0, "plugins/darkroom/contrastadv/graphheight"));
