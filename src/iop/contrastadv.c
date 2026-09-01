@@ -2112,6 +2112,27 @@ static void _ct_grid_bounds(const float *const restrict sigma, double *const lo,
   *hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
 }
 
+// implementation-plan-3.md §3.2/§4.3: sum_k H_k(lambda) -- how much of a
+// wavelength's energy the nine bands can address between them, in [0,1].
+// The same quantity _project_to_bands weights each grid row by (its own
+// loop keeps h[k] too, for the A matrix, so it is not simply routed through
+// here); this standalone copy is for callers that only need the sum, i.e.
+// implementation-plan-3.md §4.3's graph shading.
+static double _ct_band_coverage(const double lambda, const float *const restrict sigma,
+                                const int nbands)
+{
+  double sum_h = 0.0;
+  for(int k = 0; k < nbands; k++)
+  {
+    const double sigma_km1 = (k == 0) ? 0.0 : (double)sigma[k - 1];
+    const double sigma_k = (double)sigma[k];
+    const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
+    const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
+    sum_h += hp_k - hp_km1;
+  }
+  return sum_h;
+}
+
 // ---------------------------------------------------------------------------
 // §3.1: per-band calibration -- research.md §5.8
 // ---------------------------------------------------------------------------
@@ -3283,6 +3304,39 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
         cairo_rectangle(cr, 0, 0, x1, height);
         cairo_fill(cr);
       }
+    }
+  }
+
+  // 2c. implementation-plan-3.md §4.3: shade continuously by how much of a
+  // wavelength's energy the projection grid's nine bands can even address
+  // (1 - sum_k H_k, §3.2's own row weight) -- full shading where the basis
+  // has nothing there, none where sum_k H_k is 1. Distinct from both
+  // shadings above: item 2 says "too fine for this pipe scale", item 2b
+  // says "outside this pick's own window", this one says "outside what the
+  // nine-band ladder itself can ever reach", continuous rather than a
+  // stepped rectangle since the quantity itself is continuous. Sampled at
+  // CT_GRAPH_RES columns across the axis's own sigma span, same style as
+  // the curve's own sampling a few lines down.
+  {
+    float sigma_ladder[CT_BANDS];
+    _ct_band_sigma(sigma_ladder, p->scale_shift);
+    double grid_lo, grid_hi;
+    _ct_grid_bounds(sigma_ladder, &grid_lo, &grid_hi);
+    for(int i = 0; i < CT_GRAPH_RES; i++)
+    {
+      const double t = ((double)i + 0.5) / (double)CT_GRAPH_RES;
+      const double s = grid_lo * exp2(log2(grid_hi / grid_lo) * t);
+      const double lambda = s * CT_SIGMA_TO_LAMBDA;
+      const double coverage = CLAMP(_ct_band_coverage(lambda, sigma_ladder, CT_BANDS), 0.0, 1.0);
+      const double alpha = 0.4 * (1.0 - coverage);
+      if(alpha <= 0.002) continue;
+      cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                               darktable.bauhaus->graph_border.green,
+                               darktable.bauhaus->graph_border.blue, alpha);
+      const float xa = (float)i / CT_GRAPH_RES * width;
+      const float xb = (float)(i + 1) / CT_GRAPH_RES * width;
+      cairo_rectangle(cr, xa, 0, xb - xa, height);
+      cairo_fill(cr);
     }
   }
 
