@@ -3326,8 +3326,12 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     _ct_grid_bounds(sigma_ladder, &grid_lo, &grid_hi);
     for(int i = 0; i < CT_GRAPH_RES; i++)
     {
+      // t=0 is screen-left/coarse (grid_hi, the larger sigma), t=1 is
+      // screen-right/fine (grid_lo) -- the *opposite* sweep direction from
+      // color_picker_apply's own sigma_grid[], which runs fine-to-coarse as
+      // its index increases (that array has no notion of screen position).
       const double t = ((double)i + 0.5) / (double)CT_GRAPH_RES;
-      const double s = grid_lo * exp2(log2(grid_hi / grid_lo) * t);
+      const double s = grid_hi * exp2(log2(grid_lo / grid_hi) * t);
       const double lambda = s * CT_SIGMA_TO_LAMBDA;
       const double coverage = CLAMP(_ct_band_coverage(lambda, sigma_ladder, CT_BANDS), 0.0, 1.0);
       const double alpha = 0.4 * (1.0 - coverage);
