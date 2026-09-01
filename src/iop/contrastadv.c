@@ -83,14 +83,17 @@ DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
 #define CT_BANDS 9          // detail levels 2..10, one node per octave
 #define CT_BAND_D0 2.0f     // detail level of the coarsest node
 
-// §3.3/research.md §2.4: eps_k = eps * (sigma_k/sigma_ref)^p, sigma_ref the
-// finest surviving band. p is deliberately small and un-exposed ("a small p,
-// not another slider") -- 0.3 is a plausible starting point sized against
-// phase0-band-energy.md's own numbers (raising the *global* eps from 0.2 to
-// 0.8, a 4x change, was enough to keep every band alive there), not a
-// value re-validated with phase0's own visual A/B method against real
-// images; revisit if a future pass finds coarse bands still collapsing, or
-// overshooting into halos, at this setting.
+// §3.3/research.md §2.4, re-anchored by implementation-plan-4.md §2.1:
+// eps_k = eps * 2^(p * (CT_BANDS-1-k)), k the band's own nominal ladder
+// index (finest = CT_BANDS-1) -- a fixed property of the band, not of which
+// band happened to survive modify_roi_in at the current roi scale. p is
+// deliberately small and un-exposed ("a small p, not another slider") --
+// 0.3 is a plausible starting point sized against phase0-band-energy.md's
+// own numbers (raising the *global* eps from 0.2 to 0.8, a 4x change, was
+// enough to keep every band alive there), not a value re-validated with
+// phase0's own visual A/B method against real images; revisit if a future
+// pass finds coarse bands still collapsing, or overshooting into halos, at
+// this setting.
 #define CT_FEATHERING_EXPONENT 0.3f
 
 // §1.9 FAST: how many of the *finest* (d->sigma[]-space, index 0) bands stay
@@ -1816,7 +1819,6 @@ void modify_roi_in(dt_iop_module_t *self,
   // which never gets dropped.
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
-  float sigma_ref = 1.0f;  // §3.3: the finest surviving band at this scale, set below
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
     const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
@@ -1824,7 +1826,6 @@ void modify_roi_in(dt_iop_module_t *self,
     const float sigma = 0.5f * (diameter - 1.0f);
 
     if(nbands == 0 && sigma < 0.7f) continue;  // unresolvable fine tail: drop
-    if(nbands == 0) sigma_ref = fmaxf(sigma, 0.7f);
 
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
@@ -1834,10 +1835,21 @@ void modify_roi_in(dt_iop_module_t *self,
     // energy.md found the coarsest 1-4 of 9 bands going exactly to zero on
     // three of four test images (portrait, sunset, flower), and recommended
     // promoting this from a Phase-3 "only if" to required. Scale eps up
-    // with the band's own sigma relative to the finest surviving one, so
-    // coarse bands keep real edge-tolerance instead of saturating away.
+    // with the band's distance from the finest *nominal* node.
+    //
+    // implementation-plan-4.md §2.1: the ratio this raises to
+    // CT_FEATHERING_EXPONENT is meant to be the band's size relative to the
+    // finest one -- a property of the ladder, which is fixed. Taking it
+    // against the finest *surviving* band made it a property of the zoom
+    // level instead: on a 6000 px image the coarsest band's eps changed by
+    // 1.51x between fit zoom and 100% (dig_band_alignment.py), so the module
+    // rendered differently at different zooms and the preview's bands --
+    // the ones §1's calibration measures -- carried a different eps from
+    // the ones the export applies. Between two nominal nodes the ratio is
+    // exactly 2^(k_ref - k), so the whole thing is one shift of the param
+    // index and needs no sigma at all.
     d->feathering[nbands] =
-      d->feathering_base * powf(fmaxf(sigma, 0.7f) / sigma_ref, CT_FEATHERING_EXPONENT);
+      d->feathering_base * exp2f(CT_FEATHERING_EXPONENT * (float)(CT_BANDS - 1 - k));
     nbands++;
   }
   d->nbands = nbands;
