@@ -2221,6 +2221,9 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
   double Lhi = 0.0, Llo = 0.0;
   if(mode == CT_TARGET_EQUALIZE)
   {
+    // implementation-plan-4.md §7.4: _ct_fit_eval hands back S and N
+    // separately; EQUALIZE's reference level is deliberately S alone, so
+    // n_ref itself is unused past this call.
     _ct_fit_eval(fit, sigma_ref, &s_ref, &n_ref);
     Lhi = log(CT_EQUALIZE_GAIN_HI);
     Llo = log(CT_EQUALIZE_GAIN_LO);
