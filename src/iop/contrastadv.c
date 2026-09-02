@@ -4016,6 +4016,7 @@ static void _area_button_press(GtkGestureSingle *gesture,
   {
     const dt_iop_contrast_params_t *const def = self->default_params;
     _area_set_band(g, k, def->band[k]);
+    gtk_widget_queue_draw(widget);
     return;
   }
 
@@ -4047,6 +4048,7 @@ static void _area_scrolled(GtkEventControllerScroll *controller,
   const dt_iop_contrast_params_t *const p = self->params;
   const float step = dt_modifier_eq(controller, GDK_CONTROL_MASK) ? 0.01f : 0.05f;
   _area_set_band(g, g->hover_band, p->band[g->hover_band] - (float)dy * step);
+  gtk_widget_queue_draw(dt_gui_get_widget(controller));
 }
 
 enum
