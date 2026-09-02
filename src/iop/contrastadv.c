@@ -1043,20 +1043,19 @@ static double _ct_predict_band_energy(const _ct_fit_t *const fit,
   return N + A + C;
 }
 
-// §2.5: which of research.md §5.6's target shapes a fit earns. TEXTURE is
-// the default; DETAIL is the A-negligible fallback -- "a self-similar area
-// with no size", `_fit_curve_from_box` below decides which.
+// §2.5: which of research.md §5.6's target shapes a fit earns. DETAIL is
+// the A-negligible fallback -- "a self-similar area with no size";
+// `_fit_curve_from_box` below decides which.
 // implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is research.md §5.6's
-// third shape, "boost what's weak" rather than TEXTURE's "boost whatever
-// carries the most energy" -- already shipped, unchanged, as the "flatten
-// spectrum" preset; §8.1 only wires it into the live picker path so a pick
-// can use it too. Not yet chosen *between* TEXTURE and EQUALIZE for the
-// picker -- that is §8.2, decided separately with rendered crops, not code.
+// third shape, "boost what's weak" rather than TEXTURE's now-deleted "boost
+// whatever carries the most energy" -- already shipped, unchanged, as the
+// "flatten spectrum" preset; §8.1 wired it into the live picker path so a
+// pick can use it too, and TEXTURE lost that choice outright (plan-2 §8.2,
+// rendered crops) -- implementation-plan-4.md §7.2 removes the mode itself.
 typedef enum _ct_target_mode_t
 {
-  CT_TARGET_TEXTURE  = 0,
-  CT_TARGET_DETAIL   = 1,
-  CT_TARGET_EQUALIZE = 2
+  CT_TARGET_DETAIL   = 0,
+  CT_TARGET_EQUALIZE = 1
 } _ct_target_mode_t;
 
 // ---------------------------------------------------------------------------
@@ -2155,13 +2154,13 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 // rescaling.
 //
 // implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is different in *kind*,
-// not degree, from the other two -- research.md §5.6's own table gives it as
+// not degree, from DETAIL -- research.md §5.6's own table gives it as
 // a bounded absolute curve, clamp((E_ref/S_hat)^alpha) * S/(S+N), already
 // shipped unchanged as the "flatten spectrum" preset's own expression (§3.4)
 // -- not a [0,1] boost shape with a separate strength knob. shape[] here for
 // CT_TARGET_EQUALIZE *is* that curve directly: the caller must use it as the
 // target curve as-is, not lerp it between 1 and a master gain the way
-// TEXTURE/DETAIL's shape[] is.
+// DETAIL's shape[] is.
 //
 // implementation-plan-3.md §5.1: E_ref used to be evaluated at the geometric
 // mean of the *projection grid*'s own bounds, which only equalled the band
@@ -2218,11 +2217,6 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
                           const double sigma_ref,
                           double *const restrict shape)
 {
-  double peak_tex = 0.0;
-  if(mode == CT_TARGET_TEXTURE)
-    for(int j = 0; j < m; j++)
-      peak_tex = fmax(peak_tex, fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau));
-
   double s_ref = 0.0, n_ref = 0.0;
   double Lhi = 0.0, Llo = 0.0;
   if(mode == CT_TARGET_EQUALIZE)
@@ -2238,13 +2232,7 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
     _ct_fit_eval(fit, sigma_grid[j], &S, &N);
     const double wiener = S / fmax(S + N, DBL_MIN);
 
-    if(mode == CT_TARGET_TEXTURE)
-    {
-      const double that = peak_tex > 0.0
-        ? (fit->texture * _dog_shape(sigma_grid[j] * sigma_grid[j], fit->tau)) / peak_tex : 0.0;
-      shape[j] = that * wiener;
-    }
-    else if(mode == CT_TARGET_EQUALIZE)
+    if(mode == CT_TARGET_EQUALIZE)
     {
       double p = CT_EQUALIZE_ALPHA * log(s_ref / fmax(S, DBL_MIN)) + log(fmax(wiener, DBL_MIN));
       p = (p >= 0.0) ? Lhi * tanh(p / Lhi) : Llo * tanh(p / Llo);
@@ -2753,7 +2741,7 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
 // be resized out from under it mid-query.
 //
 // on success, *fit holds the model and *mode which of §2.5's target shapes
-// it earns (TEXTURE normally, DETAIL when A came back negligible -- "a
+// it earns (EQUALIZE normally, DETAIL when A came back negligible -- "a
 // self-similar area with no size"). returns FALSE only under the same
 // refusals `_fit_texture_scale` always used -- too few rungs, too narrow a
 // span, or nothing above the noise floor anywhere in the box; the two
@@ -2919,9 +2907,9 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 
   // §8.2: fit->tau/fit->texture feed _ct_fit_eval's S(sigma) the same way
   // regardless of mode (EQUALIZE's wiener term and E_ref both depend on
-  // them, just not peak-normalised the way TEXTURE's shape was) -- so the
-  // fitted size is still worth warning about whenever a texture was found
-  // at all, not only in the now-unreachable-from-the-picker TEXTURE case.
+  // them, just not peak-normalised the way TEXTURE's shape once was) -- so
+  // the fitted size is still worth warning about whenever a texture was
+  // found at all, not only in the now-deleted TEXTURE case (plan-4 §7.2).
   if(*mode != CT_TARGET_DETAIL)
   {
     const double target_sigma = sqrt(fit->tau);
@@ -3260,8 +3248,8 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, sigma_ref, shape);
   // §8.1: CT_TARGET_EQUALIZE's shape[] is already the bounded absolute
   // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
-  // target[] as-is, not lerped between 1 and master the way TEXTURE/DETAIL's
-  // [0,1] shape is.
+  // target[] as-is, not lerped between 1 and master the way DETAIL's [0,1]
+  // shape is.
   const gboolean is_equalize = (mode == CT_TARGET_EQUALIZE);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
     target[j] = is_equalize ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
@@ -3272,9 +3260,9 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   float calibration[CT_BANDS];
   _compute_band_calibration(self, box, long_edge, &fit, p->calibration_mode, calibration);
 
-  // §4.4: the envelope the target curve itself was built to -- TEXTURE/
-  // DETAIL's is 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own
-  // fixed clamp (§8.1, same as the preset). No band should leave it.
+  // §4.4: the envelope the target curve itself was built to -- DETAIL's is
+  // 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own fixed clamp
+  // (§8.1, same as the preset). No band should leave it.
   const float gain_lo = is_equalize ? CT_EQUALIZE_GAIN_LO : fminf(1.0f, p->gain_local_contrast);
   const float gain_hi = is_equalize ? CT_EQUALIZE_GAIN_HI : fmaxf(1.0f, p->gain_local_contrast);
 
