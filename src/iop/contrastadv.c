@@ -1845,6 +1845,18 @@ void process(dt_iop_module_t *self,
     band_tables.scratch_blk1 = dt_alloc_align_double(band_tables.bw * band_tables.bh);
     have_band_tables = band_tables.sat2 && band_tables.sat1 && band_tables.scratch_full
                       && band_tables.scratch_blk2 && band_tables.scratch_blk1;
+    if(have_band_tables)
+    {
+      // implementation-plan-4.md §4.2: dt_alloc_align_double does not zero,
+      // and _band_tables_accumulate only fills slots 0..d->nbands-1 while
+      // _band_fill_cb below publishes all CT_BANDS of them -- d->nbands is
+      // 7 on the default preview (§1.1), so a quarter of the published
+      // buffer was uninitialized heap. Nothing reads it today
+      // (_query_band_energy stops at band_nbands), but §1.1 moved exactly
+      // that boundary, so zero it rather than rely on that staying true.
+      memset(band_tables.sat2, 0, sizeof(double) * bstride * CT_BANDS);
+      memset(band_tables.sat1, 0, sizeof(double) * bstride * CT_BANDS);
+    }
   }
 
   if(update_calibration_data)
