@@ -169,10 +169,10 @@ typedef struct _ct_ladder_t
   int    nrungs;
   double sigma[CT_MAX_BANDS];   // §3.1: rung's own lower-boundary sigma, level-0 pixels
   double lambda[CT_MAX_BANDS];  // band-centre wavelength (sigma * CT_SIGMA_TO_LAMBDA), level-0 pixels
-  double step[CT_MAX_BANDS];    // level-0 pixels per pixel of the rung's own level
   size_t bw, bh;                 // block grid, the same for every rung
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
   double *sat1;                  // Sum(|b|), same layout
+  double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _fit_curve_from_box/_spectrum_frame_wide now read instead of assuming every block full
   double noise_floor[CT_MAX_BANDS];  // §2.4: per-rung, frame-wide block-minimum noise estimate
 } _ct_ladder_t;
 
@@ -276,17 +276,16 @@ typedef struct dt_iop_contrast_gui_data_t
   // dt_preview_data_t each untiled preview pass while the module is
   // expanded (§2.1's _build_ladder does the actual building). pd's buffer
   // is laid out node-major: (bw+1) x (bh+1) SAT nodes, 2*nrungs floats per
-  // node (Sum(b^2), Sum(|b|) interleaved per rung) -- pd.width/height are
-  // therefore the SAT dimensions, one more than the block grid on each
-  // axis. ladder_nrungs/lambda/step are the ladder metadata dt_preview_data_t
-  // has no room for; protected by the same self->gui_lock dt_preview_data_t
-  // itself uses (dt_iop_gui_enter/leave_critical_section), since pd.module
-  // == self.
+  // node (Sum(b^2), Sum(|b|), block pixel count interleaved per rung --
+  // implementation-plan-4.md §8.2) -- pd.width/height are therefore the SAT
+  // dimensions, one more than the block grid on each axis. ladder_nrungs/
+  // lambda are the ladder metadata dt_preview_data_t has no room for;
+  // protected by the same self->gui_lock dt_preview_data_t itself uses
+  // (dt_iop_gui_enter/leave_critical_section), since pd.module == self.
   dt_preview_data_t pd;
   int ladder_nrungs;
   double ladder_sigma[CT_MAX_BANDS];   // §3.1: rung's own lower-boundary sigma, level-0 px
   double ladder_lambda[CT_MAX_BANDS];
-  double ladder_step[CT_MAX_BANDS];
   double ladder_noise_floor[CT_MAX_BANDS];  // §2.4, frame-wide, published the same way
   dt_iop_roi_t ladder_roi_in;  // the roi_in the ladder above was built from
 
@@ -1095,6 +1094,7 @@ static void _ladder_free(_ct_ladder_t *const ladder)
 {
   dt_free_align(ladder->sat2);
   dt_free_align(ladder->sat1);
+  dt_free_align(ladder->sat_n);
   memset(ladder, 0, sizeof(_ct_ladder_t));
 }
 
@@ -1107,12 +1107,27 @@ static void _ladder_free(_ct_ladder_t *const ladder)
 // resolution, is what lets a box query be 4 lookups regardless of which rung
 // it is asking about (research.md §5.2): the caller never needs to know a
 // rung's own resolution to query it.
+//
+// implementation-plan-4.md §8.2: blkn, if not NULL, gets each block's own
+// (x1-x0)*(y1-y0) -- the real level-pixel count this block just summed, 0 for
+// a block past the frame edge. bx==bw-1/by==bh-1 (the block grid's own last
+// column/row) is the only place this differs from the nominal (CT_BLOCK/
+// step)^2 every consumer used to assume instead: width/height are essentially
+// never an exact multiple of CT_BLOCK*step, so that block holds fewer real
+// pixels than a full one, and every box query touching it was averaging that
+// smaller sum over a denominator sized for a full block -- reading the whole
+// box's mean low by an amount a whole-frame pick measured at 1-2% on real
+// crops (dig_block_edge_norm.c), not the "self-cancels" case
+// _ladder_rung_noise_floor's own kappa ratio is (kappa's two divisions by the
+// same n_per_block cancel algebraically; a box query's numerator carries no
+// such matching division to cancel against).
 static void _ladder_accumulate_blocks(const float *const restrict band,
                                       const size_t cw, const size_t ch,
                                       const double step,
                                       const size_t bw, const size_t bh,
                                       double *const restrict blk2,
-                                      double *const restrict blk1)
+                                      double *const restrict blk1,
+                                      double *const restrict blkn)
 {
   DT_OMP_FOR()
   for(size_t by = 0; by < bh; by++)
@@ -1124,6 +1139,7 @@ static void _ladder_accumulate_blocks(const float *const restrict band,
     for(size_t bx = 0; bx < bw; bx++)
     {
       double s2 = 0.0, s1 = 0.0;
+      size_t n = 0;
       if(y0 < ch)
       {
         const size_t x0 = MIN((size_t)((double)(bx * CT_BLOCK) / step), cw);
@@ -1131,6 +1147,8 @@ static void _ladder_accumulate_blocks(const float *const restrict band,
         if(x1 <= x0) x1 = MIN(x0 + 1, cw);
 
         if(x0 < cw)
+        {
+          n = (x1 - x0) * (y1 - y0);
           for(size_t j = y0; j < y1; j++)
           {
             const float *const row = band + j * cw;
@@ -1141,9 +1159,11 @@ static void _ladder_accumulate_blocks(const float *const restrict band,
               s1 += fabs(v);
             }
           }
+        }
       }
       blk2[by * bw + bx] = s2;
       blk1[by * bw + bx] = s1;
+      if(blkn) blkn[by * bw + bx] = (double)n;
     }
   }
 }
@@ -1273,14 +1293,16 @@ static gboolean _build_ladder(const float *const restrict lum,
 
   double *const restrict sat2 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
   double *const restrict sat1 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
+  double *const restrict sat_n = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
   double *const restrict blk2 = dt_alloc_align_double(ladder->bw * ladder->bh);
   double *const restrict blk1 = dt_alloc_align_double(ladder->bw * ladder->bh);
+  double *const restrict blkn = dt_alloc_align_double(ladder->bw * ladder->bh);
   float *restrict level = dt_alloc_align_float(npixels);   // this octave's base
   float *restrict next = dt_alloc_align_float(npixels);    // next octave's decimated base
   float *restrict band = dt_alloc_align_float(npixels);
   float *restrict rung[CT_SCALES_PER_OCTAVE + 1] = { 0 };
 
-  gboolean ok = sat2 && sat1 && blk2 && blk1 && level && next && band;
+  gboolean ok = sat2 && sat1 && sat_n && blk2 && blk1 && blkn && level && next && band;
   for(int s = 0; ok && s <= CT_SCALES_PER_OCTAVE; s++)
   {
     rung[s] = dt_alloc_align_float(npixels);
@@ -1289,8 +1311,8 @@ static gboolean _build_ladder(const float *const restrict lum,
 
   if(!ok)
   {
-    dt_free_align(sat2); dt_free_align(sat1);
-    dt_free_align(blk2); dt_free_align(blk1);
+    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n);
+    dt_free_align(blk2); dt_free_align(blk1); dt_free_align(blkn);
     dt_free_align(level); dt_free_align(next); dt_free_align(band);
     for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++) dt_free_align(rung[s]);
     memset(ladder, 0, sizeof(_ct_ladder_t));
@@ -1367,11 +1389,12 @@ static gboolean _build_ladder(const float *const restrict lum,
       DT_OMP_FOR()
       for(size_t k = 0; k < cw * ch; k++) band[k] = rung[s][k] - rung[s + 1][k];
 
-      _ladder_accumulate_blocks(band, cw, ch, step, ladder->bw, ladder->bh, blk2, blk1);
+      _ladder_accumulate_blocks(band, cw, ch, step, ladder->bw, ladder->bh, blk2, blk1, blkn);
       ladder->noise_floor[nrungs] =
         _ladder_rung_noise_floor(blk2, blk1, ladder->bw * ladder->bh, step);
       _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
+      _ladder_build_sat(blkn, ladder->bw, ladder->bh, sat_n + (size_t)nrungs * sat_stride);
 
       // implementation-plan-2.md §3.1: label the rung by its own lower-
       // boundary sigma, not the geometric mean of its two rung sigmas -- the
@@ -1386,7 +1409,6 @@ static gboolean _build_ladder(const float *const restrict lum,
                              * exp2((double)s / CT_SCALES_PER_OCTAVE);
       ladder->sigma[nrungs] = sigma_s * step;
       ladder->lambda[nrungs] = ladder->sigma[nrungs] * CT_SIGMA_TO_LAMBDA;
-      ladder->step[nrungs] = step;
       nrungs++;
     }
 
@@ -1410,35 +1432,40 @@ static gboolean _build_ladder(const float *const restrict lum,
 
   ladder->nrungs = nrungs;
 
-  dt_free_align(blk2); dt_free_align(blk1);
+  dt_free_align(blk2); dt_free_align(blk1); dt_free_align(blkn);
   dt_free_align(level); dt_free_align(next); dt_free_align(band);
   for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++) dt_free_align(rung[s]);
 
   if(!ok || nrungs == 0)
   {
-    dt_free_align(sat2); dt_free_align(sat1);
+    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n);
     memset(ladder, 0, sizeof(_ct_ladder_t));
     return FALSE;
   }
 
   ladder->sat2 = sat2;
   ladder->sat1 = sat1;
+  ladder->sat_n = sat_n;
   return TRUE;
 }
 
 // §2.2: dt_preview_data_fill_t for publishing a just-built ladder. Reshapes
 // the ladder's rung-major SAT tables (one (bw+1)x(bh+1) grid per rung) into
 // the node-major, per-node-interleaved layout dt_preview_data_t expects
-// (`components` floats per "pixel", here per SAT node): 2*nrungs floats per
-// node, Sum(b^2)/Sum(|b|) for rung 0, then rung 1, and so on. A cheap
-// reshape, not a rebuild -- the ladder itself was already built outside the
-// GUI lock, which is what this fill runs under (dt_preview_data_store's
+// (`components` floats per "pixel", here per SAT node): 3*nrungs floats per
+// node, Sum(b^2)/Sum(|b|)/pixel-count for rung 0, then rung 1, and so on. A
+// cheap reshape, not a rebuild -- the ladder itself was already built outside
+// the GUI lock, which is what this fill runs under (dt_preview_data_store's
 // contract: fill() must be cheap).
+//
+// implementation-plan-4.md §8.2: the third component is sat_n, added
+// alongside sat2/sat1 so a box query's denominator comes from the same
+// summed-area table as its numerator instead of an assumed-full-block count.
 static void _ladder_fill_cb(void *const user_data, float *const buf, const size_t nelems)
 {
   const _ct_ladder_t *const ladder = (const _ct_ladder_t *)user_data;
   const size_t sw = ladder->bw + 1, sh = ladder->bh + 1;
-  const size_t comps = (size_t)(2 * ladder->nrungs);
+  const size_t comps = (size_t)(3 * ladder->nrungs);
   (void)nelems;  // == sw * sh * comps, by construction of the caller's resize
 
   for(size_t y = 0; y < sh; y++)
@@ -1447,8 +1474,9 @@ static void _ladder_fill_cb(void *const user_data, float *const buf, const size_
       float *const dst = buf + (y * sw + x) * comps;
       for(int r = 0; r < ladder->nrungs; r++)
       {
-        dst[2 * r]     = (float)ladder->sat2[(size_t)r * sw * sh + y * sw + x];
-        dst[2 * r + 1] = (float)ladder->sat1[(size_t)r * sw * sh + y * sw + x];
+        dst[3 * r]     = (float)ladder->sat2[(size_t)r * sw * sh + y * sw + x];
+        dst[3 * r + 1] = (float)ladder->sat1[(size_t)r * sw * sh + y * sw + x];
+        dst[3 * r + 2] = (float)ladder->sat_n[(size_t)r * sw * sh + y * sw + x];
       }
     }
 }
@@ -1465,32 +1493,49 @@ typedef struct _ct_band_tables_t
 {
   size_t bw, bh;
   double *sat2, *sat1;      // CT_BANDS * (bw+1) * (bh+1) doubles each
+  // implementation-plan-4.md §8.2: real level-pixel count per block, one
+  // (bw+1)*(bh+1) table -- unlike sat2/sat1 this is the same for every band
+  // (module bands are always step=1 over the same width/height), so it is
+  // built once rather than CT_BANDS times.
+  double *sat_n;
   float *scratch_full;      // npixels, this band's own b_k
   double *scratch_blk2, *scratch_blk1;  // bw*bh, this band's own blocks
+  double *scratch_blkn;                  // bw*bh, this pass's block pixel counts
 } _ct_band_tables_t;
 
 // accumulate one band's already-computed b_k (bt->scratch_full) into its own
 // slot of bt's SAT tables. Reuses §2.1's block/SAT helpers verbatim -- they
 // were already generic over "one band's array + its own step", and a module
 // band's step is simply 1.
+//
+// implementation-plan-4.md §8.2: also rebuilds bt->sat_n every call. It is
+// band-independent (step=1, same width/height for every k) so this repeats
+// identical work CT_BANDS times, but the block-count pass touches no pixel
+// data -- negligible next to the s2/s1 accumulation already happening in the
+// same call -- and it keeps this function free of a first-band special case.
 static void _band_tables_accumulate(_ct_band_tables_t *const restrict bt,
                                     const int k, const size_t width, const size_t height)
 {
   _ladder_accumulate_blocks(bt->scratch_full, width, height, 1.0, bt->bw, bt->bh,
-                            bt->scratch_blk2, bt->scratch_blk1);
+                            bt->scratch_blk2, bt->scratch_blk1, bt->scratch_blkn);
   const size_t sat_stride = (bt->bw + 1) * (bt->bh + 1);
   _ladder_build_sat(bt->scratch_blk2, bt->bw, bt->bh, bt->sat2 + (size_t)k * sat_stride);
   _ladder_build_sat(bt->scratch_blk1, bt->bw, bt->bh, bt->sat1 + (size_t)k * sat_stride);
+  _ladder_build_sat(bt->scratch_blkn, bt->bw, bt->bh, bt->sat_n);
 }
 
 // §3.1: dt_preview_data_fill_t for _ct_band_tables_t, the same reshape
 // _ladder_fill_cb does for the ladder but with CT_BANDS fixed instead of a
 // variable nrungs.
+//
+// implementation-plan-4.md §8.2: one extra trailing component per node,
+// bt->sat_n -- shared across every band, so it rides along once per node
+// rather than interleaved per band the way sat2/sat1 are.
 static void _band_fill_cb(void *const user_data, float *const buf, const size_t nelems)
 {
   const _ct_band_tables_t *const bt = (const _ct_band_tables_t *)user_data;
   const size_t sw = bt->bw + 1, sh = bt->bh + 1;
-  const size_t comps = (size_t)(2 * CT_BANDS);
+  const size_t comps = (size_t)(2 * CT_BANDS + 1);
   (void)nelems;  // == sw * sh * comps, by construction of the caller's resize
 
   for(size_t y = 0; y < sh; y++)
@@ -1502,6 +1547,7 @@ static void _band_fill_cb(void *const user_data, float *const buf, const size_t 
         dst[2 * k]     = (float)bt->sat2[(size_t)k * sw * sh + y * sw + x];
         dst[2 * k + 1] = (float)bt->sat1[(size_t)k * sw * sh + y * sw + x];
       }
+      dst[2 * CT_BANDS] = (float)bt->sat_n[y * sw + x];
     }
 }
 
@@ -1858,11 +1904,14 @@ void process(dt_iop_module_t *self,
     const size_t bstride = (band_tables.bw + 1) * (band_tables.bh + 1);
     band_tables.sat2 = dt_alloc_align_double(bstride * CT_BANDS);
     band_tables.sat1 = dt_alloc_align_double(bstride * CT_BANDS);
+    band_tables.sat_n = dt_alloc_align_double(bstride);  // §8.2: band-independent, one table
     band_tables.scratch_full = dt_alloc_align_float(npixels);
     band_tables.scratch_blk2 = dt_alloc_align_double(band_tables.bw * band_tables.bh);
     band_tables.scratch_blk1 = dt_alloc_align_double(band_tables.bw * band_tables.bh);
-    have_band_tables = band_tables.sat2 && band_tables.sat1 && band_tables.scratch_full
-                      && band_tables.scratch_blk2 && band_tables.scratch_blk1;
+    band_tables.scratch_blkn = dt_alloc_align_double(band_tables.bw * band_tables.bh);
+    have_band_tables = band_tables.sat2 && band_tables.sat1 && band_tables.sat_n
+                      && band_tables.scratch_full && band_tables.scratch_blk2
+                      && band_tables.scratch_blk1 && band_tables.scratch_blkn;
     if(have_band_tables)
     {
       // implementation-plan-4.md §4.2: dt_alloc_align_double does not zero,
@@ -1872,8 +1921,11 @@ void process(dt_iop_module_t *self,
       // buffer was uninitialized heap. Nothing reads it today
       // (_query_band_energy stops at band_nbands), but §1.1 moved exactly
       // that boundary, so zero it rather than rely on that staying true.
+      // sat_n gets the same treatment: _band_tables_accumulate rebuilds it in
+      // full on every k, but only if d->nbands > 0 ever calls it at all.
       memset(band_tables.sat2, 0, sizeof(double) * bstride * CT_BANDS);
       memset(band_tables.sat1, 0, sizeof(double) * bstride * CT_BANDS);
+      memset(band_tables.sat_n, 0, sizeof(double) * bstride);
     }
   }
 
@@ -1887,9 +1939,9 @@ void process(dt_iop_module_t *self,
       // resize (by invalidating the stored dimensions) whenever nrungs, and
       // so components, has changed since the last publish.
       dt_iop_gui_enter_critical_section(self);
-      if(g->pd.components != (size_t)(2 * built.nrungs))
+      if(g->pd.components != (size_t)(3 * built.nrungs))
       {
-        g->pd.components = (size_t)(2 * built.nrungs);
+        g->pd.components = (size_t)(3 * built.nrungs);
         g->pd.width = 0;
         g->pd.height = 0;
       }
@@ -1909,7 +1961,6 @@ void process(dt_iop_module_t *self,
       g->ladder_nrungs = built.nrungs;
       memcpy(g->ladder_sigma, built.sigma, sizeof(g->ladder_sigma));
       memcpy(g->ladder_lambda, built.lambda, sizeof(g->ladder_lambda));
-      memcpy(g->ladder_step, built.step, sizeof(g->ladder_step));
       memcpy(g->ladder_noise_floor, built.noise_floor, sizeof(g->ladder_noise_floor));
       g->ladder_roi_in = *roi_in;
       dt_iop_gui_leave_critical_section(self);
@@ -1965,9 +2016,11 @@ void process(dt_iop_module_t *self,
   }
   dt_free_align(band_tables.sat2);
   dt_free_align(band_tables.sat1);
+  dt_free_align(band_tables.sat_n);
   dt_free_align(band_tables.scratch_full);
   dt_free_align(band_tables.scratch_blk2);
   dt_free_align(band_tables.scratch_blk1);
+  dt_free_align(band_tables.scratch_blkn);
 
   // a band's or DETAIL's raw b_k has no gain applied -- gain could be zero
   // -- and no fixed scale, so gating/scaling it here would be meaningless;
@@ -2611,7 +2664,7 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
   const size_t sat_w = g->band_pd.width, sat_h = g->band_pd.height;
   const gboolean have_data =
     g->band_pd.buf && sat_w > 1 && sat_h > 1
-    && g->band_pd.components == (size_t)(2 * CT_BANDS) && g->band_nbands > 0;
+    && g->band_pd.components == (size_t)(2 * CT_BANDS + 1) && g->band_nbands > 0;
 
   if(have_data)
   {
@@ -2622,14 +2675,22 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
     const size_t by0 = MIN(bh, (size_t)MAX(box[1], 0) / CT_BLOCK);
     size_t by1 = MIN(bh, (size_t)(MAX(box[3], 0) + CT_BLOCK - 1) / CT_BLOCK);
     if(by1 <= by0) by1 = MIN(bh, by0 + 1);
-    // module bands are always full res (direct, or upsampled pyramid alike)
-    // -- step = 1, unlike the ladder's per-rung decimation.
-    const double n_eff =
-      fmax((double)(bx1 - bx0) * (double)(by1 - by0) * (double)(CT_BLOCK * CT_BLOCK), 1.0);
 
     const int nbands = MIN(g->band_nbands, CT_BANDS);
-    const size_t comps = (size_t)(2 * CT_BANDS);
+    const size_t comps = (size_t)(2 * CT_BANDS + 1);
     const float *const restrict buf = g->band_pd.buf;
+    // implementation-plan-4.md §8.2: n_eff from the same box query as s2,
+    // over the real level-pixel count sat_n carries -- not
+    // (bx1-bx0)*(by1-by0)*CT_BLOCK^2, which assumed every block in the box
+    // was a full, unclipped CT_BLOCK x CT_BLOCK square. The block grid's own
+    // last column/row essentially never is (width/height are essentially
+    // never an exact multiple of CT_BLOCK), so that assumption read every
+    // box touching the frame edge low by an amount a whole-frame pick
+    // measured at 1-2% on real crops (dig_block_edge_norm.c).
+    const double n_eff = fmax((double)buf[(by1 * sat_w + bx1) * comps + 2 * CT_BANDS]
+                             - (double)buf[(by0 * sat_w + bx1) * comps + 2 * CT_BANDS]
+                             - (double)buf[(by1 * sat_w + bx0) * comps + 2 * CT_BANDS]
+                             + (double)buf[(by0 * sat_w + bx0) * comps + 2 * CT_BANDS], 1.0);
     for(int k = 0; k < nbands; k++)
     {
       const double s2 = buf[(by1 * sat_w + bx1) * comps + 2 * k]
@@ -2798,7 +2859,7 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   const size_t comps = g->pd.components;
   const gboolean have_data =
     g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-    && comps == (size_t)(2 * g->ladder_nrungs);
+    && comps == (size_t)(3 * g->ladder_nrungs);
 
   if(have_data)
   {
@@ -2809,7 +2870,6 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     const size_t by0 = MIN(bh, (size_t)MAX(box[1], 0) / CT_BLOCK);
     size_t by1 = MIN(bh, (size_t)(MAX(box[3], 0) + CT_BLOCK - 1) / CT_BLOCK);
     if(by1 <= by0) by1 = MIN(bh, by0 + 1);
-    const double nblocks = (double)(bx1 - bx0) * (double)(by1 - by0);
 
     // §1.1: a rung whose wavelength does not fit inside the box at least once
     // is not measuring the box's own texture -- past that size the block sum
@@ -2831,23 +2891,27 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     {
       if(g->ladder_lambda[r] > lambda_max) break;  // rungs run fine -> coarse
 
-      const double s2 = buf[(by1 * sat_w + bx1) * comps + 2 * r]
-                       - buf[(by0 * sat_w + bx1) * comps + 2 * r]
-                       - buf[(by1 * sat_w + bx0) * comps + 2 * r]
-                       + buf[(by0 * sat_w + bx0) * comps + 2 * r];
-      const double s1 = buf[(by1 * sat_w + bx1) * comps + 2 * r + 1]
-                       - buf[(by0 * sat_w + bx1) * comps + 2 * r + 1]
-                       - buf[(by1 * sat_w + bx0) * comps + 2 * r + 1]
-                       + buf[(by0 * sat_w + bx0) * comps + 2 * r + 1];
+      const double s2 = buf[(by1 * sat_w + bx1) * comps + 3 * r]
+                       - buf[(by0 * sat_w + bx1) * comps + 3 * r]
+                       - buf[(by1 * sat_w + bx0) * comps + 3 * r]
+                       + buf[(by0 * sat_w + bx0) * comps + 3 * r];
+      const double s1 = buf[(by1 * sat_w + bx1) * comps + 3 * r + 1]
+                       - buf[(by0 * sat_w + bx1) * comps + 3 * r + 1]
+                       - buf[(by1 * sat_w + bx0) * comps + 3 * r + 1]
+                       + buf[(by0 * sat_w + bx0) * comps + 3 * r + 1];
 
-      // n_per_block is deterministic from the rung's own decimation: CT_BLOCK
-      // level-0 pixels per block side, step level-0 pixels per level pixel of
-      // this rung, so (CT_BLOCK/step)^2 level pixels per block once the
-      // ladder hasn't decimated past CT_BLOCK yet, one (correlated) source
-      // pixel spread over several blocks once it has.
-      const double step = g->ladder_step[r];
-      const double n_per_block = fmax(1.0, (double)(CT_BLOCK * CT_BLOCK) / (step * step));
-      const double n_eff = fmax(nblocks * n_per_block, 1.0);
+      // implementation-plan-4.md §8.2: n_eff from the same box query as s2/
+      // s1, over the real level-pixel count sat_n carries -- not
+      // nblocks*(CT_BLOCK/step)^2, which assumed every block in the box was a
+      // full, unclipped square. The block grid's own last column/row
+      // essentially never is (width/height are essentially never an exact
+      // multiple of CT_BLOCK*step), so that assumption read every box
+      // touching the frame edge low by an amount a whole-frame pick measured
+      // at 1-2% on real crops (dig_block_edge_norm.c).
+      const double n_eff = fmax(buf[(by1 * sat_w + bx1) * comps + 3 * r + 2]
+                              - buf[(by0 * sat_w + bx1) * comps + 3 * r + 2]
+                              - buf[(by1 * sat_w + bx0) * comps + 3 * r + 2]
+                              + buf[(by0 * sat_w + bx0) * comps + 3 * r + 2], 1.0);
       const double lam = g->ladder_lambda[r];
 
       // §1.2: n_eff is a pixel count and is the wrong denominator for the
@@ -3548,19 +3612,22 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
   const size_t sat_w = g->pd.width, sat_h = g->pd.height;
   const size_t comps = g->pd.components;
   if(g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-     && comps == (size_t)(2 * g->ladder_nrungs))
+     && comps == (size_t)(3 * g->ladder_nrungs))
   {
-    const double nblocks = (double)(sat_w - 1) * (double)(sat_h - 1);
     const float *const restrict buf = g->pd.buf;
     const size_t corner = (sat_h - 1) * sat_w + (sat_w - 1);
     *nrungs = g->ladder_nrungs;
     for(int r = 0; r < g->ladder_nrungs; r++)
     {
-      const double step = g->ladder_step[r];
-      const double n_per_block = fmax(1.0, (CT_BLOCK / step) * (CT_BLOCK / step));
-      const double n_eff = fmax(nblocks * n_per_block, 1.0);
+      // implementation-plan-4.md §8.2: n_eff is sat_n's own corner -- the
+      // real level-pixel count the ladder actually summed, not
+      // nblocks*(CT_BLOCK/step)^2's assumption that every block (including
+      // the grid's own clipped last column/row) was a full one. Measured to
+      // move a whole-frame reading 1-2% on real crops
+      // (dig_block_edge_norm.c).
+      const double n_eff = fmax((double)buf[corner * comps + 3 * r + 2], 1.0);
       lambda[r] = g->ladder_lambda[r];
-      energy[r] = (double)buf[corner * comps + 2 * r] / n_eff;
+      energy[r] = (double)buf[corner * comps + 3 * r] / n_eff;
     }
     ok = TRUE;
   }
@@ -4138,7 +4205,7 @@ void gui_init(dt_iop_module_t *self)
   g->mask_divisor = 1.0f;
   dt_preview_data_alloc(&g->pd, self);  // §2.2: the frame-wide ladder's SAT tables
   dt_preview_data_alloc(&g->band_pd, self);  // §3.1: the module's own per-band tables
-  g->band_pd.components = 2 * CT_BANDS;  // fixed forever, unlike the ladder's nrungs -- no resize dance
+  g->band_pd.components = 2 * CT_BANDS + 1;  // fixed forever, unlike the ladder's nrungs -- no resize dance; +1 is §8.2's shared block-count column
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _ui_pipe_done);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _preview_pipe_finished_retry_pick);
