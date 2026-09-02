@@ -78,7 +78,7 @@ Current status as implemented by Jandren:
 #include <omp.h>
 #endif
 
-DT_MODULE_INTROSPECTION(2, dt_iop_contrast_params_t)
+DT_MODULE_INTROSPECTION(3, dt_iop_contrast_params_t)
 
 #define CT_BANDS 9          // detail levels 2..10, one node per octave
 #define CT_BAND_D0 2.0f     // detail level of the coarsest node
@@ -182,6 +182,23 @@ typedef enum dt_iop_contrast_decomposition_t
   CT_DECOMPOSITION_FAST = 1      // $DESCRIPTION: "fast" -- hybrid: coarse bands pyramided
 } dt_iop_contrast_decomposition_t;
 
+// implementation-plan-4.md §1.2: which formula _compute_band_calibration
+// uses to predict a module band's own energy from the picker's fitted
+// spectrum -- a GUI-only choice (it only shapes what a pick writes into
+// band[] below, not how a committed band[] is rendered), kept as a real
+// param anyway so a pick's calibration is reproducible from history like
+// everything else it writes. MODEL is the per-band closed form/quadrature;
+// CONSTANT is the flat-bandwidth-factor fallback the plan itself documents
+// as an acceptable outcome; OFF reproduces the pre-plan-4 "uncalibrated"
+// picker exactly, for the rendered A/B implementation-plan-4.md §1's own
+// acceptance asks for.
+typedef enum dt_iop_contrast_calibration_mode_t
+{
+  CT_CAL_MODE_OFF      = 0, // $DESCRIPTION: "off"
+  CT_CAL_MODE_CONSTANT = 1, // $DESCRIPTION: "bandwidth constant"
+  CT_CAL_MODE_MODEL    = 2  // $DESCRIPTION: "spectral model"
+} dt_iop_contrast_calibration_mode_t;
+
 typedef struct dt_iop_contrast_params_t
 {
   float gain_local_contrast;  // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0  $DESCRIPTION: "local contrast"
@@ -191,6 +208,7 @@ typedef struct dt_iop_contrast_params_t
   int filter_iterations;      // $MIN: 1 $MAX: 20 $DEFAULT: 1 $DESCRIPTION: "filter iterations"
   float noise_bias;           // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.001 $DESCRIPTION: "noise bias"
   dt_iop_contrast_decomposition_t decomposition; // $DEFAULT: CT_DECOMPOSITION_ACCURATE $DESCRIPTION: "decomposition"
+  dt_iop_contrast_calibration_mode_t calibration_mode; // $DEFAULT: CT_CAL_MODE_CONSTANT $DESCRIPTION: "picker calibration"
 } dt_iop_contrast_params_t;
 
 typedef struct dt_iop_contrast_data_t
@@ -228,6 +246,7 @@ typedef struct dt_iop_contrast_gui_data_t
   GtkWidget *band[CT_BANDS];
   GtkWidget *scale_shift;
   GtkWidget *decomposition;
+  GtkWidget *calibration_mode;
   GtkWidget *edge_protection;
   GtkWidget *filter_iterations;
   GtkWidget *noise_bias;
@@ -375,10 +394,47 @@ int legacy_params(dt_iop_module_t *self,
     n->filter_iterations = o->filter_iterations;
     n->noise_bias = o->noise_bias;
     n->decomposition = CT_DECOMPOSITION_ACCURATE;
+    n->calibration_mode = CT_CAL_MODE_CONSTANT;
 
     *new_params = n;
     *new_params_size = sizeof(dt_iop_contrast_params_t);
-    *new_version = 2;
+    *new_version = 3;
+    return 0;
+  }
+  if(old_version == 2)
+  {
+    typedef struct dt_iop_contrast_params_v2_t
+    {
+      float gain_local_contrast;
+      float band[CT_BANDS];
+      float scale_shift;
+      float edge_protection;
+      int filter_iterations;
+      float noise_bias;
+      dt_iop_contrast_decomposition_t decomposition;
+    } dt_iop_contrast_params_v2_t;
+
+    const dt_iop_contrast_params_v2_t *o = (dt_iop_contrast_params_v2_t *)old_params;
+    dt_iop_contrast_params_t *n = malloc(sizeof(dt_iop_contrast_params_t));
+
+    n->gain_local_contrast = o->gain_local_contrast;
+    for(int k = 0; k < CT_BANDS; k++) n->band[k] = o->band[k];
+    n->scale_shift = o->scale_shift;
+    n->edge_protection = o->edge_protection;
+    n->filter_iterations = o->filter_iterations;
+    n->noise_bias = o->noise_bias;
+    n->decomposition = o->decomposition;
+    // implementation-plan-4.md §1.2: a v2 history item never wrote
+    // calibration_mode, but its band[] gains were produced by the
+    // pre-plan-4 uncalibrated picker (or hand-set) either way -- CONSTANT
+    // is the new default for a *fresh* pick, not a claim about how this
+    // stack entry's own band[] came to be, so it is exactly as good a
+    // choice here as it is for a brand-new instance.
+    n->calibration_mode = CT_CAL_MODE_CONSTANT;
+
+    *new_params = n;
+    *new_params_size = sizeof(dt_iop_contrast_params_t);
+    *new_version = 3;
     return 0;
   }
   return 1;
@@ -846,6 +902,146 @@ static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double sigma,
   *S = fit->texture * _dog_shape(s, fit->tau)
      + fit->self_similar * pow(s, (fit->beta - 2.0) * 0.5);
   *N = fit->noise * _dog_shape(s, 0.0);
+}
+
+// implementation-plan-4.md §1.2: _dog_shape(s,tau) is the exact 2D spatial
+// covariance of white noise (tau=0), or white noise pre-smoothed to
+// correlation length sqrt(tau), filtered by a DoG whose two Gaussian radii
+// are fixed one ladder rung apart (s, k2*s) -- it is a special case of the
+// general two-radius covariance below, which needs no rung: for any pair of
+// Gaussian blur radii (sigma_a, sigma_b), Var[blur_a - blur_b] of that same
+// field is K*[1/(sigma_a^2+tau) + 1/(sigma_b^2+tau)] - 4K/(sigma_a^2+
+// sigma_b^2+2*tau), and matching this at sigma_b = k2*sigma_a against
+// _dog_shape's own closed form fixes K = 1/2 -- verified by direct
+// arithmetic and against raw numeric quadrature of the filter
+// (picker-regression/harness_v2/dig_calibration_scale.py's own approach,
+// generalised off the rung pair) to double-precision agreement. sa, sb are
+// s = sigma^2, matching _dog_shape's own convention.
+static inline double _ct_dog_shape2(const double sa, const double sb, const double tau)
+{
+  return 0.5 * (1.0 / (sa + tau) + 1.0 / (sb + tau)) - 2.0 / (sa + sb + 2.0 * tau);
+}
+
+// ladder rung ratio (2^(2/CT_SCALES_PER_OCTAVE), CT_SCALES_PER_OCTAVE = 3),
+// matching _dog_shape's own local k2 -- needed again below since
+// _ct_selfsimilar_shape2 has no single fixed rung to work from.
+#define CT_LADDER_K2 1.5874010519681994
+
+static inline double _ct_xlnx(const double x)
+{
+  return (x <= 0.0) ? 0.0 : x * log(x);
+}
+
+// implementation-plan-4.md §1.2: the self-similar analogue of
+// _ct_dog_shape2 above. fit->self_similar multiplies pow(s,(beta-2)/2) in
+// _ct_fit_eval, but that coefficient is not the self-similar spectrum's own
+// amplitude C0 -- integrating a w^-beta 2D spectrum against a DoG(sigma_a,
+// sigma_b) filter gives C0 * (1/2)*Gamma(1-beta/2) * bracket(sigma_a,
+// sigma_b,beta), bracket(a,b,e) = a^e+b^e-2*((a+b)/2)^e, e=(beta-2)/2 -- and
+// _fit_spectrum solved for the coefficient of pow(s,(beta-2)/2), which is
+// C0*(1/2)*Gamma(1-beta/2)*bracket(1,k2,beta) (bracket(.) factors out
+// s^e exactly, leaving an s-independent, beta-dependent shape term). Dividing
+// fit->self_similar by that same shape term recovers C0*(1/2)*Gamma(...)
+// without ever evaluating Gamma (it cancels), then multiplying by the
+// module band's own bracket(sigma_a,sigma_b,beta) gives that band's
+// predicted energy directly.
+//
+// bracket(a,b,e) is a difference from the linear interpolant of a^e, b^e at
+// their mean, so it is exactly zero -- not asymptotically, algebraically --
+// at e = 0 (beta = 2, a constant is trivially its own linear interpolant)
+// and at e = 1 (beta = 4, ditto for a linear function): both real bounds
+// inside [CT_FIT_BETA_MIN, CT_FIT_BETA_MAX], and beta = 4 is not a
+// theoretical edge -- flat/ambiguous content pegs there exactly
+// (implementation-plan-3.md §8.1). Both branches below are the L'Hopital
+// limit of bracket_general/bracket_rung at that e, i.e. their derivatives'
+// ratio; sigma_a = 0 (the shelf band) is excluded by the caller before this
+// is ever reached, since its own continuum limit does not converge here
+// regardless of beta (see _ct_predict_shelf_energy). Verified end-to-end
+// (predicted band energy against raw numeric quadrature, log-spaced through
+// both e = 0 and e = 1) to agree to <1e-9 relative error away from the
+// singularities and to remain continuous through them.
+static double _ct_selfsimilar_shape2(const double sa, const double sb, const double beta)
+{
+  const double e = (beta - 2.0) * 0.5;
+  const double k2 = CT_LADDER_K2;
+
+  if(fabs(e) < 1e-4)  // beta near 2.0
+  {
+    const double num = log(sa * sb) - 2.0 * log((sa + sb) * 0.5);
+    const double den = log(k2) - 2.0 * log((1.0 + k2) * 0.5);
+    return num / den;
+  }
+  if(fabs(e - 1.0) < 1e-4)  // beta near 4.0
+  {
+    const double num = _ct_xlnx(sa) + _ct_xlnx(sb) - (sa + sb) * log((sa + sb) * 0.5);
+    const double den = k2 * log(k2) - (1.0 + k2) * log((1.0 + k2) * 0.5);
+    return num / den;
+  }
+
+  const double num = pow(sa, e) + pow(sb, e) - 2.0 * pow((sa + sb) * 0.5, e);
+  const double den = 1.0 + pow(k2, e) - 2.0 * pow((1.0 + k2) * 0.5, e);
+  return num / den;
+}
+
+#define CT_CALIBRATION_QUAD_POINTS 200
+
+// implementation-plan-4.md §1.2: the finest *measured* band (sigma_a == 0,
+// i.e. d-space k == 0 in _query_band_energy -- it has absorbed whatever
+// detail is finer than its own outer boundary, per modify_roi_in's
+// "unresolvable fine tail: drop") is a shelf, not a bump: its own transfer
+// never rolls off at the fine end, so unlike every interior band its
+// continuum energy does not converge -- _ct_dog_shape2 and
+// _ct_selfsimilar_shape2 above both divide by zero or go unphysical at
+// sigma_a = 0 (dig_calibration_scale.py's own second table: 8 to 90x the
+// interior bandwidth factor, moving with both beta and sigma_0, no closed
+// form fits it). Integrated numerically instead, to the frame-relative
+// pixel Nyquist w = pi*long_edge, log-spaced from wmax*1e-4 since the
+// transfer's own rolloff scale (~1/sigma_b) and the cutoff can be many
+// octaves apart. Verified against direct scipy quadrature to <0.1% relative
+// error at CT_CALIBRATION_QUAD_POINTS, including at the realistic extreme
+// (a 6000px long edge, the finest surviving band at 7px).
+static double _ct_predict_shelf_energy(const _ct_fit_t *const fit,
+                                       const double sb, const double wmax)
+{
+  const double wmin = wmax * 1e-4;
+  const double du = log(wmax / wmin) / (double)(CT_CALIBRATION_QUAD_POINTS - 1);
+
+  double total = 0.0, prev = 0.0;
+  for(int i = 0; i < CT_CALIBRATION_QUAD_POINTS; i++)
+  {
+    const double w = wmin * exp((double)i * du);
+    const double H = 1.0 - exp(-sb * w * w * 0.5);
+    const double psd = fit->noise
+                      + fit->texture * exp(-fit->tau * w * w)
+                      + fit->self_similar * pow(w, -fit->beta);
+    // H^2 * P(w) * w [2D polar measure] * w [dw = w du, log-spaced grid]
+    const double g = H * H * psd * w * w;
+    if(i > 0) total += 0.5 * (g + prev) * du;
+    prev = g;
+  }
+  return total;
+}
+
+// implementation-plan-4.md §1.2: predicted energy for a module band
+// spanning (sigma_a, sigma_b], frame-relative, against the fitted spectrum
+// -- replaces _ct_fit_eval's single-point sample, which implicitly assumed
+// the band was as narrow as the ladder rungs the fit was solved against
+// (2^(1/CT_SCALES_PER_OCTAVE), a third of an octave) rather than the
+// module's own full octave.
+static double _ct_predict_band_energy(const _ct_fit_t *const fit,
+                                      const double sigma_a, const double sigma_b,
+                                      const double long_edge)
+{
+  const double sb = sigma_b * sigma_b;
+
+  if(sigma_a <= 0.0)
+    return _ct_predict_shelf_energy(fit, sb, M_PI * fmax(long_edge, 1.0));
+
+  const double sa = sigma_a * sigma_a;
+  const double N = fit->noise * _ct_dog_shape2(sa, sb, 0.0);
+  const double A = fit->texture * _ct_dog_shape2(sa, sb, fit->tau);
+  const double C = fit->self_similar * _ct_selfsimilar_shape2(sa, sb, fit->beta);
+  return N + A + C;
 }
 
 // §2.5: which of research.md §5.6's target shapes a fit earns. TEXTURE is
@@ -2215,23 +2411,17 @@ static double _ct_band_coverage(const double lambda, const float *const restrict
 // protection). A curve fitted from the linear ladder therefore over-promises
 // wherever the picked box has real local contrast, unless the projection
 // above is told how much of its own H_k a band actually delivers.
-//
-// research.md §2.2's peak wavelength of H_k = HP_k - HP_{k-1}, for an
-// octave-spaced ladder; the finest band (sigma_km1 = 0) is a shelf, not a
-// bump (same section), so its own half-amplitude wavelength stands in.
-static double _band_peak_lambda(const double sigma_km1, const double sigma_k)
-{
-  if(sigma_km1 <= 0.0) return 2.0 * M_PI * sigma_k / sqrt(2.0 * log(2.0));
-  const double num = 2.0 * (sigma_k * sigma_k - sigma_km1 * sigma_km1);
-  const double den = log((sigma_k * sigma_k) / (sigma_km1 * sigma_km1));
-  return M_PI * sqrt(num / den);
-}
 
-// implementation-plan-2.md §5.1: peak wavelength of an octave-spaced H_k
-// pair, i.e. _band_peak_lambda specialised to sigma_k = 2*sigma_km1 --
-// pi*sqrt(6/ln 4). The finest band (sigma_km1 = 0) is a shelf, not a bump
-// (_band_peak_lambda's own comment), so it will not land exactly on its
-// node under the formula below; that is correct and should be left alone.
+// implementation-plan-2.md §5.1: peak wavelength of an octave-spaced H_k =
+// HP_k - HP_{k-1} pair (sigma_k = 2*sigma_km1) -- pi*sqrt(6/ln 4). The finest
+// band (sigma_km1 = 0) is a shelf, not a bump (research.md §2.2), so it will
+// not land exactly on its node under the formula below; that is correct and
+// should be left alone. implementation-plan-4.md §1.2: the general (any
+// sigma_km1, sigma_k, not only an octave pair) peak-wavelength formula this
+// specialises from used to be needed here to point-sample the fit at a
+// band's own peak; §1.2 replaced that point sample with an integral over the
+// band's whole transfer, so the general form is gone and this specialised
+// constant is what remains, used only to anchor the graph's own x axis.
 #define CT_BAND_PEAK_FACTOR 6.5357852
 
 // map a wavelength (in some roi's own pixels, or a frame-relative fraction
@@ -2393,12 +2583,23 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
 #define CT_CALIBRATION_MAX 3.0
 #define CT_CALIBRATION_FLOOR 1e-9
 
+// implementation-plan-4.md §1.2's cheap alternative: E_module,k / E_rung is
+// flat to +-1.5% across the whole [CT_FIT_BETA_MIN, CT_FIT_BETA_MAX] range
+// for an interior (octave-wide) band against the ladder's own third-octave
+// rung (picker-regression/harness_v2/dig_calibration_scale.py's first
+// table: 8.35-8.56, this value near its midpoint). Used only by
+// CT_CAL_MODE_CONSTANT; CT_CAL_MODE_MODEL computes the same quantity per
+// band, per fit, from _ct_predict_band_energy instead.
+#define CT_CALIBRATION_BANDWIDTH 8.38
+
 static void _compute_band_calibration(dt_iop_module_t *self, const int *const box,
                                       const float long_edge,
                                       const _ct_fit_t *const fit,
+                                      const dt_iop_contrast_calibration_mode_t mode,
                                       float *const restrict calibration)
 {
   for(int k = 0; k < CT_BANDS; k++) calibration[k] = 1.0f;
+  if(mode == CT_CAL_MODE_OFF) return;
 
   double e_module[CT_BANDS], sigma_d[CT_BANDS];
   int nbands = 0;
@@ -2421,22 +2622,32 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
 
   for(int k = 0; k < nbands; k++)
   {
-    const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1];
-    const double lambda_peak = _band_peak_lambda(sigma_km1, sigma_d[k]);
-    // implementation-plan-2.md §3.4/§4.2: _ct_fit_eval now takes fit's own
-    // (frame-relative, since §4.2) sigma convention, not lambda_peak
-    // directly (which would silently reintroduce the old 2*pi mismatch) and
-    // not the band's own boundary sigma_d[k] (a different quantity -- the
-    // boundary, not the peak). sigma_d[] is physical (pixels of the same
-    // roi_in the ladder was built from), same as lambda_peak, so it needs
-    // the same /long_edge conversion §4.2 applies to the ladder's own sigma.
-    const double sigma_peak = lambda_peak / CT_SIGMA_TO_LAMBDA / (double)long_edge;
+    // implementation-plan-4.md §1.2: d-space k == 0 is the finest *measured*
+    // band regardless of offset -- it has absorbed whatever detail is finer
+    // than its own outer boundary (modify_roi_in's "unresolvable fine tail:
+    // drop"), so it is a shelf, not a bump, and its continuum energy runs to
+    // the pixel Nyquist rather than converging. CT_CAL_MODE_MODEL integrates
+    // it directly (_ct_predict_band_energy); CT_CAL_MODE_CONSTANT's single
+    // bandwidth factor does not apply to it at all (dig_calibration_scale.py:
+    // 8 to 90x, moving with both beta and sigma_0) and leaves it at its
+    // neutral default instead of guessing.
+    if(k == 0 && mode == CT_CAL_MODE_CONSTANT) continue;
 
-    double S, N;
-    _ct_fit_eval(fit, sigma_peak, &S, &N);
-    const double e_predicted = fmax(S + N, CT_CALIBRATION_FLOOR);
+    double r;  // energy ratio, E_module,k / E_predicted,k
+    if(mode == CT_CAL_MODE_CONSTANT)
+    {
+      r = e_module[k] / CT_CALIBRATION_BANDWIDTH;
+    }
+    else  // CT_CAL_MODE_MODEL
+    {
+      const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1] / (double)long_edge;
+      const double sigma_k = sigma_d[k] / (double)long_edge;
+      const double e_predicted =
+        fmax(_ct_predict_band_energy(fit, sigma_km1, sigma_k, long_edge), CT_CALIBRATION_FLOOR);
+      r = e_module[k] / e_predicted;
+    }
 
-    calibration[offset + k] = (float)CLAMP(e_module[k] / e_predicted, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
+    calibration[offset + k] = (float)CLAMP(r, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
   }
 }
 
@@ -2995,7 +3206,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // this same box, last time the module's own bands were measured there --
   // uncalibrated (all 1s) if that measurement isn't available yet.
   float calibration[CT_BANDS];
-  _compute_band_calibration(self, box, long_edge, &fit, calibration);
+  _compute_band_calibration(self, box, long_edge, &fit, p->calibration_mode, calibration);
 
   // §4.4: the envelope the target curve itself was built to -- TEXTURE/
   // DETAIL's is 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own
@@ -3975,6 +4186,24 @@ void gui_init(dt_iop_module_t *self)
        "fast: the coarsest bands run on a lower-resolution pyramid instead,\n"
        "about 30% cheaper. can soften dense fine texture (fur, hair) very\n"
        "slightly -- leave off unless you need the speed."));
+
+  // implementation-plan-4.md §1.2: which formula the *next* pick uses to
+  // correct the linear ladder for how much of it eigf actually delivers.
+  // GUI-only -- it shapes what a pick writes into the band sliders above,
+  // not how a committed band[] is rendered, so it does not belong on the
+  // history-relevant controls above this one, but it is still a real param
+  // (not a dt_conf toggle) so a pick's calibration stays reproducible.
+  g->calibration_mode = dt_bauhaus_combobox_from_params(self, "calibration_mode");
+  gtk_widget_set_tooltip_text(g->calibration_mode,
+     _("how a pick corrects the ladder for what eigf's edge-awareness actually\n"
+       "lets through, band by band.\n"
+       "bandwidth constant: a single measured factor, right to within 2% on\n"
+       "ordinary content, uncalibrated at the very finest band.\n"
+       "spectral model: integrates the pick's own fitted spectrum over each\n"
+       "band's real width instead of one factor for all of them -- the finest\n"
+       "band included. more work per pick, no known case where it does worse.\n"
+       "off: apply the linear ladder uncorrected, as before this correction\n"
+       "existed."));
 
   g->edge_protection = dt_bauhaus_slider_from_params(self, "edge_protection");
   dt_bauhaus_slider_set_soft_range(g->edge_protection, -2.0, 2.0);
