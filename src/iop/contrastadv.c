@@ -4206,18 +4206,26 @@ void gui_init(dt_iop_module_t *self)
   gtk_widget_set_tooltip_text(g->scale_shift,
      _("shifts every band's node together, finer or coarser.\n"
        "half a step moves the whole ladder by half an octave."));
+  // implementation-plan-4.md §6.1: this quad no longer moves scale_shift --
+  // it never has, since plan-3 Phase 6 decided against ladder placement and
+  // routed the picker through band[]/gain_local_contrast instead (§6.2's own
+  // comment below). The old wording promised a "shift the ladder" effect
+  // this control does not have, and warned about an outcome
+  // (scale_shift-less picks "coming back at the finest setting") that cannot
+  // occur -- what a noisy pick actually produces is the dt_control_log
+  // warning quoted below.
   dt_bauhaus_widget_set_quad_tooltip
     (g->scale_shift,
-     _("pick an area: measure how large the texture in it actually is, and\n"
-       "shift the ladder so a node lands on that size.\n"
+     _("pick an area: measure the texture in it and set each band's gain\n"
+       "from what was found.\n"
        "click to use the whole frame, then drag on the image to work from the\n"
        "subject that matters instead. a small box cannot report structure\n"
        "larger than itself, so pick over as much of the texture as you want\n"
        "counted.\n"
        "an area with nothing in it to enhance -- clear sky, an out-of-focus\n"
        "background -- is declined rather than guessed at. if a pick over deep\n"
-       "shadow comes back at the finest setting it is reading sensor noise;\n"
-       "raise the noise bias below and pick again."));
+       "shadow logs \"looks like noise\", raise the noise bias below and pick\n"
+       "again."));
 
   g->decomposition = dt_bauhaus_combobox_from_params(self, "decomposition");
   gtk_widget_set_tooltip_text(g->decomposition,
