@@ -2404,6 +2404,21 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
   int nbands = 0;
   if(!_query_band_energy(self, box, e_module, sigma_d, &nbands)) return;
 
+  // implementation-plan-4.md §1.1: _query_band_energy answers in d-space --
+  // index 0 is the finest band that *survived* modify_roi_in on the pass that
+  // built the tables -- while _project_to_bands indexes the full nine-node
+  // ladder, index 0 being the finest node whether it survived or not. d index
+  // i is param index nbands-1-i, hence projection index CT_BANDS-nbands+i.
+  // The two coincide only at nbands == CT_BANDS, which the preview pipe (the
+  // only pipe that builds these tables) essentially never reaches: its input
+  // is capped at DT_MIPMAP_3/4 (mipmap_cache.c), so nbands is 7 at the default
+  // 1440 px long edge and 8 with highres_preview_mip. The calibration was
+  // being applied two bands too fine, leaving the coarsest two -- where eigf
+  // saturates most and the correction is most needed -- uncalibrated.
+  // nbands is MIN(g->band_nbands, CT_BANDS) so offset >= 0 by construction;
+  // clamped rather than trusted.
+  const int offset = MAX(0, CT_BANDS - nbands);
+
   for(int k = 0; k < nbands; k++)
   {
     const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1];
@@ -2421,7 +2436,7 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
     _ct_fit_eval(fit, sigma_peak, &S, &N);
     const double e_predicted = fmax(S + N, CT_CALIBRATION_FLOOR);
 
-    calibration[k] = (float)CLAMP(e_module[k] / e_predicted, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
+    calibration[offset + k] = (float)CLAMP(e_module[k] / e_predicted, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
   }
 }
 
