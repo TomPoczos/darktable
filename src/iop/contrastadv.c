@@ -2103,6 +2103,30 @@ void commit_params(dt_iop_module_t *self,
   d->feathering_base = default_feathering * powf(2.0f, -p->edge_protection) / (p->filter_iterations * p->filter_iterations);
 }
 
+// implementation-plan-4.md §6.3 (Issue I.5): the graph's tooltip depends only
+// on g->nbands, so it belongs where g->nbands changes -- not rebuilt on every
+// _area_draw expose, the one place in this file that used to set a tooltip
+// from inside a draw handler (atrous.c/colorequal.c/toneequal.c all set
+// theirs once in gui_init).
+static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
+{
+  gtk_widget_set_tooltip_text
+    (GTK_WIDGET(g->area),
+     g->nbands < CT_BANDS
+     ? _("drag a node to set its band's gain; double-click to reset it;\n"
+         "ctrl+click to visualize that band's own detail texture;\n"
+         "middle-click for the plain slider list.\n"
+         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
+         "dashed nodes were extrapolated, not measured, by the last pick.\n"
+         "the shaded bands on the right are too fine to resolve at the\n"
+         "current zoom level and have no effect until you zoom in.")
+     : _("drag a node to set its band's gain; double-click to reset it;\n"
+         "ctrl+click to visualize that band's own detail texture;\n"
+         "middle-click for the plain slider list.\n"
+         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
+         "dashed nodes were extrapolated, not measured, by the last pick."));
+}
+
 // redraw the graph once a pipe has actually run, so its stripe shading
 // (g->nbands, published from process() above) and node positions track
 // what just got computed rather than the last GUI edit (§1.5; atrous.c's
@@ -2111,7 +2135,10 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = self->gui_data;
   if(g && !DT_IN_GUI_UPDATE() && self->enabled && self->expanded)
+  {
+    _area_set_tooltip(g);
     gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3667,22 +3694,6 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   _graph_geometry(widget, &inset, &width, &height);
   if(width <= 0 || height <= 0) return FALSE;
 
-  gtk_widget_set_tooltip_text
-    (widget,
-     g->nbands < CT_BANDS
-     ? _("drag a node to set its band's gain; double-click to reset it;\n"
-         "ctrl+click to visualize that band's own detail texture;\n"
-         "middle-click for the plain slider list.\n"
-         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
-         "dashed nodes were extrapolated, not measured, by the last pick.\n"
-         "the shaded bands on the right are too fine to resolve at the\n"
-         "current zoom level and have no effect until you zoom in.")
-     : _("drag a node to set its band's gain; double-click to reset it;\n"
-         "ctrl+click to visualize that band's own detail texture;\n"
-         "middle-click for the plain slider list.\n"
-         "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
-         "dashed nodes were extrapolated, not measured, by the last pick."));
-
   GtkAllocation allocation;
   gtk_widget_get_allocation(widget, &allocation);
 
@@ -4164,6 +4175,7 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_connect_motion(g->area, _area_motion, _area_motion, _area_leave, self);
   dt_gui_connect_scroll(g->area, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
                                | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE, _area_scrolled, self);
+  _area_set_tooltip(g);  // §6.3: initial state, until the first _ui_pipe_done updates it
 
   // one slider per band, labeled by the node's nominal size -- computed
   // rather than nine near-identical translated strings, per
