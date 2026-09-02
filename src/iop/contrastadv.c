@@ -2570,17 +2570,25 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
   return have_data;
 }
 
-// r_k = E_module,k / E_predicted,k, clamped against a near-empty band's
-// E_predicted blowing the ratio up rather than trusted at face value --
-// this is an empirical correction, not a physical law, and both the box and
-// the fit are noisy. Physically eigf never delivers *more* than the linear
-// model predicts (1 - a = eps/(v+eps) <= 1 always), but the fit's own beta
-// need not exactly match the module's own bands, so a little headroom above
-// 1 is left rather than hard-clamped there. calibration defaults every band
-// to 1 (uncalibrated) first, so a stale or missing table just skips the
+// calibration[k] = sqrt(E_module,k / E_predicted,k), clamped against a
+// near-empty band's E_predicted blowing the ratio up rather than trusted at
+// face value -- this is an empirical correction, not a physical law, and
+// both the box and the fit are noisy. calibration defaults every band to 1
+// (uncalibrated) first, so a stale or missing table just skips the
 // refinement instead of failing the pick.
+//
+// implementation-plan-4.md §1.3: _project_to_bands multiplies calibration[k]
+// onto H_k, an *amplitude* column (its RHS is g_target - 1, a gain) -- so
+// what multiplies it has to be an amplitude fraction, not the energy ratio
+// above. sqrt() is the conversion; without it a band delivering 62% of its
+// amplitude (research.md §5.8's +-0.5 EV texture row) read as 0.38 and the
+// solve asked for 2.6x the correction it should have. In amplitude terms a
+// physical bound exists -- 1 - a = eps/(v+eps) <= 1 always -- so the upper
+// bound sits just above 1 (headroom for the fit's own beta not exactly
+// matching a band, not a hard clamp there) rather than at the old energy-
+// space value tuned against a ratio whose neutral point was never 1.
 #define CT_CALIBRATION_MIN 0.05
-#define CT_CALIBRATION_MAX 3.0
+#define CT_CALIBRATION_MAX 1.2
 #define CT_CALIBRATION_FLOOR 1e-9
 
 // implementation-plan-4.md §1.2's cheap alternative: E_module,k / E_rung is
@@ -2647,7 +2655,7 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
       r = e_module[k] / e_predicted;
     }
 
-    calibration[offset + k] = (float)CLAMP(r, CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
+    calibration[offset + k] = (float)CLAMP(sqrt(fmax(r, 0.0)), CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
   }
 }
 
