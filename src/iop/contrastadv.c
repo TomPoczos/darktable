@@ -150,7 +150,7 @@ DT_MODULE_INTROSPECTION(3, dt_iop_contrast_params_t)
 // factor is not constant below sigma ~= 0.8, so pre-dividing would need a
 // per-sigma inversion and would still land the finest rung on the part of the
 // curve where it is least uniform. Not applied to sigmas that have no
-// dt_gaussian_blur behind them -- see _preset_nominal_sigma.
+// dt_gaussian_blur behind them -- see _ct_band_sigma.
 #define CT_GAUSSIAN_SIGMA_FACTOR 1.1799
 
 // implementation-plan-2.md §3.1: peak wavelength of the DoG between sigma and
@@ -2384,6 +2384,16 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
 // scale_shift -- the band ladder is frame-relative by construction (node
 // k's nominal wavelength is S * 2^-(D0+k+shift)), so no pixel term is
 // needed here the way modify_roi_in's own sigma[] needs one.
+//
+// implementation-plan-3.md §1.3/implementation-plan-4.md §5.2:
+// CT_GAUSSIAN_SIGMA_FACTOR does **not** belong here, and the next person to
+// find it will want to sprinkle it in. This sigma is pure geometry -- a
+// detail level turned into a frame-relative size, with no dt_gaussian_blur
+// behind it to have widened anything. The correction it eventually drives is
+// applied by fast_eigf_surface_blur at d->sigma[k], which is a guided
+// filter, not Deriche's smoother, so it does not inherit the factor either.
+// _build_ladder's two dt_gaussian_init calls are the module's only ones, and
+// its rung labels are the only thing the factor applies to.
 static void _ct_band_sigma(float *const restrict sigma, const float scale_shift)
 {
   int idx = 0;
@@ -2967,25 +2977,6 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
 // pixel-discretisation term negligible) was never necessary, and neither
 // was the term itself. scale_shift = 0: presets sit on the standard ladder.
 //
-// implementation-plan-3.md §1.3: CT_GAUSSIAN_SIGMA_FACTOR does **not** belong
-// here, and the next person to find it will want to sprinkle it in. These
-// sigmas are pure geometry -- a detail level turned into a frame-relative
-// size, with no dt_gaussian_blur behind them to have widened anything --
-// exactly like color_picker_apply's own band sigma[]. The correction they
-// eventually drive is applied by fast_eigf_surface_blur at d->sigma[k], which
-// is a guided filter, not Deriche's smoother, so it does not inherit the
-// factor either. _build_ladder's two dt_gaussian_init calls are the module's
-// only ones, and its rung labels are the only thing the factor applies to.
-static void _preset_nominal_sigma(float *const restrict sigma)  // CT_BANDS, finest-first
-{
-  int idx = 0;
-  for(int k = CT_BANDS - 1; k >= 0; k--)
-  {
-    const double D = CT_BAND_D0 + k + 0.5;
-    sigma[idx++] = (float)exp2(-(D + 1.0));
-  }
-}
-
 // project target[] (evaluated on lambda_grid[]) onto the nine bands and
 // write the result into p->band[], coarsest-first -- the same reversal
 // color_picker_apply does at the end of its own projection. gain_lo/gain_hi
@@ -3029,15 +3020,15 @@ void init_presets(dt_iop_module_so_t *self)
 
   // implementation-plan-2.md §5.2/§4.3: sigma-native grid, frame-relative
   // (long edge = 1.0 throughout -- _spectrum_lambda_to_x's roi_long_edge
-  // argument, and _preset_nominal_sigma above), matching the picker's own
-  // §4.3 grid exactly -- implementation-plan-3.md §3.1's coarse trim
-  // (see color_picker_apply's own grid comment) included, since §3.3 depends
-  // on the two staying identical.
+  // argument, and _ct_band_sigma above with scale_shift = 0), matching the
+  // picker's own §4.3 grid exactly -- implementation-plan-3.md §3.1's coarse
+  // trim (see color_picker_apply's own grid comment) included, since §3.3
+  // depends on the two staying identical.
   float sigma[CT_BANDS];
-  _preset_nominal_sigma(sigma);
+  _ct_band_sigma(sigma, 0.0f);
   double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
-  const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
-  const double hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
+  double lo, hi;
+  _ct_grid_bounds(sigma, &lo, &hi);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
     sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
