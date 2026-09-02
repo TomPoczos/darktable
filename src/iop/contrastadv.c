@@ -2211,13 +2211,19 @@ static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
          "middle-click for the plain slider list.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
+         "the thin dashed curve is the *effective* gain after local contrast\n"
+         "is applied; a red node/number means that band's effective gain has\n"
+         "gone at or below zero, inverting its detail.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
-         "dashed nodes were extrapolated, not measured, by the last pick."));
+         "dashed nodes were extrapolated, not measured, by the last pick.\n"
+         "the thin dashed curve is the *effective* gain after local contrast\n"
+         "is applied; a red node/number means that band's effective gain has\n"
+         "gone at or below zero, inverting its detail."));
 }
 
 // redraw the graph once a pipe has actually run, so its stripe shading
@@ -3635,6 +3641,17 @@ static float _graph_gain_to_yfrac(const float gain)
   return CLAMP(0.5f + log2f(fmaxf(gain, 1e-6f)) / (2.0f * CT_GRAPH_LOG_HALF), 0.0f, 1.0f);
 }
 
+// implementation-plan-6.md §6 Phase 4.1: the node position is the *shape*
+// the picker wrote (or the user hand-drew) -- process() then multiplies its
+// deviation from 1 by the master gain once more (§2.2's `correction *= gate
+// * gain_local_contrast`), so what actually reaches the pixels is this,
+// which can go negative (inverting that octave's detail) even on a shape
+// that itself never goes below zero.
+static float _graph_effective_gain(const float band_gain, const float master)
+{
+  return 1.0f + master * (band_gain - 1.0f);
+}
+
 static void _graph_curve_from_params(dt_draw_curve_t *curve,
                                      const dt_iop_contrast_params_t *const p,
                                      const _ct_axis_t *const axis)
@@ -4026,7 +4043,9 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   // background, the last pick's own spectrum + fitted model on top of it.
   _draw_spectrum_overlay(cr, self, width, height, &axis);
 
-  // 5. the curve: monotone cubic through the nine nodes
+  // 5. the curve: monotone cubic through the nine nodes -- this is the
+  // *shape*, i.e. exactly what dragging a node edits (p->band[k]), not what
+  // reaches the pixels once the master gain is applied (see 5b below).
   _graph_curve_from_params(g->curve, p, &axis);
   float xs[CT_GRAPH_RES], ys[CT_GRAPH_RES];
   dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, xs, ys);
@@ -4036,6 +4055,33 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   for(int i = 1; i < CT_GRAPH_RES; i++)
     cairo_line_to(cr, i * width / (float)(CT_GRAPH_RES - 1), height * (1.0f - ys[i]));
   cairo_stroke(cr);
+
+  // 5b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
+  // 1 + master*(shape-1) -- what §1's bug report actually judged. Dashed,
+  // since it's derived from the shape curve rather than directly editable
+  // (this file's existing convention: solid = editable/measured, dashed =
+  // derived -- e.g. the spectrum overlay's fitted model below). Skipped at
+  // master == 1 exactly, where it would trace the shape curve on top of
+  // itself and add nothing to look at. g->curve is scratch state private to
+  // this draw call (nothing after this point reads it), so reusing it here
+  // rather than allocating a second curve is safe.
+  if(p->gain_local_contrast != 1.0f)
+  {
+    for(int k = 0; k < CT_BANDS; k++)
+      dt_draw_curve_set_point(g->curve, k, _graph_node_x(k, &axis),
+                              _graph_gain_to_yfrac(_graph_effective_gain(p->band[k], p->gain_local_contrast)));
+    float exs[CT_GRAPH_RES], eys[CT_GRAPH_RES];
+    dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, exs, eys);
+    const double eff_dashes[2] = { DT_PIXEL_APPLY_DPI(3.0), DT_PIXEL_APPLY_DPI(2.0) };
+    cairo_set_dash(cr, eff_dashes, 2, 0.0);
+    set_color(cr, darktable.bauhaus->graph_fg);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+    cairo_move_to(cr, 0, height * (1.0f - eys[0]));
+    for(int i = 1; i < CT_GRAPH_RES; i++)
+      cairo_line_to(cr, i * width / (float)(CT_GRAPH_RES - 1), height * (1.0f - eys[i]));
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
+  }
 
   // 6. node bars + bullets
   //
@@ -4065,6 +4111,16 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     const gboolean extrapolated =
       have_pick_window && (node_raw < window_lo_raw || node_raw > window_hi_raw);
 
+    // implementation-plan-6.md §6 Phase 4.1: a node sitting innocently inside
+    // the envelope (e.g. the EQUALIZE floor at 0.30) can still have master
+    // push its *effective* gain at or below zero, inverting that octave's
+    // detail (§2.2) -- the node bullet itself is what a user actually looks
+    // at when judging a curve, so this is marked here, not only on the 5b
+    // overlay curve, and it overrides the extrapolated color (not the dash,
+    // which is a separate question per §4.5).
+    const float effective_gain = _graph_effective_gain(p->band[k], p->gain_local_contrast);
+    const gboolean negative_effective = effective_gain <= 0.0f;
+
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
     set_color(cr, darktable.bauhaus->color_fill);
     dt_draw_line(cr, xn, baseline_y, xn, yn);
@@ -4077,8 +4133,11 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     {
       const double dashes[2] = { DT_PIXEL_APPLY_DPI(1.5), DT_PIXEL_APPLY_DPI(1.5) };
       cairo_set_dash(cr, dashes, 2, 0.0);
-      set_color(cr, darktable.bauhaus->graph_border);
     }
+    if(negative_effective)
+      cairo_set_source_rgba(cr, 0.8, 0.1, 0.1, 1.0);
+    else if(extrapolated)
+      set_color(cr, darktable.bauhaus->graph_border);
     else
       set_color(cr, darktable.bauhaus->graph_fg);
     cairo_stroke_preserve(cr);
@@ -4097,6 +4156,29 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
       set_color(cr, darktable.bauhaus->graph_fg);
       cairo_arc(cr, xn, yn, DT_PIXEL_APPLY_DPI(7.5), 0.0, 2.0 * M_PI);
       cairo_stroke(cr);
+    }
+
+    // implementation-plan-6.md §6 Phase 4.1's acceptance bullet is explicit:
+    // a railed node must read as *negative*, not as a node sitting innocently
+    // on its rail -- the log axis can't place a negative y at all (§4.1
+    // above already collapses it to the floor), so the actual signed number
+    // is printed at the floor instead, in the same warning color as the node.
+    if(negative_effective)
+    {
+      char eff_buf[16];
+      snprintf(eff_buf, sizeof(eff_buf), "%.2f", (double)effective_gain);
+      PangoFontDescription *eff_desc = dt_gui_get_font();
+      pango_font_description_set_absolute_size(eff_desc, 0.08 * height * PANGO_SCALE);
+      PangoLayout *eff_layout = pango_cairo_create_layout(cr);
+      pango_layout_set_font_description(eff_layout, eff_desc);
+      cairo_set_source_rgba(cr, 0.8, 0.1, 0.1, 1.0);
+      pango_layout_set_text(eff_layout, eff_buf, -1);
+      PangoRectangle eff_ink;
+      pango_layout_get_pixel_extents(eff_layout, &eff_ink, NULL);
+      cairo_move_to(cr, xn - eff_ink.width / 2.0, height - eff_ink.height - DT_PIXEL_APPLY_DPI(2));
+      pango_cairo_show_layout(cr, eff_layout);
+      g_object_unref(eff_layout);
+      pango_font_description_free(eff_desc);
     }
   }
 
