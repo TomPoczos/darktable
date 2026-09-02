@@ -2499,12 +2499,15 @@ static float _spectrum_lambda_to_x(const double lambda, const double roi_long_ed
   return CLAMP((float)_spectrum_lambda_to_raw_x(lambda, roi_long_edge), 0.0f, 1.0f);
 }
 
-// implementation-plan-3.md §4.2: the graph's x axis is the projection grid
-// -- x0/x1 are that grid's own raw-x bounds (coarse/screen-left and
-// fine/screen-right), sourced from the same _ct_band_sigma/_ct_grid_bounds
-// color_picker_apply and init_presets build their grid from, so the axis
-// and the grid it is drawn over can never disagree. If the grid's bounds
-// ever move, re-derive from here rather than copying new numbers in.
+// implementation-plan-3.md §4.2/implementation-plan-4.md §5.3: the graph's x
+// axis is the projection grid -- x0/x1 are that grid's own raw-x bounds
+// (coarse/screen-left and fine/screen-right), sourced from the same
+// _ct_band_sigma/_ct_grid_bounds color_picker_apply and init_presets now
+// call directly, so the axis and the grid it is drawn over cannot disagree.
+// Before plan-4 §5.1/§5.2 that was merely true by inspection -- both callers
+// open-coded the same formulas beside their own copies of this comment, and
+// nothing enforced it. If the grid's bounds ever move, re-derive from here
+// rather than copying new numbers in.
 typedef struct _ct_axis_t { double x0, x1; } _ct_axis_t;
 
 static _ct_axis_t _graph_axis(const dt_iop_contrast_params_t *const p)
