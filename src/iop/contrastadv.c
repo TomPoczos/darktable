@@ -3198,14 +3198,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // permanently unreachable from a pick) and spanned 21 octaves, most of it
   // sub-pixel garbage.
   float sigma[CT_BANDS];
-  {
-    int idx = 0;
-    for(int k = CT_BANDS - 1; k >= 0; k--)
-    {
-      const double D = CT_BAND_D0 + k + 0.5 + p->scale_shift;
-      sigma[idx++] = (float)exp2(-(D + 1.0));  // sigma / long edge; diameter/2, no pixel term
-    }
-  }
+  _ct_band_sigma(sigma, p->scale_shift);
 
   // implementation-plan-2.md §4.3: dense log-sigma grid spanning the node
   // ladder itself, padded two octaves at the fine end (sigma[0]*0.25, none
@@ -3234,8 +3227,8 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // preset.
   double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID];
   double shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
-  const double lo = fmax((double)sigma[0], 1e-6) * 0.25;
-  const double hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
+  double lo, hi;
+  _ct_grid_bounds(sigma, &lo, &hi);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
   {
     sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
