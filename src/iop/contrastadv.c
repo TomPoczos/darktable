@@ -3187,11 +3187,27 @@ void init_presets(dt_iop_module_so_t *self)
 
   // "flatten spectrum": research.md §5.6's "equalize" mode, now also the
   // live picker's CT_TARGET_EQUALIZE (§8.1) -- same _target_curve, evaluated
-  // against a synthetic self-similar spectrum (beta = 2.4, research.md
-  // §5.3's typical measured slope; no sized texture) rather than any
-  // particular picked area's own fit, since a preset has no box to measure.
+  // against a synthetic self-similar spectrum (no sized texture) rather than
+  // any particular picked area's own fit, since a preset has no box to
+  // measure.
+  //
+  // Both constants below were re-derived (findings.md, "flatten spectrum"
+  // preset section) after Phase 7.3/§5.2 flagged the old beta = 2.4 as
+  // research.md §5.3's literature figure for *linear-radiance* power spectra
+  // applied to a ladder that measures log2 luminance -- never verified in
+  // this domain. beta = 2.75 is the median of Phase 2's refined-beta fits
+  // across twelve real log2-luminance crops (implementation-plan-3.md §2,
+  // 1.8-3.4 cluster). noise = 1.8e-10 replaces the old 0.02: measured
+  // directly (six real crops, self_similar/noise both fitted together) as
+  // the median noise/self_similar ratio at this struct's self_similar = 1.0
+  // reference scale -- the old value was ~8 orders of magnitude too large at
+  // that scale, which silently pinned wiener = S/(S+N) near 0 at every band
+  // but the coarsest two or three regardless of beta, so the preset's
+  // projected gains sat at the CT_EQUALIZE_GAIN_LO floor on nearly every
+  // band no matter what beta was set to -- the beta mismatch above was real
+  // but had no visible effect until this was fixed too.
   {
-    const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.4, .noise = 0.02,
+    const _ct_fit_t synthetic = { .self_similar = 1.0, .beta = 2.75, .noise = 1.8e-10,
                                   .texture = 0.0, .tau = 0.0 };
     // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
     // geometric mean, not the grid's -- see _target_curve's comment.
