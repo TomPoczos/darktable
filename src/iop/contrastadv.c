@@ -2468,6 +2468,21 @@ static double _ct_sigma_to_node(const double sigma)
 // three.
 #define CT_DEFAULT_PEAK 0.20
 
+// implementation-plan-6.md §6 Phase 2.5, decided: the shape's own natural
+// skirt at nodes 7-8 (the two finest, which a preview-scale ladder never
+// measures, §3.0) is left alone -- not tapered to zero. Decided by rendering
+// (per the plan's own instruction, not by argument): a raised-cosine taper
+// forcing shape to 0 over [6.5, 8.5] in node space, rendered as a real 9-band
+// override against the untapered curve on a 3000px crop of the dog's eye/fur
+// (the densest fine detail in either reported frame, and the frame R8's own
+// worry is about), differs from the untapered render by less than JPEG
+// quantisation noise -- an auto-levelled pixel-difference image shows no
+// structure at all, just uniform low-level noise. The reason it barely
+// registers: node 8 (the only band the taper meaningfully moves) is already
+// down to shape=0.169 (a 1.034 band gain) in the untapered curve, so the
+// taper's own maximum effect is removing a ~3% boost from one band. Tapering
+// would be a second free parameter (where the cosine starts/ends) bought for
+// a difference nobody can see -- simpler code wins.
 static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
                           const double *const restrict sigma_grid, const int m,
                           const double sigma_ref, const float scale_shift,
