@@ -2628,6 +2628,15 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
   // clamped rather than trusted.
   const int offset = MAX(0, CT_BANDS - nbands);
 
+  // implementation-plan-4.md §1.4: this is what turns the plan's own
+  // acceptance criteria into a measurement instead of an argument -- every
+  // dig_*.c driver calls _project_to_bands with calibration = NULL, so
+  // nothing offline ever exercised this path; a live pick with -d picker is
+  // the only way to read r_k, e_module,k and e_predicted,k off together.
+  dt_print(DT_DEBUG_PICKER,
+           "[contrastadv] calibration mode=%d nbands=%d offset=%d fit N=%.4g A=%.4g C=%.4g tau=%.4g beta=%.3f",
+           mode, nbands, offset, fit->noise, fit->texture, fit->self_similar, fit->tau, fit->beta);
+
   for(int k = 0; k < nbands; k++)
   {
     // implementation-plan-4.md §1.2: d-space k == 0 is the finest *measured*
@@ -2639,23 +2648,32 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
     // bandwidth factor does not apply to it at all (dig_calibration_scale.py:
     // 8 to 90x, moving with both beta and sigma_0) and leaves it at its
     // neutral default instead of guessing.
-    if(k == 0 && mode == CT_CAL_MODE_CONSTANT) continue;
+    if(k == 0 && mode == CT_CAL_MODE_CONSTANT)
+    {
+      dt_print(DT_DEBUG_PICKER, "[contrastadv]   k=%d (proj %d) shelf, left uncalibrated (CONSTANT mode)",
+               k, offset + k);
+      continue;
+    }
 
-    double r;  // energy ratio, E_module,k / E_predicted,k
+    double e_predicted, r;  // r = energy ratio, E_module,k / E_predicted,k
     if(mode == CT_CAL_MODE_CONSTANT)
     {
-      r = e_module[k] / CT_CALIBRATION_BANDWIDTH;
+      e_predicted = CT_CALIBRATION_BANDWIDTH;
+      r = e_module[k] / e_predicted;
     }
     else  // CT_CAL_MODE_MODEL
     {
       const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1] / (double)long_edge;
       const double sigma_k = sigma_d[k] / (double)long_edge;
-      const double e_predicted =
-        fmax(_ct_predict_band_energy(fit, sigma_km1, sigma_k, long_edge), CT_CALIBRATION_FLOOR);
+      e_predicted = fmax(_ct_predict_band_energy(fit, sigma_km1, sigma_k, long_edge), CT_CALIBRATION_FLOOR);
       r = e_module[k] / e_predicted;
     }
 
     calibration[offset + k] = (float)CLAMP(sqrt(fmax(r, 0.0)), CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
+
+    dt_print(DT_DEBUG_PICKER,
+             "[contrastadv]   k=%d (proj %d) e_module=%.4g e_predicted=%.4g r=%.4g calibration=%.4f",
+             k, offset + k, e_module[k], e_predicted, r, (double)calibration[offset + k]);
   }
 }
 
