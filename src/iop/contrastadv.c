@@ -1154,6 +1154,20 @@ static void _ladder_accumulate_blocks(const float *const restrict band,
 // point of accumulating it once per ladder rather than per pick -- because a
 // query can sum thousands of blocks and this is exactly the kind of
 // running sum that drifts in float.
+//
+// implementation-plan-4.md §8.1: measured, unchanged. _ladder_fill_cb/
+// _band_fill_cb narrow every published node to float regardless, so the
+// question is whether that narrowing (not this accumulation) loses anything
+// -- dig_sat_precision.c compared a box query straight off this table in
+// double against the same query through a float-narrowed copy, on real
+// preview-sized images. Ordinary boxes: unmeasurable (0.0000% at every size
+// from 2x2 blocks to the whole frame). A frame's own flattest block can be
+// close enough to mathematically flat that the four-corner float subtraction
+// catastrophically cancels -- one measured case came back a 1.7e9% relative
+// error, far past Issue J.1's own 10%+ guess -- but only because the true
+// answer was already ~5-6 orders of magnitude below anything a real pick
+// reports (and below CT_FLAT_ENERGY), so the wrong float value is still
+// harmlessly small in absolute terms, not mistakable for real texture.
 static void _ladder_build_sat(const double *const restrict blk,
                               const size_t bw, const size_t bh,
                               double *const restrict sat)
