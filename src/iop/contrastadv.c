@@ -188,15 +188,27 @@ typedef enum dt_iop_contrast_decomposition_t
 // band[] below, not how a committed band[] is rendered), kept as a real
 // param anyway so a pick's calibration is reproducible from history like
 // everything else it writes. MODEL is the per-band closed form/quadrature;
-// CONSTANT is the flat-bandwidth-factor fallback the plan itself documents
-// as an acceptable outcome; OFF reproduces the pre-plan-4 "uncalibrated"
-// picker exactly, for the rendered A/B implementation-plan-4.md §1's own
-// acceptance asks for.
+// OFF reproduces the pre-plan-4 "uncalibrated" picker exactly, for the
+// rendered A/B implementation-plan-4.md §1's own acceptance asks for.
+//
+// implementation-plan-6.md §6 Phase 3.5: CT_CAL_MODE_CONSTANT (the
+// flat-bandwidth-factor fallback, value 1) is retired -- its formula
+// (e_predicted = CT_CALIBRATION_BANDWIDTH, used as an absolute energy) was
+// missing the per-band E_rung term the constant was derived to multiply
+// (dig_calibration_scale.py's own "E_module,k / E_rung ~= 8.4"), so on real
+// content e_predicted came out ~1000x too high and every band railed at
+// CT_CALIBRATION_MIN regardless of image content -- confirmed on the live
+// GUI pick plan-4-findings.md recorded and reconfirmed headlessly on seven
+// more real frames this phase (plan-6-evidence/real-module/22-*.txt).
+// MODEL's closed-form integral (_ct_predict_band_energy) is not meaningfully
+// more expensive, so there was no accuracy/cost trade left to keep a broken
+// "cheap" option around for. No released darktable version ships this
+// module (own feature branch), so the enum is renumbered rather than kept
+// sparse for compatibility -- MODEL takes value 1, matching the new default.
 typedef enum dt_iop_contrast_calibration_mode_t
 {
   CT_CAL_MODE_OFF      = 0, // $DESCRIPTION: "off"
-  CT_CAL_MODE_CONSTANT = 1, // $DESCRIPTION: "bandwidth constant"
-  CT_CAL_MODE_MODEL    = 2  // $DESCRIPTION: "spectral model"
+  CT_CAL_MODE_MODEL    = 1  // $DESCRIPTION: "spectral model"
 } dt_iop_contrast_calibration_mode_t;
 
 typedef struct dt_iop_contrast_params_t
@@ -208,7 +220,7 @@ typedef struct dt_iop_contrast_params_t
   int filter_iterations;      // $MIN: 1 $MAX: 20 $DEFAULT: 1 $DESCRIPTION: "filter iterations"
   float noise_bias;           // $MIN: 0.0 $MAX: 1.0 $DEFAULT: 0.001 $DESCRIPTION: "noise bias"
   dt_iop_contrast_decomposition_t decomposition; // $DEFAULT: CT_DECOMPOSITION_ACCURATE $DESCRIPTION: "decomposition"
-  dt_iop_contrast_calibration_mode_t calibration_mode; // $DEFAULT: CT_CAL_MODE_CONSTANT $DESCRIPTION: "picker calibration"
+  dt_iop_contrast_calibration_mode_t calibration_mode; // $DEFAULT: CT_CAL_MODE_MODEL $DESCRIPTION: "picker calibration"
 } dt_iop_contrast_params_t;
 
 typedef struct dt_iop_contrast_data_t
@@ -392,7 +404,7 @@ int legacy_params(dt_iop_module_t *self,
     n->filter_iterations = o->filter_iterations;
     n->noise_bias = o->noise_bias;
     n->decomposition = CT_DECOMPOSITION_ACCURATE;
-    n->calibration_mode = CT_CAL_MODE_CONSTANT;
+    n->calibration_mode = CT_CAL_MODE_MODEL;
 
     *new_params = n;
     *new_params_size = sizeof(dt_iop_contrast_params_t);
@@ -424,11 +436,12 @@ int legacy_params(dt_iop_module_t *self,
     n->decomposition = o->decomposition;
     // implementation-plan-4.md §1.2: a v2 history item never wrote
     // calibration_mode, but its band[] gains were produced by the
-    // pre-plan-4 uncalibrated picker (or hand-set) either way -- CONSTANT
-    // is the new default for a *fresh* pick, not a claim about how this
-    // stack entry's own band[] came to be, so it is exactly as good a
-    // choice here as it is for a brand-new instance.
-    n->calibration_mode = CT_CAL_MODE_CONSTANT;
+    // pre-plan-4 uncalibrated picker (or hand-set) either way -- MODEL
+    // (implementation-plan-6.md §6 Phase 3.5) is the new default for a
+    // *fresh* pick, not a claim about how this stack entry's own band[]
+    // came to be, so it is exactly as good a choice here as it is for a
+    // brand-new instance.
+    n->calibration_mode = CT_CAL_MODE_MODEL;
 
     *new_params = n;
     *new_params_size = sizeof(dt_iop_contrast_params_t);
@@ -2817,15 +2830,6 @@ static gboolean _query_band_energy(dt_iop_module_t *self, const int *const box,
 #define CT_CALIBRATION_MAX 1.2
 #define CT_CALIBRATION_FLOOR 1e-9
 
-// implementation-plan-4.md §1.2's cheap alternative: E_module,k / E_rung is
-// flat to +-1.5% across the whole [CT_FIT_BETA_MIN, CT_FIT_BETA_MAX] range
-// for an interior (octave-wide) band against the ladder's own third-octave
-// rung (picker-regression/harness_v2/dig_calibration_scale.py's first
-// table: 8.35-8.56, this value near its midpoint). Used only by
-// CT_CAL_MODE_CONSTANT; CT_CAL_MODE_MODEL computes the same quantity per
-// band, per fit, from _ct_predict_band_energy instead.
-#define CT_CALIBRATION_BANDWIDTH 8.38
-
 static void _compute_band_calibration(dt_iop_module_t *self, const int *const box,
                                       const float long_edge,
                                       const _ct_fit_t *const fit,
@@ -2869,31 +2873,13 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
     // band regardless of offset -- it has absorbed whatever detail is finer
     // than its own outer boundary (modify_roi_in's "unresolvable fine tail:
     // drop"), so it is a shelf, not a bump, and its continuum energy runs to
-    // the pixel Nyquist rather than converging. CT_CAL_MODE_MODEL integrates
-    // it directly (_ct_predict_band_energy); CT_CAL_MODE_CONSTANT's single
-    // bandwidth factor does not apply to it at all (dig_calibration_scale.py:
-    // 8 to 90x, moving with both beta and sigma_0) and leaves it at its
-    // neutral default instead of guessing.
-    if(k == 0 && mode == CT_CAL_MODE_CONSTANT)
-    {
-      dt_print(DT_DEBUG_PICKER, "[contrastadv]   k=%d (proj %d) shelf, left uncalibrated (CONSTANT mode)",
-               k, offset + k);
-      continue;
-    }
-
-    double e_predicted, r;  // r = energy ratio, E_module,k / E_predicted,k
-    if(mode == CT_CAL_MODE_CONSTANT)
-    {
-      e_predicted = CT_CALIBRATION_BANDWIDTH;
-      r = e_module[k] / e_predicted;
-    }
-    else  // CT_CAL_MODE_MODEL
-    {
-      const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1] / (double)long_edge;
-      const double sigma_k = sigma_d[k] / (double)long_edge;
-      e_predicted = fmax(_ct_predict_band_energy(fit, sigma_km1, sigma_k, long_edge), CT_CALIBRATION_FLOOR);
-      r = e_module[k] / e_predicted;
-    }
+    // the pixel Nyquist rather than converging. _ct_predict_band_energy
+    // integrates it directly (sigma_km1 = 0 signals the shelf case to it).
+    const double sigma_km1 = (k == 0) ? 0.0 : sigma_d[k - 1] / (double)long_edge;
+    const double sigma_k = sigma_d[k] / (double)long_edge;
+    const double e_predicted
+      = fmax(_ct_predict_band_energy(fit, sigma_km1, sigma_k, long_edge), CT_CALIBRATION_FLOOR);
+    const double r = e_module[k] / e_predicted;  // energy ratio, E_module,k / E_predicted,k
 
     calibration[offset + k] = (float)CLAMP(sqrt(fmax(r, 0.0)), CT_CALIBRATION_MIN, CT_CALIBRATION_MAX);
 
