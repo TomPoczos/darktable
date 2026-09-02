@@ -1058,10 +1058,19 @@ static double _ct_predict_band_energy(const _ct_fit_t *const fit,
 // "flatten spectrum" preset; §8.1 wired it into the live picker path so a
 // pick can use it too, and TEXTURE lost that choice outright (plan-2 §8.2,
 // rendered crops) -- implementation-plan-4.md §7.2 removes the mode itself.
+// implementation-plan-6.md §5B.1/§6 Phase 2.2: CT_TARGET_DEFAULT replaces
+// both DETAIL and EQUALIZE on the picker path -- plan-6 §3.7b measured that
+// this photographer's own accepted curves are predicted worse by a shape
+// derived from the picked area's own excess than by one fixed shape, so the
+// picker's job shrinks to "which fixed shape" (never "no shape", since
+// DETAIL's own shape is flat and un-derived) rather than "derive a shape".
+// DETAIL/EQUALIZE stay reachable by other callers (EQUALIZE by the "flatten
+// spectrum" preset, DETAIL by nothing left, see _fit_curve_from_box's §2.2).
 typedef enum _ct_target_mode_t
 {
   CT_TARGET_DETAIL   = 0,
-  CT_TARGET_EQUALIZE = 1
+  CT_TARGET_EQUALIZE = 1,
+  CT_TARGET_DEFAULT  = 2
 } _ct_target_mode_t;
 
 // ---------------------------------------------------------------------------
@@ -2213,6 +2222,151 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 }
 
 // ---------------------------------------------------------------------------
+// implementation-plan-3.md §4.2: the projection grid's own geometry --
+// shared by color_picker_apply, init_presets and the graph's x axis so none
+// of the three can ever disagree about where the grid's bounds sit.
+//
+// implementation-plan-6.md §6 Phase 2.1: moved up from just after
+// _project_to_bands so that _target_curve's CT_TARGET_DEFAULT branch (below)
+// can call _spectrum_lambda_to_raw_x through _ct_sigma_to_node without a
+// forward declaration -- these functions were already grouped together in
+// the file, so the move carries the whole group rather than cherry-picking
+// one function out of it.
+// ---------------------------------------------------------------------------
+
+// implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
+// frame-relative (sigma / long edge) and finest-first (idx 0), for a given
+// scale_shift -- the band ladder is frame-relative by construction (node
+// k's nominal wavelength is S * 2^-(D0+k+shift)), so no pixel term is
+// needed here the way modify_roi_in's own sigma[] needs one.
+//
+// implementation-plan-3.md §1.3/implementation-plan-4.md §5.2:
+// CT_GAUSSIAN_SIGMA_FACTOR does **not** belong here, and the next person to
+// find it will want to sprinkle it in. This sigma is pure geometry -- a
+// detail level turned into a frame-relative size, with no dt_gaussian_blur
+// behind it to have widened anything. The correction it eventually drives is
+// applied by fast_eigf_surface_blur at d->sigma[k], which is a guided
+// filter, not Deriche's smoother, so it does not inherit the factor either.
+// _build_ladder's two dt_gaussian_init calls are the module's only ones, and
+// its rung labels are the only thing the factor applies to.
+static void _ct_band_sigma(float *const restrict sigma, const float scale_shift)
+{
+  int idx = 0;
+  for(int k = CT_BANDS - 1; k >= 0; k--)
+  {
+    const double D = CT_BAND_D0 + k + 0.5 + scale_shift;
+    sigma[idx++] = (float)exp2(-(D + 1.0));
+  }
+}
+
+// implementation-plan-2.md §4.3/implementation-plan-3.md §3.1: the dense
+// log-sigma projection grid's own bounds -- two octaves of fine padding
+// below band 0 (none of it below the finest band, so sum_k H_k is exactly 1
+// out to the grid's fine end) and the coarse end trimmed to the frame's own
+// long edge (past which nothing was measured and nothing can be applied,
+// rather than the old sigma[CT_BANDS-1]*4.0, which reached 2.62 octaves
+// outside the frame).
+static void _ct_grid_bounds(const float *const restrict sigma, double *const lo, double *const hi)
+{
+  *lo = fmax((double)sigma[0], 1e-6) * 0.25;
+  *hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
+}
+
+// implementation-plan-3.md §3.2/§4.3: sum_k H_k(lambda) -- how much of a
+// wavelength's energy the nine bands can address between them, in [0,1].
+// The same quantity _project_to_bands weights each grid row by (its own
+// loop keeps h[k] too, for the A matrix, so it is not simply routed through
+// here); this standalone copy is for callers that only need the sum, i.e.
+// implementation-plan-3.md §4.3's graph shading.
+static double _ct_band_coverage(const double lambda, const float *const restrict sigma,
+                                const int nbands)
+{
+  double sum_h = 0.0;
+  for(int k = 0; k < nbands; k++)
+  {
+    const double sigma_km1 = (k == 0) ? 0.0 : (double)sigma[k - 1];
+    const double sigma_k = (double)sigma[k];
+    const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
+    const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
+    sum_h += hp_k - hp_km1;
+  }
+  return sum_h;
+}
+
+// ---------------------------------------------------------------------------
+// §3.1: per-band calibration -- research.md §5.8
+// ---------------------------------------------------------------------------
+//
+// The DoG ladder is linear; eigf is not (§5.8's table: as little as 9% of a
+// hard edge's local deviation reaches the high-pass at the default edge
+// protection). A curve fitted from the linear ladder therefore over-promises
+// wherever the picked box has real local contrast, unless the projection
+// above is told how much of its own H_k a band actually delivers.
+
+// implementation-plan-2.md §5.1: peak wavelength of an octave-spaced H_k =
+// HP_k - HP_{k-1} pair (sigma_k = 2*sigma_km1) -- pi*sqrt(6/ln 4). The finest
+// band (sigma_km1 = 0) is a shelf, not a bump (research.md §2.2), so it will
+// not land exactly on its node under the formula below; that is correct and
+// should be left alone. implementation-plan-4.md §1.2: the general (any
+// sigma_km1, sigma_k, not only an octave pair) peak-wavelength formula this
+// specialises from used to be needed here to point-sample the fit at a
+// band's own peak; §1.2 replaced that point sample with an integral over the
+// band's whole transfer, so the general form is gone and this specialised
+// constant is what remains, used only to anchor the graph's own x axis.
+#define CT_BAND_PEAK_FACTOR 6.5357852
+
+// map a wavelength (in some roi's own pixels, or a frame-relative fraction
+// of the long edge if roi_long_edge is 1.0) to a *raw*, unclamped x
+// fraction. Node k is drawn at (k+0.5)/CT_BANDS (_graph_curve_from_params);
+// band k's own H_k actually peaks at CT_BAND_PEAK_FACTOR * sigma_lower,
+// sigma_lower being the next-finer band's own boundary sigma (half of band
+// k's own, under §4.1's octave-spaced frame-relative ladder) -- working
+// through §4.1's sigma[k] = 2^-(D0+k+1.5) puts that peak at
+// 2^-(D0+k+0.5) * (CT_BAND_PEAK_FACTOR/4). Anchoring the axis there,
+// instead of at the nominal detail level the old formula used, is what
+// makes a rung/preset shape and the node whose H_k actually responds to it
+// land at the same x -- the old nominal-level axis drew the spectrum
+// 0.7083606 octave toward the coarse end of the band it belonged to
+// (implementation-plan-2.md §5.1's own measurement). Verified here as an
+// identity against _band_peak_lambda for all nine bands, per §5.1's own
+// acceptance criterion; the doc's own inline code snippet has this
+// correction term's sign backwards (confirmed by that check -- an additive
+// +log2(F/4), not the doc's -log2(F/4)). Ignores scale_shift, exactly as
+// the nodes' own fixed screen positions do, so a rung/preset shape and the
+// node it nominally corresponds to line up regardless of where scale_shift
+// has since moved the *physical* meaning of that node. Shared by §3.2's
+// graph overlay and §3.4's analytic preset shapes -- and, unclamped, by
+// implementation-plan-3.md §4.2's axis (below), which is what needs to see
+// the projection grid's own overhang past the node ladder rather than have
+// it piled at a clamped edge.
+static double _spectrum_lambda_to_raw_x(const double lambda, const double roi_long_edge)
+{
+  const double d = -log2(lambda / fmax(roi_long_edge, 1.0)) + log2(CT_BAND_PEAK_FACTOR / 4.0);
+  return (d - CT_BAND_D0) / (double)CT_BANDS;
+}
+
+// the presets (§3.4) build their target shapes against the node ladder's
+// own [0,1] span, clamped -- they have no screen to draw on, so the grid's
+// overhang past the ladder is simply not addressable there and clamping it
+// to the nearest node is the right behaviour, unchanged from before §4.2.
+static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
+{
+  return CLAMP((float)_spectrum_lambda_to_raw_x(lambda, roi_long_edge), 0.0f, 1.0f);
+}
+
+// implementation-plan-6.md §6 Phase 2.1: sigma (frame-relative, i.e. already
+// divided by the long edge) to the module's own node axis -- the inverse of
+// _spectrum_lambda_to_raw_x's ((k+0.5)/CT_BANDS at node k) convention, so
+// _ct_sigma_to_node of the wavelength a band's H_k actually peaks at returns
+// that band's own integer node index exactly. Used only to place
+// CT_TARGET_DEFAULT's fixed hump (§5B.1) in the same units the graph draws,
+// so the shape and the axis cannot disagree.
+static double _ct_sigma_to_node(const double sigma)
+{
+  return _spectrum_lambda_to_raw_x(sigma * CT_SIGMA_TO_LAMBDA, 1.0) * (double)CT_BANDS - 0.5;
+}
+
+// ---------------------------------------------------------------------------
 // §2.5: from the fit to a target gain curve, and from that curve to nodes
 // ---------------------------------------------------------------------------
 //
@@ -2286,9 +2440,37 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
 #define CT_EQUALIZE_GAIN_LO 0.3
 #define CT_EQUALIZE_GAIN_HI 2.5
 
+// implementation-plan-6.md §5B.1/§6 Phase 2.1: the fixed default shape --
+// a log-Gaussian hump on the module's own node axis, least-squares fit
+// (residual 1.0e-4) against §3.7b's leave-one-out median of twelve accepted
+// hand-drawn atrous curves from this project's own photographer, mapped onto
+// this axis via harness/atrous_curves.py's node correspondence. Not derived
+// from the picked area: §3.7b measured that a shape derived from the frame's
+// own excess-over-continuum predicts these same twelve curves *worse* than
+// this one fixed shape does (median R^2 0.545 adaptive vs 0.833 fixed), so
+// there is nothing here to re-derive per pick.
+//
+// CT_DEFAULT_NODE = 4.89 -- lambda = 0.97% of the long edge, nominal detail
+// level D8.0.
+#define CT_DEFAULT_NODE 4.89
+// CT_DEFAULT_WIDTH = 1.65 nodes -- the fitted Gaussian's own sigma.
+#define CT_DEFAULT_WIDTH 1.65
+// CT_DEFAULT_PEAK = 0.20 -- gives an effective peak band gain of 1.30 at the
+// post-pick master default of 1.5 (§5.5(a)/Phase 2's own convention below:
+// the picker writes 1 + CT_DEFAULT_PEAK*shape directly, master-independent,
+// and process() then multiplies the (band-1) deviation by master once).
+// Three independent lines of evidence land within 0.1 of 1.30: this
+// photographer's own median accepted peak band gain is 1.35 (§3.7); §4.4's
+// countershading ceiling at its preferred 0.65 fraction is 1.40 at the
+// fussiest band (band 3); §4.7's acutance saturation puts nothing worth
+// buying past roughly there. The shipped picker before this plan reached
+// 1.75 (DETAIL) to 3.25 (EQUALIZE's own top rail) -- about twice any of the
+// three.
+#define CT_DEFAULT_PEAK 0.20
+
 static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mode,
                           const double *const restrict sigma_grid, const int m,
-                          const double sigma_ref,
+                          const double sigma_ref, const float scale_shift,
                           double *const restrict shape)
 {
   double s_ref = 0.0, n_ref = 0.0;
@@ -2305,6 +2487,24 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
 
   for(int j = 0; j < m; j++)
   {
+    if(mode == CT_TARGET_DEFAULT)
+    {
+      // implementation-plan-6.md §6 Phase 2.4: _ct_sigma_to_node ignores
+      // scale_shift by construction (it shares _spectrum_lambda_to_raw_x
+      // with the graph's node placement, which is fixed on screen) -- so a
+      // given *physical* sigma's node number drifts by scale_shift as the
+      // slider moves the ladder under it. Subtracting scale_shift back out
+      // anchors the hump to the *ladder's own* node numbering instead: a
+      // pick always writes the same nine band[] values regardless of
+      // scale_shift, exactly like a hand-drawn curve's band[] does, rather
+      // than the hump staying fixed on screen while the physical bands slide
+      // under it and the written gains change with the slider.
+      const double node = _ct_sigma_to_node(sigma_grid[j]) - (double)scale_shift;
+      const double z = (node - CT_DEFAULT_NODE) / CT_DEFAULT_WIDTH;
+      shape[j] = 1.0 + CT_DEFAULT_PEAK * exp(-0.5 * z * z);
+      continue;
+    }
+
     double S, N;
     _ct_fit_eval(fit, sigma_grid[j], &S, &N);
     const double wiener = S / fmax(S + N, DBL_MIN);
@@ -2461,132 +2661,6 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
   dt_free_align(A);
   dt_free_align(y);
   return ok;
-}
-
-// ---------------------------------------------------------------------------
-// implementation-plan-3.md §4.2: the projection grid's own geometry --
-// shared by color_picker_apply, init_presets and the graph's x axis so none
-// of the three can ever disagree about where the grid's bounds sit.
-// ---------------------------------------------------------------------------
-
-// implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
-// frame-relative (sigma / long edge) and finest-first (idx 0), for a given
-// scale_shift -- the band ladder is frame-relative by construction (node
-// k's nominal wavelength is S * 2^-(D0+k+shift)), so no pixel term is
-// needed here the way modify_roi_in's own sigma[] needs one.
-//
-// implementation-plan-3.md §1.3/implementation-plan-4.md §5.2:
-// CT_GAUSSIAN_SIGMA_FACTOR does **not** belong here, and the next person to
-// find it will want to sprinkle it in. This sigma is pure geometry -- a
-// detail level turned into a frame-relative size, with no dt_gaussian_blur
-// behind it to have widened anything. The correction it eventually drives is
-// applied by fast_eigf_surface_blur at d->sigma[k], which is a guided
-// filter, not Deriche's smoother, so it does not inherit the factor either.
-// _build_ladder's two dt_gaussian_init calls are the module's only ones, and
-// its rung labels are the only thing the factor applies to.
-static void _ct_band_sigma(float *const restrict sigma, const float scale_shift)
-{
-  int idx = 0;
-  for(int k = CT_BANDS - 1; k >= 0; k--)
-  {
-    const double D = CT_BAND_D0 + k + 0.5 + scale_shift;
-    sigma[idx++] = (float)exp2(-(D + 1.0));
-  }
-}
-
-// implementation-plan-2.md §4.3/implementation-plan-3.md §3.1: the dense
-// log-sigma projection grid's own bounds -- two octaves of fine padding
-// below band 0 (none of it below the finest band, so sum_k H_k is exactly 1
-// out to the grid's fine end) and the coarse end trimmed to the frame's own
-// long edge (past which nothing was measured and nothing can be applied,
-// rather than the old sigma[CT_BANDS-1]*4.0, which reached 2.62 octaves
-// outside the frame).
-static void _ct_grid_bounds(const float *const restrict sigma, double *const lo, double *const hi)
-{
-  *lo = fmax((double)sigma[0], 1e-6) * 0.25;
-  *hi = fmin((double)sigma[CT_BANDS - 1] * 4.0, 1.0 / CT_SIGMA_TO_LAMBDA);
-}
-
-// implementation-plan-3.md §3.2/§4.3: sum_k H_k(lambda) -- how much of a
-// wavelength's energy the nine bands can address between them, in [0,1].
-// The same quantity _project_to_bands weights each grid row by (its own
-// loop keeps h[k] too, for the A matrix, so it is not simply routed through
-// here); this standalone copy is for callers that only need the sum, i.e.
-// implementation-plan-3.md §4.3's graph shading.
-static double _ct_band_coverage(const double lambda, const float *const restrict sigma,
-                                const int nbands)
-{
-  double sum_h = 0.0;
-  for(int k = 0; k < nbands; k++)
-  {
-    const double sigma_km1 = (k == 0) ? 0.0 : (double)sigma[k - 1];
-    const double sigma_k = (double)sigma[k];
-    const double hp_km1 = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_km1 * sigma_km1 / (lambda * lambda));
-    const double hp_k   = 1.0 - exp(-2.0 * M_PI * M_PI * sigma_k   * sigma_k   / (lambda * lambda));
-    sum_h += hp_k - hp_km1;
-  }
-  return sum_h;
-}
-
-// ---------------------------------------------------------------------------
-// §3.1: per-band calibration -- research.md §5.8
-// ---------------------------------------------------------------------------
-//
-// The DoG ladder is linear; eigf is not (§5.8's table: as little as 9% of a
-// hard edge's local deviation reaches the high-pass at the default edge
-// protection). A curve fitted from the linear ladder therefore over-promises
-// wherever the picked box has real local contrast, unless the projection
-// above is told how much of its own H_k a band actually delivers.
-
-// implementation-plan-2.md §5.1: peak wavelength of an octave-spaced H_k =
-// HP_k - HP_{k-1} pair (sigma_k = 2*sigma_km1) -- pi*sqrt(6/ln 4). The finest
-// band (sigma_km1 = 0) is a shelf, not a bump (research.md §2.2), so it will
-// not land exactly on its node under the formula below; that is correct and
-// should be left alone. implementation-plan-4.md §1.2: the general (any
-// sigma_km1, sigma_k, not only an octave pair) peak-wavelength formula this
-// specialises from used to be needed here to point-sample the fit at a
-// band's own peak; §1.2 replaced that point sample with an integral over the
-// band's whole transfer, so the general form is gone and this specialised
-// constant is what remains, used only to anchor the graph's own x axis.
-#define CT_BAND_PEAK_FACTOR 6.5357852
-
-// map a wavelength (in some roi's own pixels, or a frame-relative fraction
-// of the long edge if roi_long_edge is 1.0) to a *raw*, unclamped x
-// fraction. Node k is drawn at (k+0.5)/CT_BANDS (_graph_curve_from_params);
-// band k's own H_k actually peaks at CT_BAND_PEAK_FACTOR * sigma_lower,
-// sigma_lower being the next-finer band's own boundary sigma (half of band
-// k's own, under §4.1's octave-spaced frame-relative ladder) -- working
-// through §4.1's sigma[k] = 2^-(D0+k+1.5) puts that peak at
-// 2^-(D0+k+0.5) * (CT_BAND_PEAK_FACTOR/4). Anchoring the axis there,
-// instead of at the nominal detail level the old formula used, is what
-// makes a rung/preset shape and the node whose H_k actually responds to it
-// land at the same x -- the old nominal-level axis drew the spectrum
-// 0.7083606 octave toward the coarse end of the band it belonged to
-// (implementation-plan-2.md §5.1's own measurement). Verified here as an
-// identity against _band_peak_lambda for all nine bands, per §5.1's own
-// acceptance criterion; the doc's own inline code snippet has this
-// correction term's sign backwards (confirmed by that check -- an additive
-// +log2(F/4), not the doc's -log2(F/4)). Ignores scale_shift, exactly as
-// the nodes' own fixed screen positions do, so a rung/preset shape and the
-// node it nominally corresponds to line up regardless of where scale_shift
-// has since moved the *physical* meaning of that node. Shared by §3.2's
-// graph overlay and §3.4's analytic preset shapes -- and, unclamped, by
-// implementation-plan-3.md §4.2's axis (below), which is what needs to see
-// the projection grid's own overhang past the node ladder rather than have
-// it piled at a clamped edge.
-static double _spectrum_lambda_to_raw_x(const double lambda, const double roi_long_edge)
-{
-  const double d = -log2(lambda / fmax(roi_long_edge, 1.0)) + log2(CT_BAND_PEAK_FACTOR / 4.0);
-  return (d - CT_BAND_D0) / (double)CT_BANDS;
-}
-
-// the presets (§3.4) build their target shapes against the node ladder's
-// own [0,1] span, clamped -- they have no screen to draw on, so the grid's
-// overhang past the ladder is simply not addressable there and clamping it
-// to the nearest node is the right behaviour, unchanged from before §4.2.
-static float _spectrum_lambda_to_x(const double lambda, const double roi_long_edge)
-{
-  return CLAMP((float)_spectrum_lambda_to_raw_x(lambda, roi_long_edge), 0.0f, 1.0f);
 }
 
 // implementation-plan-3.md §4.2/implementation-plan-4.md §5.3: the graph's x
@@ -2970,16 +3044,19 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     return FALSE;
   }
 
-  // §2.5/research.md §5.6: what the texture term actually delivers over the
-  // measured rungs (fit->texture_peak) is negligible next to the box's own
-  // peak energy: there is no sized texture here, only sensor noise and/or
-  // ordinary (beta != 2) scene content -- fall back to the broad DETAIL
-  // shape rather than inventing a bump. (fit->texture itself is not
-  // comparable to peak_e -- see §2.3's own comment on why texture_peak
-  // exists.) implementation-plan-2.md §8.2/target-shape.md: EQUALIZE, not
-  // TEXTURE, is the shape a found texture earns -- decided by rendered
-  // comparison, not by this comment.
-  *mode = (fit->texture_peak <= peak_e * 1e-2) ? CT_TARGET_DETAIL : CT_TARGET_EQUALIZE;
+  // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is no
+  // longer derived from what was measured here (§3.7b) -- both of DETAIL's
+  // and EQUALIZE's old outcomes now write the same fixed CT_TARGET_DEFAULT
+  // shape. What the fit still decides is whether a sized texture was found
+  // at all, kept as `found_texture` below purely to gate the size-sanity
+  // advisories a few lines down (fit->tau/fit->texture are meaningless
+  // without a texture to have measured); it no longer selects a shape.
+  // implementation-plan-2.md §8.2/target-shape.md's own EQUALIZE-over-TEXTURE
+  // decision, and DETAIL's flat S/(S+N) shape, both stay reachable in
+  // _target_curve for any caller that still wants them -- neither is wired
+  // to the picker any more.
+  const gboolean found_texture = fit->texture_peak > peak_e * 1e-2;
+  *mode = CT_TARGET_DEFAULT;
 
   // §2.4/research.md §5.9: advisory only, neither warning below refuses the
   // pick -- both just explain a result that might otherwise look like
@@ -2998,7 +3075,9 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
   // them, just not peak-normalised the way TEXTURE's shape once was) -- so
   // the fitted size is still worth warning about whenever a texture was
   // found at all, not only in the now-deleted TEXTURE case (plan-4 §7.2).
-  if(*mode != CT_TARGET_DETAIL)
+  // implementation-plan-6.md §6 Phase 2.2: gated on `found_texture` now that
+  // `*mode` no longer varies with it.
+  if(found_texture)
   {
     const double target_sigma = sqrt(fit->tau);
 
@@ -3212,7 +3291,7 @@ void init_presets(dt_iop_module_so_t *self)
     // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
     // geometric mean, not the grid's -- see _target_curve's comment.
     const double sigma_ref = sqrt((double)sigma[0] * (double)sigma[CT_BANDS - 1]);
-    _target_curve(&synthetic, CT_TARGET_EQUALIZE, sigma_grid, CT_PROJECT_GRID, sigma_ref, target);
+    _target_curve(&synthetic, CT_TARGET_EQUALIZE, sigma_grid, CT_PROJECT_GRID, sigma_ref, 0.0f, target);
   }
   if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI, &p))
     dt_gui_presets_add_generic(_("flatten spectrum"), self->op, self->version(), &p, sizeof(p), TRUE,
@@ -3349,14 +3428,18 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
   // geometric mean, not the grid's -- see _target_curve's comment.
   const double sigma_ref = sqrt((double)sigma[0] * (double)sigma[CT_BANDS - 1]);
-  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, sigma_ref, shape);
+  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, sigma_ref, p->scale_shift, shape);
   // §8.1: CT_TARGET_EQUALIZE's shape[] is already the bounded absolute
   // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
   // target[] as-is, not lerped between 1 and master the way DETAIL's [0,1]
-  // shape is.
-  const gboolean is_equalize = (mode == CT_TARGET_EQUALIZE);
+  // shape is. implementation-plan-6.md §5.5(a)/§6 Phase 2.1: CT_TARGET_DEFAULT
+  // is built the same absolute way (1 + CT_DEFAULT_PEAK*shape, §5B.1) --
+  // master-independent by design, so a pick lands at the same effective
+  // strength regardless of what the master slider was set to beforehand, and
+  // Phase 5 is what brings DETAIL onto this same convention.
+  const gboolean is_absolute_target = (mode == CT_TARGET_EQUALIZE || mode == CT_TARGET_DEFAULT);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
-    target[j] = is_equalize ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
+    target[j] = is_absolute_target ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
   // §3.1: how much of its own linear H_k each band actually delivered over
   // this same box, last time the module's own bands were measured there --
@@ -3367,8 +3450,18 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // §4.4: the envelope the target curve itself was built to -- DETAIL's is
   // 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own fixed clamp
   // (§8.1, same as the preset). No band should leave it.
-  const float gain_lo = is_equalize ? CT_EQUALIZE_GAIN_LO : fminf(1.0f, p->gain_local_contrast);
-  const float gain_hi = is_equalize ? CT_EQUALIZE_GAIN_HI : fmaxf(1.0f, p->gain_local_contrast);
+  // implementation-plan-6.md §5.3/§6 Phase 2.3: CT_TARGET_DEFAULT's own
+  // envelope is [1, 1+CT_DEFAULT_PEAK] -- gain_lo pinned at 1.0 (not
+  // min(1,master) the way DETAIL's was) so R1 (never cut a band below
+  // neutral on the autopick path) holds by construction, and gain_hi at the
+  // shape's own known ceiling (the Gaussian never exceeds 1) rather than
+  // anything master-derived, since this target is master-independent.
+  const float gain_lo = (mode == CT_TARGET_EQUALIZE) ? CT_EQUALIZE_GAIN_LO
+                       : (mode == CT_TARGET_DEFAULT)  ? 1.0f
+                       : fminf(1.0f, p->gain_local_contrast);
+  const float gain_hi = (mode == CT_TARGET_EQUALIZE) ? CT_EQUALIZE_GAIN_HI
+                       : (mode == CT_TARGET_DEFAULT)  ? (1.0f + CT_DEFAULT_PEAK)
+                       : fmaxf(1.0f, p->gain_local_contrast);
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
   if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration,
