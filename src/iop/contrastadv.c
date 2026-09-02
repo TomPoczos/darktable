@@ -262,7 +262,6 @@ typedef struct dt_iop_contrast_gui_data_t
   // under dt_iop_gui_enter/leave_critical_section (§1.5). nbands defaults to
   // CT_BANDS -- everything resolvable -- until the first preview pass lands.
   int nbands;
-  float sigma[CT_BANDS];  // matching pixel sigma, index 0 = finest surviving
 
   // rms-based divisor of the currently displayed texture mask (a band or
   // DETAIL, never CORRECTION), published from process() the same way (§1.6)
@@ -1796,7 +1795,6 @@ void process(dt_iop_module_t *self,
   {
     dt_iop_gui_enter_critical_section(self);
     g->nbands = d->nbands;
-    memcpy(g->sigma, d->sigma, sizeof(g->sigma));
     dt_iop_gui_leave_critical_section(self);
   }
 
