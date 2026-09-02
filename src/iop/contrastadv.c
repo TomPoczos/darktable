@@ -552,8 +552,13 @@ int legacy_params(dt_iop_module_t *self,
 // area that can be measured at all. the hump is located by its flanks, so what
 // matters is the *range* of sizes the ladder covers rather than how many rungs
 // it took to cover them: one full octave, plus enough rungs to outnumber the
-// model's three parameters. together these put the floor at 24 pixels on the
-// short axis.
+// model's three parameters. implementation-plan-4.md §7.5: with today's
+// ladder the finest rung is CT_SIGMA_BASE * CT_GAUSSIAN_SIGMA_FACTOR *
+// CT_SIGMA_TO_LAMBDA = 7.09 px, so together these put the floor at
+// CT_MIN_SPAN * 7.09 = 14.2 px on the short axis -- the number the refusal
+// message below actually quotes. 24 px is a different, unstated claim: the
+// worst case *after* _fit_curve_from_box's outward block rounding (three
+// 8 px blocks).
 #define CT_MIN_SPAN 2.0
 #define CT_MIN_BANDS 4
 
@@ -868,8 +873,10 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   // takes beta to 0.027 resolution: it recovers 2.402 with texture_peak
   // an order of magnitude *below* the threshold, at every box size, and
   // changes nothing where a real bump exists (sigma_t and A unchanged to
-  // three digits). 21 beta evaluations against 13, about 1.6x the search;
-  // a flat dense grid would be 4x for the same answer.
+  // three digits). implementation-plan-4.md §7.5: the refinement loop below
+  // is -8..8, 17 evaluations, so 30 beta evaluations against 13, about 2.3x
+  // the search; a flat dense grid would be 4x for the same answer. (The
+  // *resolution* claim above, beta_step/8 = 0.027, is unchanged.)
   if(best_residual < DBL_MAX)
   {
     const double coarse_beta = best.beta;
