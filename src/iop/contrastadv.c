@@ -1865,8 +1865,16 @@ void process(dt_iop_module_t *self,
       }
       dt_iop_gui_leave_critical_section(self);
 
-      dt_preview_data_store(&g->pd, built.bw + 1, built.bh + 1, piece, _ladder_fill_cb, &built);
-
+      // implementation-plan-4.md §4.1: dt_preview_data_store commits
+      // pd->hash -- which is what makes the buffer read as fresh -- inside
+      // its own critical section. Anything written after it describes the
+      // new data but becomes visible later, so a pick landing between the
+      // two reads new energies against the previous pass's wavelengths,
+      // decimation factors and roi long edge. The nrungs-driven components
+      // check above catches a changed *rung count*, which is the common
+      // case, but not a zoom or crop that keeps the count and moves the
+      // labels -- and roi_in's long edge is an L^(beta-2) lever on the
+      // answer (§3.1). Describe first, then publish.
       dt_iop_gui_enter_critical_section(self);
       g->ladder_nrungs = built.nrungs;
       memcpy(g->ladder_sigma, built.sigma, sizeof(g->ladder_sigma));
@@ -1875,6 +1883,8 @@ void process(dt_iop_module_t *self,
       memcpy(g->ladder_noise_floor, built.noise_floor, sizeof(g->ladder_noise_floor));
       g->ladder_roi_in = *roi_in;
       dt_iop_gui_leave_critical_section(self);
+
+      dt_preview_data_store(&g->pd, built.bw + 1, built.bh + 1, piece, _ladder_fill_cb, &built);
     }
     _ladder_free(&built);
   }
@@ -1910,14 +1920,18 @@ void process(dt_iop_module_t *self,
   // these energies rather than whatever the picker's current params say.
   if(have_band_tables)
   {
-    dt_preview_data_store(&g->band_pd, band_tables.bw + 1, band_tables.bh + 1, piece,
-                          _band_fill_cb, &band_tables);
-
+    // implementation-plan-4.md §4.1: same race as the ladder's above --
+    // band_pd had no guard at all against it (band_nbands/band_sigma moving
+    // under a stable component count, unlike the ladder's nrungs-driven
+    // resize). Describe first, then publish.
     dt_iop_gui_enter_critical_section(self);
     g->band_nbands = d->nbands;
     memset(g->band_sigma, 0, sizeof(g->band_sigma));
     memcpy(g->band_sigma, d->sigma, sizeof(float) * MIN(d->nbands, CT_BANDS));
     dt_iop_gui_leave_critical_section(self);
+
+    dt_preview_data_store(&g->band_pd, band_tables.bw + 1, band_tables.bh + 1, piece,
+                          _band_fill_cb, &band_tables);
   }
   dt_free_align(band_tables.sat2);
   dt_free_align(band_tables.sat1);
