@@ -3630,9 +3630,18 @@ static float _graph_gain_to_yfrac(const float gain)
 // * gain_local_contrast`), so what actually reaches the pixels is this,
 // which can go negative (inverting that octave's detail) even on a shape
 // that itself never goes below zero.
-static float _graph_effective_gain(const float band_gain, const float master)
+//
+// implementation-plan-7.md §4.2: `master` here is no longer the raw slider
+// value directly -- it is that band's own post-knee master
+// (_ct_band_master), the same per-band value process() actually multiplies
+// by (§4.1(d)/§6 Phase 1.3). Using the raw slider value here, as before this
+// plan, is exactly §2.2's bug: past each band's own R_k the dashed line kept
+// climbing while the pixels stood still.
+static float _graph_effective_gain(const int k, const float band_gain, const float master,
+                                   const float scale_shift)
 {
-  return 1.0f + master * (band_gain - 1.0f);
+  const float band_master = (float)_ct_band_master(k, band_gain, master, scale_shift);
+  return 1.0f + band_master * (band_gain - 1.0f);
 }
 
 static void _graph_curve_from_params(dt_draw_curve_t *curve,
@@ -4052,7 +4061,8 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   {
     for(int k = 0; k < CT_BANDS; k++)
       dt_draw_curve_set_point(g->curve, k, _graph_node_x(k, &axis),
-                              _graph_gain_to_yfrac(_graph_effective_gain(p->band[k], p->gain_local_contrast)));
+                              _graph_gain_to_yfrac(_graph_effective_gain(k, p->band[k], p->gain_local_contrast,
+                                                                        p->scale_shift)));
     float exs[CT_GRAPH_RES], eys[CT_GRAPH_RES];
     dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, exs, eys);
     const double eff_dashes[2] = { DT_PIXEL_APPLY_DPI(3.0), DT_PIXEL_APPLY_DPI(2.0) };
@@ -4101,7 +4111,8 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     // at when judging a curve, so this is marked here, not only on the 5b
     // overlay curve, and it overrides the extrapolated color (not the dash,
     // which is a separate question per §4.5).
-    const float effective_gain = _graph_effective_gain(p->band[k], p->gain_local_contrast);
+    const float effective_gain = _graph_effective_gain(k, p->band[k], p->gain_local_contrast,
+                                                       p->scale_shift);
     const gboolean negative_effective = effective_gain <= 0.0f;
 
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
