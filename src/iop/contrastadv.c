@@ -2474,10 +2474,10 @@ static double _ct_sigma_to_node(const double sigma)
 #define CT_DEFAULT_NODE 4.89
 // CT_DEFAULT_WIDTH = 1.65 nodes -- the fitted Gaussian's own sigma.
 #define CT_DEFAULT_WIDTH 1.65
-// CT_DEFAULT_PEAK = 0.20 -- gives an effective peak band gain of 1.30 at the
-// post-pick master default of 1.5 (§5.5(a)/Phase 2's own convention below:
-// the picker writes 1 + CT_DEFAULT_PEAK*shape directly, master-independent,
-// and process() then multiplies the (band-1) deviation by master once).
+// CT_DEFAULT_PEAK = 0.20 -- gives an effective peak band gain of 1.30 at
+// CT_POST_PICK_MASTER (§5.5(a)/Phase 2's own convention below: the picker
+// writes 1 + CT_DEFAULT_PEAK*shape directly, master-independent, and
+// process() then multiplies the (band-1) deviation by master once).
 // Three independent lines of evidence land within 0.1 of 1.30: this
 // photographer's own median accepted peak band gain is 1.35 (§3.7); §4.4's
 // countershading ceiling at its preferred 0.65 fraction is 1.40 at the
@@ -2486,6 +2486,19 @@ static double _ct_sigma_to_node(const double sigma)
 // 1.75 (DETAIL) to 3.25 (EQUALIZE's own top rail) -- about twice any of the
 // three.
 #define CT_DEFAULT_PEAK 0.20
+
+// implementation-plan-6.md §6 Phase 5.4: the master the picker raises
+// gain_local_contrast to the first time a pick finds it still at its
+// neutral default (§2.5/research.md §5.6: a shape with no strength behind
+// it would be invisible, so raise it first -- the same exception
+// blackwhite's picker uses). Named and derived rather than left as a bare
+// literal in that call site: 1 + CT_POST_PICK_MASTER*CT_DEFAULT_PEAK = 1.30
+// is the same effective peak band gain CT_DEFAULT_PEAK's own comment above
+// derives from the three independent lines of evidence there. If a later
+// phase (§6 Phase 6.4's own note) moves the preferred effective peak, this
+// is the constant to change -- CT_DEFAULT_PEAK is the shape's own fitted
+// amplitude and should stay fixed to what §3.7b measured.
+#define CT_POST_PICK_MASTER 1.5
 
 // implementation-plan-6.md §6 Phase 2.5, decided: the shape's own natural
 // skirt at nodes 7-8 (the two finest, which a preview-scale ladder never
@@ -3382,7 +3395,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // exception, the same one blackwhite's picker uses to turn its filter on:
   // a shape with no strength behind it (gain still at its neutral default)
   // would be invisible, so raise it first.
-  if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = 1.5f;
+  if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = CT_POST_PICK_MASTER;
 
   // implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
   // frame-relative (sigma / long edge) and finest-first (idx 0) to match
