@@ -4435,7 +4435,7 @@ void gui_init(dt_iop_module_t *self)
 
   // Local boost slider
   g->gain_local_contrast = dt_bauhaus_slider_from_params(self, "gain_local_contrast");
-  dt_bauhaus_slider_set_soft_range(g->gain_local_contrast, 0.0, 2.0);
+  dt_bauhaus_slider_set_soft_range(g->gain_local_contrast, 0.0, 3.0);
   dt_bauhaus_slider_set_digits(g->gain_local_contrast, 2);
   dt_bauhaus_slider_set_format(g->gain_local_contrast, "%");
   dt_bauhaus_slider_set_factor(g->gain_local_contrast, 100.0);
