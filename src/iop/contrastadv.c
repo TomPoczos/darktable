@@ -167,7 +167,7 @@ typedef struct _ct_ladder_t
 
 typedef struct dt_iop_contrast_params_t
 {
-  float gain_local_contrast;  // $MIN: 0.0 $MAX: 10.0 $DEFAULT: 1.0  $DESCRIPTION: "gain"
+  float gain_local_contrast;  // $MIN: 0.0 $MAX: 20.0 $DEFAULT: 1.0  $DESCRIPTION: "gain"
   float band[CT_BANDS];       // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0
   float scale_shift;          // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0 $DESCRIPTION: "node placement"
   float edge_protection;      // $MIN: -10.0 $MAX: 10.0 $DEFAULT: 0.0 $DESCRIPTION: "adjust edge protection"
@@ -4440,7 +4440,7 @@ void gui_init(dt_iop_module_t *self)
   // and "+1000%" at the new, much wider hard range reads worse than "10x"
   // for the same number.
   g->gain_local_contrast = dt_bauhaus_slider_from_params(self, "gain_local_contrast");
-  dt_bauhaus_slider_set_soft_range(g->gain_local_contrast, 0.0, 3.0);
+  dt_bauhaus_slider_set_soft_range(g->gain_local_contrast, 0.0, 10.0);
   dt_bauhaus_slider_set_digits(g->gain_local_contrast, 2);
   dt_bauhaus_slider_set_format(g->gain_local_contrast, "x");
   gtk_widget_set_tooltip_text(g->gain_local_contrast,
