@@ -185,10 +185,12 @@ typedef struct dt_iop_contrast_data_t
   float gain[CT_BANDS];         // matching gains, same order as sigma
   float feathering[CT_BANDS];   // §3.3: per-band edge protection, same order as sigma/gain
   float feathering_base;        // from edge_protection/filter_iterations, before the per-band scaling
-  // implementation-plan-6.md §5.3/§6 Phase 6: gain_local_contrast after the
-  // countershading ceiling, computed once modify_roi_in knows d->sigma[]/
-  // d->gain[] -- process() reads this, not gain_local_contrast directly.
-  float halo_master;
+  // implementation-plan-6.md §5.3/§6 Phase 6, revised implementation-plan-7.md
+  // §4.1(d)/§6 Phase 1.3: gain_local_contrast after the per-band countershading
+  // knee, one value per band (same order as sigma/gain), computed once
+  // modify_roi_in knows d->sigma[]/d->gain[] -- process() reads this, not
+  // gain_local_contrast directly.
+  float band_master[CT_BANDS];
   int iterations;
   float noise_bias;
 } dt_iop_contrast_data_t;
@@ -1626,7 +1628,15 @@ static void _decompose_and_accumulate(const float *const restrict lum,
                            DT_GF_BLENDING_LINEAR, 1.0f,
                            0.0f, NORM_MIN, 4.0f);
 
+    // implementation-plan-7.md §4.1(d)/§6 Phase 1.3: the per-band knee is
+    // baked in here, per band, before bands are summed -- not as a single
+    // scalar applied to the sum afterward. That final-scalar structure is
+    // exactly what made every earlier candidate discount every band by
+    // whichever one band was tightest; folding d->band_master[k] into each
+    // band's own contribution before it is added to correction[] is what
+    // makes a band with headroom keep its full requested gain.
     const float gain_minus_one = d->gain[k] - 1.0f;
+    const float band_scale = gain_minus_one * d->band_master[k];
     const gboolean is_display = (display_band == k);
     const gboolean detail_mode = (display_band == -2);
 
@@ -1637,7 +1647,7 @@ static void _decompose_and_accumulate(const float *const restrict lum,
       const float b_k = log_lum[p] - log_blur;  // log_lum here holds band (k-1)'s own blur, not the original
       if(is_display) correction[p] = b_k;
       else if(detail_mode) correction[p] += b_k;
-      else if(display_band < 0) correction[p] += gain_minus_one * b_k;
+      else if(display_band < 0) correction[p] += band_scale * b_k;
       if(bt) bt->scratch_full[p] = b_k;
       log_lum[p] = log_blur;  // becomes band (k+1)'s "previous"
     }
@@ -1898,19 +1908,18 @@ void process(dt_iop_module_t *self,
   // a band's or DETAIL's raw b_k has no gain applied -- gain could be zero
   // -- and no fixed scale, so gating/scaling it here would be meaningless;
   // it gets its own rms-based normalization below instead. CORRECTION and
-  // the real output both want the gate and master strength.
+  // the real output both want the gate; the per-band master strength is
+  // already baked into correction[] by _decompose_and_accumulate above
+  // (implementation-plan-7.md §4.1(d)/§6 Phase 1.3 -- it can no longer be a
+  // single scalar applied here, since different bands now carry different
+  // masters).
   if(!showing_texture)
   {
-    // gain_local_contrast is a pure multiplier on top of whatever the bands
-    // already summed to, so it belongs here rather than inside the ladder.
-    // implementation-plan-6.md §5.3/§6 Phase 6: halo_master is
-    // gain_local_contrast after modify_roi_in's countershading ceiling --
-    // the two are equal whenever the ceiling does not bind.
     DT_OMP_FOR()
     for(size_t k = 0; k < npixels; k++)
     {
       const float gate = _wiener_gate(coarsest[k], d->noise_bias);
-      correction[k] *= gate * d->halo_master;
+      correction[k] *= gate;
     }
   }
 
@@ -2004,6 +2013,40 @@ static double _ct_halo_gain_ceiling(const double sigma_frame)
   return 1.0 + 2.0 * _ct_halo_lambda_obj(zeta);
 }
 
+// implementation-plan-7.md §4.1(d)/§6 Phase 1.3: decided candidate -- a
+// smooth, per-band knee, chosen over three single-scalar candidates (a
+// hard fmin wall, a global soft knee, and a pick-time-only clamp) that all
+// scale every band by one number, decided by whichever single band is
+// tightest. The ceiling budget varies ~3x across the ladder (§8.2), so any
+// single global number either under-uses a loose band's headroom or
+// overspends the tight one's. Evaluating the same knee shape per band, off
+// that band's own R_k, means a band with headroom is never discounted for a
+// different band's constraint -- confirmed on real B&W frames
+// (plan-7-evidence/phase1-2-ceiling-renders/) and reasoned through with the
+// user directly.
+//
+// The knee itself is not the plan's original min(x, R*(x/R)^q): that is two
+// smooth curves joined by a hard minimum -- continuous in value at R, but
+// the slope jumps from q to 1 with no transition, a real corner rather than
+// a knee. Replaced by the standard smoothly-broken power law
+//   g(x) = x * (1 + (x/R)^s)^((q-1)/s)
+// which has the same two asymptotes (slope 1 for x<<R, R*(x/R)^q for x>>R)
+// joined smoothly (C-infinity) instead of at a corner. s controls how wide
+// the transition is: s -> infinity recovers the old hard corner exactly;
+// s=6 keeps the deviation from an unclamped curve under 0.01% at the
+// masters every preset and the post-pick default actually use (~1.0-1.5),
+// while still giving R itself a real, visible give instead of a slope
+// discontinuity.
+#define CT_HALO_KNEE_Q 0.5
+#define CT_HALO_KNEE_S 6.0
+
+static double _ct_halo_smooth_knee(const double x, const double Rk)
+{
+  if(x <= 0.0 || Rk == DBL_MAX) return x;
+  const double u = pow(x / Rk, CT_HALO_KNEE_S);
+  return x * pow(1.0 + u, (CT_HALO_KNEE_Q - 1.0) / CT_HALO_KNEE_S);
+}
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *roi_out,
@@ -2020,18 +2063,21 @@ void modify_roi_in(dt_iop_module_t *self,
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
 
-  // implementation-plan-7.md §4.4: the smallest per-band ratio
+  // implementation-plan-7.md §4.4: each band's own ratio
   // (ceiling - 1)/(g_k - 1), taken over the *fixed* CT_BANDS ladder by each
   // band's nominal frame-relative sigma -- not only over bands that survive
   // this pass' fine-tail drop below. The ceiling is a property of the
   // ladder, which is fixed and frame-relative; which bands survive is a
-  // property of the current roi/zoom. Coupling the two made halo_master (and
-  // therefore the rendered image) differ between preview and export at the
-  // same master (§2.3) -- a band dropped here for being unresolvable at this
-  // roi scale is not thereby exempt from the ceiling it would bind at full
-  // resolution. `D` here is already frame-relative (no roi_in->scale term),
-  // so this loop, unlike the one below, needs no roi to run.
-  double halo_min_ratio = DBL_MAX;
+  // property of the current roi/zoom. Coupling the two made the per-band
+  // master (and therefore the rendered image) differ between preview and
+  // export at the same master (§2.3) -- a band dropped here for being
+  // unresolvable at this roi scale is not thereby exempt from the ceiling it
+  // would bind at full resolution. `D` here is already frame-relative (no
+  // roi_in->scale term), so this loop, unlike the one below, needs no roi to
+  // run. R_k is kept per band (§4.1(d)), not reduced to a single global
+  // minimum -- that reduction is exactly what made every single-scalar
+  // candidate discount every band by whichever one band is tightest.
+  double Rk[CT_BANDS];
   for(int k = 0; k < CT_BANDS; k++)
   {
     if(d->band[k] > 1.0f)
@@ -2039,8 +2085,11 @@ void modify_roi_in(dt_iop_module_t *self,
       const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
       const double sigma_frame = exp2(-((double)D + 1.0));
       const double ceiling = _ct_halo_gain_ceiling(sigma_frame);
-      const double ratio = (ceiling - 1.0) / ((double)d->band[k] - 1.0);
-      halo_min_ratio = fmin(halo_min_ratio, ratio);
+      Rk[k] = (ceiling - 1.0) / ((double)d->band[k] - 1.0);
+    }
+    else
+    {
+      Rk[k] = DBL_MAX;  // no boost requested at this band: nothing to bend
     }
   }
 
@@ -2054,6 +2103,8 @@ void modify_roi_in(dt_iop_module_t *self,
 
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
+    d->band_master[nbands] =
+      (float)_ct_halo_smooth_knee((double)d->gain_local_contrast, Rk[k]);
 
     // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
     // blurring at all) as the window grows, so a single global eps leaves
@@ -2079,13 +2130,6 @@ void modify_roi_in(dt_iop_module_t *self,
     nbands++;
   }
   d->nbands = nbands;
-
-  // never raises the master, only lowers it -- a pick/edit with no band
-  // above 1.0 leaves halo_min_ratio at DBL_MAX and halo_master equal to
-  // gain_local_contrast unchanged.
-  d->halo_master = (halo_min_ratio < (double)d->gain_local_contrast)
-                  ? (float)halo_min_ratio
-                  : d->gain_local_contrast;
 }
 
 void commit_params(dt_iop_module_t *self,
