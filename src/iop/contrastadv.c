@@ -2187,6 +2187,9 @@ static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
          "the thin dashed curve is the *effective* gain after local contrast\n"
          "is applied; a red node/number means that band's effective gain has\n"
          "gone at or below zero, inverting its detail.\n"
+         "the dotted curve is a perceptual countershading ceiling: past it,\n"
+         "that band's own effective gain bends off instead of climbing\n"
+         "further as you raise local contrast.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
@@ -2196,7 +2199,10 @@ static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the thin dashed curve is the *effective* gain after local contrast\n"
          "is applied; a red node/number means that band's effective gain has\n"
-         "gone at or below zero, inverting its detail."));
+         "gone at or below zero, inverting its detail.\n"
+         "the dotted curve is a perceptual countershading ceiling: past it,\n"
+         "that band's own effective gain bends off instead of climbing\n"
+         "further as you raise local contrast."));
 }
 
 // redraw the graph once a pipe has actually run, so its stripe shading
@@ -4435,7 +4441,12 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_factor(g->gain_local_contrast, 100.0);
   dt_bauhaus_slider_set_offset(g->gain_local_contrast, -100.0);
   gtk_widget_set_tooltip_text(g->gain_local_contrast,
-                              _("amount of local contrast enhancement"));
+                              _("scales the picked (or hand-drawn) curve up or down: each\n"
+                                "band's effective gain is 1 + this * (band gain - 1).\n"
+                                "past a perceptual countershading limit, which varies by band and\n"
+                                "is drawn as the graph's third, dotted curve, a band's own effective\n"
+                                "gain bends off smoothly rather than climbing further -- see the\n"
+                                "graph for which bands still have headroom."));
   dt_bauhaus_widget_set_quad(g->gain_local_contrast, self, dtgtk_cairo_paint_showmask, TRUE, show_details_callback,
                              _("visualize the accumulated correction -- what this module is doing.\n"
                                "ctrl+click: visualize the raw, un-gained detail sum (v1's behaviour)."));
