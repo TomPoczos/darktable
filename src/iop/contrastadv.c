@@ -2019,12 +2019,31 @@ void modify_roi_in(dt_iop_module_t *self,
   // which never gets dropped.
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
-  // implementation-plan-6.md §5.3/§6 Phase 6.1: the smallest per-band ratio
-  // (ceiling - 1)/(g_k - 1) over bands this pick/edit actually boosts --
-  // scaling gain_local_contrast down by this ratio, for the whole curve
-  // rather than per band, is §5.3's own instruction (clipping band-by-band
-  // re-introduces the flat-topped rail plan-3 §5 spent a phase softening).
+
+  // implementation-plan-7.md §4.4: the smallest per-band ratio
+  // (ceiling - 1)/(g_k - 1), taken over the *fixed* CT_BANDS ladder by each
+  // band's nominal frame-relative sigma -- not only over bands that survive
+  // this pass' fine-tail drop below. The ceiling is a property of the
+  // ladder, which is fixed and frame-relative; which bands survive is a
+  // property of the current roi/zoom. Coupling the two made halo_master (and
+  // therefore the rendered image) differ between preview and export at the
+  // same master (§2.3) -- a band dropped here for being unresolvable at this
+  // roi scale is not thereby exempt from the ceiling it would bind at full
+  // resolution. `D` here is already frame-relative (no roi_in->scale term),
+  // so this loop, unlike the one below, needs no roi to run.
   double halo_min_ratio = DBL_MAX;
+  for(int k = 0; k < CT_BANDS; k++)
+  {
+    if(d->band[k] > 1.0f)
+    {
+      const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
+      const double sigma_frame = exp2(-((double)D + 1.0));
+      const double ceiling = _ct_halo_gain_ceiling(sigma_frame);
+      const double ratio = (ceiling - 1.0) / ((double)d->band[k] - 1.0);
+      halo_min_ratio = fmin(halo_min_ratio, ratio);
+    }
+  }
+
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
     const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
@@ -2036,17 +2055,6 @@ void modify_roi_in(dt_iop_module_t *self,
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
 
-    // frame-relative sigma (fraction of the long edge), independent of
-    // roi_in->scale -- the same nominal quantity _ct_band_sigma computes,
-    // recomputed here from D directly since that function sits later in the
-    // file (forward-declaration issue) and this loop already has D in hand.
-    if(d->gain[nbands] > 1.0f)
-    {
-      const double sigma_frame = exp2(-((double)D + 1.0));
-      const double ceiling = _ct_halo_gain_ceiling(sigma_frame);
-      const double ratio = (ceiling - 1.0) / ((double)d->gain[nbands] - 1.0);
-      halo_min_ratio = fmin(halo_min_ratio, ratio);
-    }
     // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
     // blurring at all) as the window grows, so a single global eps leaves
     // coarse bands empty on most ordinary photographs -- phase0-band-
