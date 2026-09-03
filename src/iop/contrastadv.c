@@ -233,6 +233,10 @@ typedef struct dt_iop_contrast_data_t
   float gain[CT_BANDS];         // matching gains, same order as sigma
   float feathering[CT_BANDS];   // §3.3: per-band edge protection, same order as sigma/gain
   float feathering_base;        // from edge_protection/filter_iterations, before the per-band scaling
+  // implementation-plan-6.md §5.3/§6 Phase 6: gain_local_contrast after the
+  // countershading ceiling, computed once modify_roi_in knows d->sigma[]/
+  // d->gain[] -- process() reads this, not gain_local_contrast directly.
+  float halo_master;
   int iterations;
   float noise_bias;
   dt_iop_contrast_decomposition_t decomposition;
@@ -2052,11 +2056,14 @@ void process(dt_iop_module_t *self,
   {
     // gain_local_contrast is a pure multiplier on top of whatever the bands
     // already summed to, so it belongs here rather than inside the ladder.
+    // implementation-plan-6.md §5.3/§6 Phase 6: halo_master is
+    // gain_local_contrast after modify_roi_in's countershading ceiling --
+    // the two are equal whenever the ceiling does not bind.
     DT_OMP_FOR()
     for(size_t k = 0; k < npixels; k++)
     {
       const float gate = _wiener_gate(coarsest[k], d->noise_bias);
-      correction[k] *= gate * d->gain_local_contrast;
+      correction[k] *= gate * d->halo_master;
     }
   }
 
@@ -2119,6 +2126,37 @@ void cleanup_pipe(dt_iop_module_t *self,
   piece->data = NULL;
 }
 
+// implementation-plan-6.md §4.4/§6 Phase 6: Trentacoste, Mantiuk, Heidrich &
+// Dufrot's just-objectionable countershading magnitude (EG 2012, "Unsharp
+// Masking, Countershading and Halos: Enhancements or Artifacts?"), fit to
+// their 1800 judgements as a cubic/linear piecewise in zeta =
+// log10(sigma in degrees). lambda is in log10 contrast for a template edge
+// of log10-contrast 1; converting a step of log2 amplitude A = log2(10)
+// gives the gain ceiling 1 + 2*lambda that _ct_halo_gain_ceiling below
+// returns directly.
+static double _ct_halo_lambda_obj(const double zeta)
+{
+  return (zeta <= 0.418)
+    ? -0.249 * zeta * zeta * zeta - 0.233 * zeta * zeta + 0.377 * zeta + 0.674
+    :  0.048 * zeta + 0.752;
+}
+
+// CT_VIEW_DEGREES = 30 -- Trentacoste's tolerance is set by *angular*, not
+// pixel, profile width (§4.4), and darktable knows neither print size nor
+// viewing distance. Named so the next reader does not mistake this for a
+// measurement rather than the fixed assumption it is. §5B.1/§6 Phase 6.3
+// predicts this essentially never binds on the picker's own default.
+#define CT_VIEW_DEGREES 30.0
+
+// the ceiling on *effective* per-band gain (1 + master*(g_k-1)), from a
+// band's own frame-relative sigma (fraction of the long edge) --
+// implementation-plan-6.md §5.3/§6 Phase 6.1.
+static double _ct_halo_gain_ceiling(const double sigma_frame)
+{
+  const double zeta = log10(sigma_frame * CT_VIEW_DEGREES);
+  return 1.0 + 2.0 * _ct_halo_lambda_obj(zeta);
+}
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *roi_out,
@@ -2134,6 +2172,12 @@ void modify_roi_in(dt_iop_module_t *self,
   // which never gets dropped.
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
+  // implementation-plan-6.md §5.3/§6 Phase 6.1: the smallest per-band ratio
+  // (ceiling - 1)/(g_k - 1) over bands this pick/edit actually boosts --
+  // scaling gain_local_contrast down by this ratio, for the whole curve
+  // rather than per band, is §5.3's own instruction (clipping band-by-band
+  // re-introduces the flat-topped rail plan-3 §5 spent a phase softening).
+  double halo_min_ratio = DBL_MAX;
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
     const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
@@ -2144,6 +2188,18 @@ void modify_roi_in(dt_iop_module_t *self,
 
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
+
+    // frame-relative sigma (fraction of the long edge), independent of
+    // roi_in->scale -- the same nominal quantity _ct_band_sigma computes,
+    // recomputed here from D directly since that function sits later in the
+    // file (forward-declaration issue) and this loop already has D in hand.
+    if(d->gain[nbands] > 1.0f)
+    {
+      const double sigma_frame = exp2(-((double)D + 1.0));
+      const double ceiling = _ct_halo_gain_ceiling(sigma_frame);
+      const double ratio = (ceiling - 1.0) / ((double)d->gain[nbands] - 1.0);
+      halo_min_ratio = fmin(halo_min_ratio, ratio);
+    }
     // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
     // blurring at all) as the window grows, so a single global eps leaves
     // coarse bands empty on most ordinary photographs -- phase0-band-
@@ -2168,6 +2224,13 @@ void modify_roi_in(dt_iop_module_t *self,
     nbands++;
   }
   d->nbands = nbands;
+
+  // never raises the master, only lowers it -- a pick/edit with no band
+  // above 1.0 leaves halo_min_ratio at DBL_MAX and halo_master equal to
+  // gain_local_contrast unchanged.
+  d->halo_master = (halo_min_ratio < (double)d->gain_local_contrast)
+                  ? (float)halo_min_ratio
+                  : d->gain_local_contrast;
 }
 
 void commit_params(dt_iop_module_t *self,
