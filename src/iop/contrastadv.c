@@ -167,7 +167,7 @@ typedef struct _ct_ladder_t
 
 typedef struct dt_iop_contrast_params_t
 {
-  float gain_local_contrast;  // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0  $DESCRIPTION: "local contrast"
+  float gain_local_contrast;  // $MIN: 0.0 $MAX: 10.0 $DEFAULT: 1.0  $DESCRIPTION: "gain"
   float band[CT_BANDS];       // $MIN: 0.0 $MAX: 5.0 $DEFAULT: 1.0
   float scale_shift;          // $MIN: -0.5 $MAX: 0.5 $DEFAULT: 0.0 $DESCRIPTION: "node placement"
   float edge_protection;      // $MIN: -10.0 $MAX: 10.0 $DEFAULT: 0.0 $DESCRIPTION: "adjust edge protection"
@@ -2184,12 +2184,12 @@ static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
          "middle-click for the plain slider list.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
-         "the thin dashed curve is the *effective* gain after local contrast\n"
-         "is applied; a red node/number means that band's effective gain has\n"
+         "the thin dashed curve is the *effective* gain after the gain\n"
+         "slider is applied; a red node/number means that band's effective gain has\n"
          "gone at or below zero, inverting its detail.\n"
          "the dotted curve is a perceptual countershading ceiling: past it,\n"
          "that band's own effective gain bends off instead of climbing\n"
-         "further as you raise local contrast.\n"
+         "further as you raise gain.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
@@ -2197,12 +2197,12 @@ static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
          "middle-click for the plain slider list.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
-         "the thin dashed curve is the *effective* gain after local contrast\n"
-         "is applied; a red node/number means that band's effective gain has\n"
+         "the thin dashed curve is the *effective* gain after the gain\n"
+         "slider is applied; a red node/number means that band's effective gain has\n"
          "gone at or below zero, inverting its detail.\n"
          "the dotted curve is a perceptual countershading ceiling: past it,\n"
          "that band's own effective gain bends off instead of climbing\n"
-         "further as you raise local contrast."));
+         "further as you raise gain."));
 }
 
 // redraw the graph once a pipe has actually run, so its stripe shading
@@ -4434,12 +4434,15 @@ void gui_init(dt_iop_module_t *self)
   self->widget = dt_gui_vbox();
 
   // Local boost slider
+  // plan-7 §6 Phase 3.2: displayed as a direct multiplier ("1.00x" at
+  // neutral) rather than a percent offset from neutral -- the underlying
+  // quantity already is one (effective gain = 1 + this * (band gain - 1)),
+  // and "+1000%" at the new, much wider hard range reads worse than "10x"
+  // for the same number.
   g->gain_local_contrast = dt_bauhaus_slider_from_params(self, "gain_local_contrast");
   dt_bauhaus_slider_set_soft_range(g->gain_local_contrast, 0.0, 3.0);
   dt_bauhaus_slider_set_digits(g->gain_local_contrast, 2);
-  dt_bauhaus_slider_set_format(g->gain_local_contrast, "%");
-  dt_bauhaus_slider_set_factor(g->gain_local_contrast, 100.0);
-  dt_bauhaus_slider_set_offset(g->gain_local_contrast, -100.0);
+  dt_bauhaus_slider_set_format(g->gain_local_contrast, "x");
   gtk_widget_set_tooltip_text(g->gain_local_contrast,
                               _("scales the picked (or hand-drawn) curve up or down: each\n"
                                 "band's effective gain is 1 + this * (band gain - 1).\n"
