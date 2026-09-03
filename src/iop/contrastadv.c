@@ -2047,6 +2047,31 @@ static double _ct_halo_smooth_knee(const double x, const double Rk)
   return x * pow(1.0 + u, (CT_HALO_KNEE_Q - 1.0) / CT_HALO_KNEE_S);
 }
 
+// implementation-plan-7.md §4.2: the ceiling and the per-band knee it drives
+// are both frame-relative -- a function of the band's own param index and
+// scale_shift only (§4.4), never of the pipe's roi/zoom. That is what lets
+// the graph call these two functions directly from self->params and get
+// exactly what process() applies, with no publish/critical-section round
+// trip through the pipe: unlike g->nbands (genuinely roi-dependent -- which
+// bands survive at this zoom), there is nothing here the GUI cannot already
+// derive itself. modify_roi_in below is the other caller, so this is shared
+// rather than duplicated.
+static double _ct_band_ceiling(const int k, const float scale_shift)
+{
+  const float D = CT_BAND_D0 + k + 0.5f + scale_shift;
+  const double sigma_frame = exp2(-((double)D + 1.0));
+  return _ct_halo_gain_ceiling(sigma_frame);
+}
+
+static double _ct_band_master(const int k, const float band_gain, const float master,
+                              const float scale_shift)
+{
+  if(band_gain <= 1.0f) return (double)master;  // no boost requested: nothing to bend
+  const double ceiling = _ct_band_ceiling(k, scale_shift);
+  const double Rk = (ceiling - 1.0) / ((double)band_gain - 1.0);
+  return _ct_halo_smooth_knee((double)master, Rk);
+}
+
 void modify_roi_in(dt_iop_module_t *self,
                    dt_dev_pixelpipe_iop_t *piece,
                    const dt_iop_roi_t *roi_out,
@@ -2063,35 +2088,22 @@ void modify_roi_in(dt_iop_module_t *self,
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
 
-  // implementation-plan-7.md §4.4: each band's own ratio
-  // (ceiling - 1)/(g_k - 1), taken over the *fixed* CT_BANDS ladder by each
-  // band's nominal frame-relative sigma -- not only over bands that survive
-  // this pass' fine-tail drop below. The ceiling is a property of the
-  // ladder, which is fixed and frame-relative; which bands survive is a
-  // property of the current roi/zoom. Coupling the two made the per-band
-  // master (and therefore the rendered image) differ between preview and
-  // export at the same master (§2.3) -- a band dropped here for being
-  // unresolvable at this roi scale is not thereby exempt from the ceiling it
-  // would bind at full resolution. `D` here is already frame-relative (no
-  // roi_in->scale term), so this loop, unlike the one below, needs no roi to
-  // run. R_k is kept per band (§4.1(d)), not reduced to a single global
-  // minimum -- that reduction is exactly what made every single-scalar
-  // candidate discount every band by whichever one band is tightest.
-  double Rk[CT_BANDS];
-  for(int k = 0; k < CT_BANDS; k++)
-  {
-    if(d->band[k] > 1.0f)
-    {
-      const float D = CT_BAND_D0 + k + 0.5f + d->scale_shift;
-      const double sigma_frame = exp2(-((double)D + 1.0));
-      const double ceiling = _ct_halo_gain_ceiling(sigma_frame);
-      Rk[k] = (ceiling - 1.0) / ((double)d->band[k] - 1.0);
-    }
-    else
-    {
-      Rk[k] = DBL_MAX;  // no boost requested at this band: nothing to bend
-    }
-  }
+  // implementation-plan-7.md §4.4/§4.2: each band's own ratio
+  // (ceiling - 1)/(g_k - 1), taken by each band's nominal frame-relative
+  // sigma -- not only over bands that survive this pass' fine-tail drop
+  // below. The ceiling is a property of the *fixed* CT_BANDS ladder, which
+  // is frame-relative; which bands survive is a property of the current
+  // roi/zoom. Coupling the two made the per-band master (and therefore the
+  // rendered image) differ between preview and export at the same master
+  // (§2.3) -- a band dropped here for being unresolvable at this roi scale
+  // is not thereby exempt from the ceiling it would bind at full
+  // resolution. _ct_band_master (above) needs no roi to run, so it is
+  // called directly per surviving band below rather than precomputed for
+  // every k up front -- unlike a global minimum (which every single-scalar
+  // candidate reduced to, discounting every band by whichever one was
+  // tightest), each band's own R_k depends on nothing outside that band, so
+  // there is nothing to gain by computing it before we know which bands
+  // survive.
 
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
@@ -2104,7 +2116,7 @@ void modify_roi_in(dt_iop_module_t *self,
     d->sigma[nbands] = sigma;
     d->gain[nbands] = d->band[k];
     d->band_master[nbands] =
-      (float)_ct_halo_smooth_knee((double)d->gain_local_contrast, Rk[k]);
+      (float)_ct_band_master(k, d->band[k], d->gain_local_contrast, d->scale_shift);
 
     // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
     // blurring at all) as the window grows, so a single global eps leaves
