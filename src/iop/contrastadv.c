@@ -4076,6 +4076,34 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_set_dash(cr, NULL, 0, 0.0);
   }
 
+  // 5c. implementation-plan-7.md §4.2: the ceiling itself, third curve --
+  // _ct_band_ceiling per band, purely frame-relative (needs only k and
+  // scale_shift, §4.4) -- like 5b just above, derived directly from
+  // self->params, not published from the pipe (see _ct_band_ceiling's own
+  // comment). Drawn unconditionally, like the envelope rails (3b): with the
+  // per-band knee (§4.1(d)) this is where 5b's dashed line is headed once a
+  // band's own R_k starts binding, and that is worth seeing before the
+  // slider is ever touched, not only after. Dotted rather than dashed so it
+  // reads as a third, distinct line rather than a second copy of 5b's dash
+  // style; graph_border rather than graph_fg keeps it visually behind the
+  // two editable/derived curves.
+  {
+    for(int k = 0; k < CT_BANDS; k++)
+      dt_draw_curve_set_point(g->curve, k, _graph_node_x(k, &axis),
+                              _graph_gain_to_yfrac((float)_ct_band_ceiling(k, p->scale_shift)));
+    float cxs[CT_GRAPH_RES], cys[CT_GRAPH_RES];
+    dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, cxs, cys);
+    const double ceiling_dots[2] = { DT_PIXEL_APPLY_DPI(1.0), DT_PIXEL_APPLY_DPI(2.0) };
+    cairo_set_dash(cr, ceiling_dots, 2, 0.0);
+    set_color(cr, darktable.bauhaus->graph_border);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+    cairo_move_to(cr, 0, height * (1.0f - cys[0]));
+    for(int i = 1; i < CT_GRAPH_RES; i++)
+      cairo_line_to(cr, i * width / (float)(CT_GRAPH_RES - 1), height * (1.0f - cys[i]));
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
+  }
+
   // 6. node bars + bullets
   //
   // implementation-plan-3.md §4.4: which nodes the last pick's own window
