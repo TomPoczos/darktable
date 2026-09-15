@@ -533,8 +533,9 @@ static void _nnls3(const double AtA[3][3],
 {
   // whiten each column by its own RMS magnitude (sqrt of its AtA diagonal)
   // before solving. the three model terms live at wildly different natural
-  // scales -- _dog_shape peaks around 1e-4, s^((beta-2)/2) spans several
-  // orders of magnitude over a ten-octave ladder -- so a ridge or
+  // scales -- _dog_shape goes as 1/(s+tau), ~1e4 at the finest rung in the
+  // frame-relative s the callers pass, while s^((beta-2)/2) stays within a
+  // few orders of magnitude of 1 over a ten-octave ladder -- so a ridge or
   // determinant tolerance sized to matter for one column either does
   // nothing for the others or swamps them outright. normalized, every
   // active diagonal is ~1 and a single small, scale-free ridge and
@@ -688,10 +689,10 @@ static void _fit_spectrum_at_beta(const double beta,
 
     if(residual < *best_residual)
     {
-      // A alone is not comparable to N or C: _dog_shape peaks around 1e-4
-      // while the self-similar column can be O(1)-O(10), so a "large" A is
-      // routinely needed just to explain a small amount of real energy --
-      // and, at large tau, _dog_shape's near-zero, nearly featureless
+      // A alone is not comparable to N or C: _dog_shape's column is orders
+      // of magnitude away from the self-similar one (see _nnls3), so A's
+      // size says nothing about how much energy it explains -- and, at
+      // large tau, _dog_shape's near-zero, nearly featureless
       // values over every *measured* rung make the (tau, A) pair almost
       // unidentifiable from self-similar-only data: residual stays flat
       // while A drifts arbitrarily high chasing float-noise-scale
