@@ -1488,26 +1488,27 @@ static gboolean _build_ladder(const float *const restrict lum,
 }
 
 // §2.2: dt_preview_data_fill_t for publishing a just-built ladder. Reshapes
-// the ladder's rung-major SAT tables (one (bw+1)x(bh+1) grid per rung) into
-// the node-major, per-node-interleaved layout dt_preview_data_t expects
-// (`components` floats per "pixel", here per SAT node): 3*nrungs floats per
-// node, Sum(b^2)/Sum(|b|)/pixel-count for rung 0, then rung 1, and so on. A
-// cheap reshape, not a rebuild -- the ladder itself was already built outside
-// the GUI lock, which is what this fill runs under (dt_preview_data_store's
-// contract: fill() must be cheap).
+// the ladder's rung-major tables (one (bw+1)x(bh+1) grid per rung) into the
+// node-major, per-node-interleaved layout dt_preview_data_t expects
+// (`components` floats per "pixel", here per SAT node): 4*nrungs floats per
+// node, Sum(b^2)/Sum(|b|)/pixel-count/block RMS for rung 0, then rung 1, and
+// so on. A cheap reshape, not a rebuild -- the ladder itself was already
+// built outside the GUI lock, which is what this fill runs under
+// (dt_preview_data_store's contract: fill() must be cheap).
 //
-// implementation-plan-4.md §8.2: the third component is sat_n, added
-// alongside sat2/sat1 so a box query's denominator comes from the same
-// summed-area table as its numerator instead of an assumed-full-block count.
+// implementation-plan-4.md §8.2: the third component is sat_n, so a box
+// query's denominator comes from the same summed-area table as its
+// numerator instead of an assumed-full-block count. implementation-plan-8.md
+// §5.4: the fourth is blockrms, which is not a SAT (see _ct_ladder_t's own
+// comment) but is stored at the identical (bw+1)*(bh+1)-per-rung stride, so
+// this reshape needs no special case for it. Every reader (_measure_box,
+// _box_block_percentiles, _spectrum_frame_wide*) indexes node (y, x)'s rung
+// r as 4*r + component and checks components == 4*nrungs before trusting
+// the buffer.
 static void _ladder_fill_cb(void *const user_data, float *const buf, const size_t nelems)
 {
   const _ct_ladder_t *const ladder = (const _ct_ladder_t *)user_data;
   const size_t sw = ladder->bw + 1, sh = ladder->bh + 1;
-  // implementation-plan-8.md §5.4: a 4th component, blockrms, alongside
-  // sat2/sat1/sat_n -- comps is now 4 per rung, not 3. blockrms is not a SAT
-  // (see _ct_ladder_t's own comment), but it is stored at the identical
-  // (bw+1)*(bh+1)-per-rung stride so this reshape needs no special case for
-  // it: node (y, x) just gets a 4th float instead of 3.
   const size_t comps = (size_t)(4 * ladder->nrungs);
   (void)nelems;  // == sw * sh * comps, by construction of the caller's resize
 
