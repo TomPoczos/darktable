@@ -3182,10 +3182,27 @@ static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const b
       *nrungs_out = g->ladder_nrungs;
       for(int r = 0; r < g->ladder_nrungs; r++)
       {
-        size_t n = 0;
+        // a decimated rung's level is floor(height/step) pixels tall, so on
+        // a frame whose height is not a multiple of CT_BLOCK*step the last
+        // base block row(s) start past the level's edge and hold no pixels
+        // at all (sat_n counts 0 there; same for columns). They carry no
+        // area and are no sample: leave them out of the read, and out of
+        // the super-block count below. The empties are a suffix of the
+        // rows and of the columns, so the blocks that remain are the
+        // rectangle [bx0, bxe) x [by0, bye).
+        size_t n = 0, bxe = bx0, bye = by0;
         for(size_t by = by0; by < by1; by++)
           for(size_t bx = bx0; bx < bx1; bx++)
+          {
+            const float cnt = buf[((by + 1) * sat_w + bx + 1) * comps + 4 * r + 2]
+                            - buf[(by * sat_w + bx + 1) * comps + 4 * r + 2]
+                            - buf[((by + 1) * sat_w + bx) * comps + 4 * r + 2]
+                            + buf[(by * sat_w + bx) * comps + 4 * r + 2];
+            if(cnt <= 0.0f) continue;
             scratch[n++] = (double)buf[(by * sat_w + bx) * comps + 4 * r + 3];
+            bxe = MAX(bxe, bx + 1);
+            bye = MAX(bye, by + 1);
+          }
 
         qsort(scratch, n, sizeof(double), _ct_cmp_double);
         p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
@@ -3196,7 +3213,8 @@ static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const b
         // clipped box touches, partial cells at its edges included
         const double step = exp2((double)(r / CT_SCALES_PER_OCTAVE));
         const size_t grp = _ladder_superblock_side(step);
-        nblocks[r] = (int)(((bx1 - 1) / grp - bx0 / grp + 1) * ((by1 - 1) / grp - by0 / grp + 1));
+        nblocks[r] = (n == 0) ? 0
+          : (int)(((bxe - 1) / grp - bx0 / grp + 1) * ((bye - 1) / grp - by0 / grp + 1));
       }
       dt_free_align(scratch);
       ok = TRUE;
