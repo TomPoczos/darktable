@@ -2535,25 +2535,16 @@ static double _ct_sigma_to_node(const double sigma)
 #define CT_DEFAULT_NODE 4.89
 // CT_DEFAULT_WIDTH = 1.65 nodes -- the fitted Gaussian's own sigma.
 #define CT_DEFAULT_WIDTH 1.65
-// implementation-plan-8.md §3.2: CT_DEFAULT_PEAK_EFF is what gets *written*
-// into band[] now, at gain_local_contrast's own neutral default of 1.0 --
-// there is no post-pick moment any more at which to bump the master
-// (init()/_target_curve write the same hump the picker itself writes,
-// nothing to distinguish "just picked" from "just enabled"), so the module's
-// baseline curve has to carry its own full effective strength directly
-// rather than splitting it across a shape amplitude and a raised master.
-// 0.30 = the old split's 0.20 * 1.5 (CT_DEFAULT_PEAK * the deleted
-// CT_POST_PICK_MASTER below) -- same effective peak band gain of 1.30, same
-// three lines of evidence (this photographer's own median accepted peak
-// band gain 1.35; §4.4's countershading ceiling at its preferred 0.65
-// fraction, 1.40 at the fussiest band; §4.7's acutance saturation, nothing
-// worth buying past roughly there). _ct_band_master's smooth knee is
-// homogeneous of degree 1 in (master, R_k) together (R_k = (ceiling-1)/
-// (band-1) scales by the same 2/3 factor band-1 scales by 1.5x), so
-// band_master(k)*(band-1) -- what process() actually applies -- comes out
-// identical under the 0.20x1.5 -> 0.30x1.0 split for every master the user
-// might already have set before a pick, not just at the neutral default;
-// verified algebraically (plan-8 Phase 1.4) rather than only by rendering.
+// implementation-plan-8.md §3.2: the hump's peak excess over 1.0, written
+// into band[] directly at gain_local_contrast's own neutral default of 1.0.
+// init(), the "default curve" preset and a fixed-mode pick all write this
+// same hump, so there is no "just picked" moment at which to raise the
+// master instead: the baseline curve carries its full effective strength
+// itself, a peak band gain of 1.30. Sized by three lines of evidence: this
+// photographer's own median accepted peak band gain (1.35); plan-6 §4.4's
+// countershading ceiling at its preferred 0.65 fraction (1.40 at the
+// fussiest band); and §4.7's acutance saturation, past which there is
+// nothing worth buying.
 #define CT_DEFAULT_PEAK_EFF 0.30
 
 // implementation-plan-6.md §6 Phase 2.5, decided: the shape's own natural
