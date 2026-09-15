@@ -3207,6 +3207,14 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 // super-block sitting in a corner of a large box should not outvote one
 // that covers most of it.
 //
+// nblocks[] gets the number of *distinct* super-blocks the box overlaps at
+// each rung -- what the percentile is really a statistic of, since the
+// repeated values above add area weight but no new samples. A nearest-rank
+// p99 is simply the maximum below ~100 distinct values, and p90 is too
+// below 10, so p90/p99 reads exactly 1 on a box that overlaps fewer than
+// ~10 super-blocks whatever its content: the caller uses this count to
+// know which rungs it can trust (CT_PERCENTILE_MIN_BLOCKS).
+//
 // The box-to-blocks clipping below is the same arithmetic
 // _fit_curve_from_box uses (see there); not factored into a shared helper
 // since the two loops that follow it diverge immediately (four-corner SAT
@@ -3215,6 +3223,7 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const box,
                                        double *const restrict p90,
                                        double *const restrict p99,
+                                       int *const restrict nblocks,
                                        int *const restrict nrungs_out)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
@@ -3241,8 +3250,8 @@ static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const b
     // implementation-plan-8.md §5.4: O(blocks) per rung, <= 21600 blocks for
     // the whole frame at CT_BLOCK=8 on a 1440x960 preview -- this runs once
     // per pick on the GUI thread, no need for anything past a plain qsort.
-    const size_t nblocks = (bx1 - bx0) * (by1 - by0);
-    double *const restrict scratch = dt_alloc_align_double(MAX(nblocks, (size_t)1));
+    const size_t nbase = (bx1 - bx0) * (by1 - by0);
+    double *const restrict scratch = dt_alloc_align_double(MAX(nbase, (size_t)1));
     if(scratch)
     {
       const float *const restrict buf = g->pd.buf;
@@ -3257,132 +3266,15 @@ static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const b
         qsort(scratch, n, sizeof(double), _ct_cmp_double);
         p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
         p99[r] = _ct_percentile_sorted(scratch, n, 0.99);
-      }
-      dt_free_align(scratch);
-      ok = TRUE;
-    }
-  }
 
-  dt_iop_gui_leave_critical_section(self);
-  return ok;
-}
-
-// implementation-plan-8.md §5.2/§5.4's correction: `q_gauss`, the baseline
-// `percentile` mode's own q_r = p90/p99 is measured against, is not the
-// closed-form iid constant (0.920 for 64 samples) §5.2 first guessed --
-// Phase 0.2 measured it at a pooled median of 0.601 on real sensor data,
-// because a super-block's samples are not independent at native resolution
-// (demosaicing correlates neighbours). So it has to be measured per image,
-// per rung, the same way _ladder_rung_noise_floor measures its own noise
-// floor: frame-wide, restricted to super-blocks whose own kappa reads as
-// near-Gaussian (within CT_KAPPA_NOISE_TOL of CT_KAPPA_GAUSSIAN -- the same
-// test _ladder_rung_noise_floor already applies at the base-block
-// granularity, applied here one level up at the super-block grouping
-// _ladder_superblock_side/_ladder_build_blockrms use).
-//
-// Ported from the offline harness's own version of this
-// (picker-regression/harness_v2/dig_phase0.c's for_each_superblock +
-// _cb_gauss_rms), adapted to box-query the live module's published SAT
-// buffer (g->pd, the 4-component sat2/sat1/sat_n/blockrms layout) instead
-// of a standalone _ct_ladder_t the harness keeps around for its own use --
-// the live module has no such struct outside the pixelpipe's own ladder
-// build, only what it publishes.
-//
-// A rung with fewer than 20 near-Gaussian super-blocks in the whole frame
-// has no reliable ratio of its own; §5.4 says to fall back to this frame's
-// own median over rungs that did clear 20, and only to the pooled constant
-// 0.60 (plan-8-evidence/00-families-on-12-crops.txt §0.2's own empirical
-// median across 11 frames) when nothing in the frame clears it anywhere.
-static gboolean _frame_gauss_baseline(dt_iop_module_t *self,
-                                      double *const restrict q_gauss,
-                                      int *const restrict nrungs_out)
-{
-  dt_iop_contrast_gui_data_t *const g = self->gui_data;
-
-  dt_iop_gui_enter_critical_section(self);
-
-  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
-  const size_t comps = g->pd.components;
-  const gboolean have_data =
-    g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-    && comps == (size_t)(4 * g->ladder_nrungs);
-
-  gboolean ok = FALSE;
-  if(have_data)
-  {
-    const size_t bw = sat_w - 1, bh = sat_h - 1;
-    const float *const restrict buf = g->pd.buf;
-    *nrungs_out = g->ladder_nrungs;
-
-    double ratio[CT_MAX_BANDS];
-    gboolean valid[CT_MAX_BANDS];
-    double *const restrict scratch = dt_alloc_align_double(MAX(bw * bh, (size_t)1));
-    if(scratch)
-    {
-      for(int r = 0; r < g->ladder_nrungs; r++)
-      {
-        // _build_ladder's own step: constant across one octave's
-        // CT_SCALES_PER_OCTAVE rungs, doubling per octave -- see its
-        // comment on the ladder-building loop.
+        // super-blocks sit on the global block grid (_ladder_build_blockrms
+        // groups from block 0), so the count is over the grid cells the
+        // clipped box touches, partial cells at its edges included
         const double step = exp2((double)(r / CT_SCALES_PER_OCTAVE));
         const size_t grp = _ladder_superblock_side(step);
-
-        size_t n = 0;
-        for(size_t gy = 0; gy < bh; gy += grp)
-        {
-          const size_t y1 = MIN(gy + grp, bh);
-          for(size_t gx = 0; gx < bw; gx += grp)
-          {
-            const size_t x1 = MIN(gx + grp, bw);
-            const double s2 = buf[(y1 * sat_w + x1) * comps + 4 * r]
-                             - buf[(gy * sat_w + x1) * comps + 4 * r]
-                             - buf[(y1 * sat_w + gx) * comps + 4 * r]
-                             + buf[(gy * sat_w + gx) * comps + 4 * r];
-            const double s1 = buf[(y1 * sat_w + x1) * comps + 4 * r + 1]
-                             - buf[(gy * sat_w + x1) * comps + 4 * r + 1]
-                             - buf[(y1 * sat_w + gx) * comps + 4 * r + 1]
-                             + buf[(gy * sat_w + gx) * comps + 4 * r + 1];
-            const double sn = buf[(y1 * sat_w + x1) * comps + 4 * r + 2]
-                             - buf[(gy * sat_w + x1) * comps + 4 * r + 2]
-                             - buf[(y1 * sat_w + gx) * comps + 4 * r + 2]
-                             + buf[(gy * sat_w + gx) * comps + 4 * r + 2];
-            if(sn <= 0.0 || s1 <= 0.0) continue;
-            const double e_mean = s2 / sn;
-            const double s1_mean = s1 / sn;
-            const double kappa = sqrt(e_mean) / s1_mean;
-            if(fabs(kappa - CT_KAPPA_GAUSSIAN) <= CT_KAPPA_NOISE_TOL * CT_KAPPA_GAUSSIAN)
-              scratch[n++] = sqrt(e_mean);
-          }
-        }
-
-        if(n >= 20)
-        {
-          qsort(scratch, n, sizeof(double), _ct_cmp_double);
-          const double p90 = _ct_percentile_sorted(scratch, n, 0.90);
-          const double p99 = _ct_percentile_sorted(scratch, n, 0.99);
-          ratio[r] = (p99 > 0.0) ? p90 / p99 : 1.0;
-          valid[r] = TRUE;
-        }
-        else
-        {
-          ratio[r] = 0.0;
-          valid[r] = FALSE;
-        }
+        nblocks[r] = (int)(((bx1 - 1) / grp - bx0 / grp + 1) * ((by1 - 1) / grp - by0 / grp + 1));
       }
       dt_free_align(scratch);
-
-      double have_ratios[CT_MAX_BANDS];
-      int nhave = 0;
-      for(int r = 0; r < g->ladder_nrungs; r++) if(valid[r]) have_ratios[nhave++] = ratio[r];
-      double frame_fallback = 0.60;
-      if(nhave > 0)
-      {
-        qsort(have_ratios, nhave, sizeof(double), _ct_cmp_double);
-        frame_fallback = (nhave % 2) ? have_ratios[nhave / 2]
-                                      : 0.5 * (have_ratios[nhave / 2 - 1] + have_ratios[nhave / 2]);
-      }
-      for(int r = 0; r < g->ladder_nrungs; r++) q_gauss[r] = valid[r] ? ratio[r] : frame_fallback;
-
       ok = TRUE;
     }
   }
@@ -3396,13 +3288,40 @@ static gboolean _frame_gauss_baseline(dt_iop_module_t *self,
 // crops found no value clearly better than 0.5.
 #define CT_PERCENTILE_GAMMA 0.5
 #define CT_PERCENTILE_EPS 0.01
-// plan-8-evidence/00-families-on-12-crops.txt §0.2's own pooled empirical
-// q_gauss median across 11 real frames -- not the 0.920 iid closed form for
-// 64 independent samples, which demosaiced sensor data never clears
-// (measured median 0.601, because neighbouring level pixels are correlated,
-// not independent). Last-resort fallback only, when a whole frame has no
-// rung with >= 20 near-Gaussian super-blocks.
-#define CT_PERCENTILE_GAUSS_FALLBACK 0.60
+
+// the two rails percentile mode's q_r = p90/p99 is read against, the same
+// way CT_KAPPA_GAUSSIAN/CT_KAPPA_STRUCT bracket structure mode's kappa.
+//
+// CT_PERCENTILE_Q_NOISE: what a spatially uniform field reads, i.e. the
+// finite-sample scatter of 64-sample block RMS values -- the chi
+// distribution with 64 degrees of freedom gives p90/p99 = 0.9198, and a
+// simulated nearest-rank read of it stays within 0.92-0.94 for any 20 or
+// more distinct super-blocks. A rung at or above this rail is as even as
+// noise and contributes nothing. §5.2/§5.4's per-frame "measured
+// q_gauss" replaced this: it was taken over the frame's near-Gaussian
+// super-blocks, but a super-block spans about one wavelength of its own
+// rung and reads near-Gaussian on ~78% of *all* content (see
+// _ct_structure_shape's comment), so what it measured was the frame's own
+// concentration, and a sub-box rarely beats the frame it is cut from --
+// plan-8-evidence/01-phase-4-5-review.txt: "already even" on a quarter of
+// 300 px boxes, and every rung with fewer than ~10 super-blocks.
+//
+// CT_PERCENTILE_Q_STRUCT: the q_r at which a rung counts as fully
+// concentrated -- 10th percentile of q_r over 3120 measured (box, rung)
+// pairs on the same review set, the mirror of CT_KAPPA_STRUCT's own 90th
+// percentile rule. An absolute rail rather than §5.2's peak-normalised
+// shape, so a box whose contrast is nearly even everywhere gets a small
+// curve, not a full-strength one built from whichever rung was least even.
+#define CT_PERCENTILE_Q_NOISE 0.9198
+#define CT_PERCENTILE_Q_STRUCT 0.43
+
+// fewest distinct super-blocks a rung needs before its p90/p99 means
+// anything -- see _box_block_percentiles: below ~10 the ratio is 1 by
+// construction, and 20 is where the simulated iid read settles onto the
+// closed form above. Rungs run fine to coarse and the count only ever
+// falls with rung, so the measurable rungs are always a prefix.
+#define CT_PERCENTILE_MIN_BLOCKS 20
+
 
 // implementation-plan-8.md §5's shared taper/smoothing rule for both
 // adaptive modes: "The three finest nodes are never measured at preview
@@ -3480,6 +3399,63 @@ static void _ct_project_rung_shape(const double *const restrict sigma_r,
     const double t = (hi_z > lo_z) ? (log_sg - lo_z) / (hi_z - lo_z) : 0.0;
     shape01[j] = s_r[lo] + t * (s_r[hi] - s_r[lo]);
   }
+}
+
+// implementation-plan-8.md §5.2 Phase 5.1: CT_PICK_PERCENTILE's own per-rung
+// shape, from the box's p90/p99 block-RMS concentration -- Bonnier &
+// Simoncelli's per-subband multiplier g(q) = ((1-eps)*q + eps)^(gamma-1)
+// collapsed to one gain per rung, read between the CT_PERCENTILE_Q_NOISE
+// and CT_PERCENTILE_Q_STRUCT rails:
+//
+//   s_r = clamp((g(q_r) - g(Q_NOISE)) / (g(Q_STRUCT) - g(Q_NOISE)), 0, 1)
+//
+// Only rungs with at least CT_PERCENTILE_MIN_BLOCKS distinct super-blocks
+// are measured; the shape past the last measured rung holds that rung's
+// own value, the same coarse-end rule _ct_project_rung_shape applies past
+// the coarsest rung anyway. *nmeasured reports how many rungs that was --
+// 0 means the box was too small to read at any rung, which a caller
+// should report differently from an all-zero shape. Returns TRUE with
+// `shape[]` filled iff at least one measured rung came back non-zero.
+static gboolean _ct_percentile_shape(const _ct_box_stats_t *const stats,
+                                     const double *const restrict p90,
+                                     const double *const restrict p99,
+                                     const int *const restrict nblocks, const int box_nrungs,
+                                     const double *const restrict sigma_grid, const int m,
+                                     double *const restrict shape, double *const restrict q_out,
+                                     int *const nmeasured)
+{
+  // both queries walk the same live ladder this pick's own `stats` came
+  // from and share its fine-to-coarse rung order, so index r here is index
+  // r there too -- `_box_block_percentiles` just doesn't stop early at the
+  // box's own lambda_max the way `_measure_box` does, hence the MIN.
+  const int n = MIN(box_nrungs, stats->nrungs);
+  int nm = 0;
+  while(nm < n && nblocks[nm] >= CT_PERCENTILE_MIN_BLOCKS && p99[nm] > 0.0) nm++;
+  *nmeasured = nm;
+  if(nm == 0) return FALSE;
+
+  const double g_noise = pow((1.0 - CT_PERCENTILE_EPS) * CT_PERCENTILE_Q_NOISE + CT_PERCENTILE_EPS,
+                             CT_PERCENTILE_GAMMA - 1.0);
+  const double g_struct = pow((1.0 - CT_PERCENTILE_EPS) * CT_PERCENTILE_Q_STRUCT + CT_PERCENTILE_EPS,
+                              CT_PERCENTILE_GAMMA - 1.0);
+  double s_r[CT_MAX_BANDS];
+  gboolean any_nonzero = FALSE;
+  for(int r = 0; r < nm; r++)
+  {
+    const double q = fmin(1.0, p90[r] / p99[r]);
+    q_out[r] = q;
+    const double g_r = pow((1.0 - CT_PERCENTILE_EPS) * q + CT_PERCENTILE_EPS, CT_PERCENTILE_GAMMA - 1.0);
+    s_r[r] = CLAMP((g_r - g_noise) / (g_struct - g_noise), 0.0, 1.0);
+    if(s_r[r] > 0.0) any_nonzero = TRUE;
+  }
+  if(!any_nonzero) return FALSE;
+
+  _ct_smooth_log_octave(stats->sigma, s_r, nm);
+
+  double shape01[CT_PROJECT_GRID];
+  _ct_project_rung_shape(stats->sigma, s_r, nm, sigma_grid, m, shape01);
+  for(int j = 0; j < m; j++) shape[j] = 1.0 + CT_DEFAULT_PEAK_EFF * shape01[j];
+  return TRUE;
 }
 
 // implementation-plan-8.md §5.1 Phase 4.1: CT_PICK_STRUCTURE's own per-rung
@@ -3640,91 +3616,52 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
 
   switch(mode)
   {
-    // implementation-plan-8.md §5.2/§5.4: spatial concentration per rung,
-    // Bonnier & Simoncelli's per-subband multiplier collapsed to one gain
-    // per band. q_r = p90/p99 of the box's own per-super-block RMS,
-    // normalised against this *frame's* own measured near-Gaussian
-    // baseline (§5.4's correction -- not a constant), then
-    // g_r = ((1-eps)*q_r' + eps)^(gamma-1) >= 1, and the shape is
-    // (g_r - 1) peak-normalised to 1.
+    // implementation-plan-8.md §5.2/§5.4 Phase 5.1/5.3: spatial
+    // concentration per rung -- see `_ct_percentile_shape`.
     case CT_PICK_PERCENTILE:
     {
       double p90[CT_MAX_BANDS], p99[CT_MAX_BANDS];
+      int nblocks[CT_MAX_BANDS];
       int box_nrungs = 0;
-      double q_gauss[CT_MAX_BANDS];
-      int gauss_nrungs = 0;
-      const gboolean have_box_q = _box_block_percentiles(self, box, p90, p99, &box_nrungs);
-      const gboolean have_gauss = _frame_gauss_baseline(self, q_gauss, &gauss_nrungs);
+      if(!_box_block_percentiles(self, box, p90, p99, nblocks, &box_nrungs)) box_nrungs = 0;
+
+      double q_r[CT_MAX_BANDS];
+      int nmeasured = 0;
+      const gboolean ok = _ct_percentile_shape(stats, p90, p99, nblocks, box_nrungs, sigma_grid, m,
+                                               shape, q_r, &nmeasured);
 
       // implementation-plan-8.md §4.4/§5.4 Phase 2.3/5.2: publish this
-      // pick's own *raw* q_r (p90/p99, before the q_gauss normalisation
-      // below) for the graph overlay -- the overlay draws it against the
-      // frame-wide q_r and the noise baseline on the same un-normalised
-      // axis, the same way the fixed mode's spectrum overlay a few lines
-      // above draws raw energies rather than anything already folded into
-      // a shape.
+      // pick's own q_r for the graph overlay, measured rungs only, whether
+      // or not there was anything to write -- the overlay's whole point is
+      // to make a pick legible, including one that landed on nothing.
       {
-        const int overlay_n = have_box_q ? MIN(box_nrungs, stats->nrungs) : 0;
-        double overlay_q[CT_MAX_BANDS];
-        for(int r = 0; r < overlay_n; r++) overlay_q[r] = (p99[r] > 0.0) ? p90[r] / p99[r] : 0.0;
         dt_iop_contrast_gui_data_t *const g = self->gui_data;
         dt_iop_gui_enter_critical_section(self);
-        if(overlay_n > 0) memcpy(g->mode_overlay, overlay_q, sizeof(double) * overlay_n);
-        g->mode_overlay_n = overlay_n;
+        if(nmeasured > 0) memcpy(g->mode_overlay, q_r, sizeof(double) * nmeasured);
+        g->mode_overlay_n = nmeasured;
         dt_iop_gui_leave_critical_section(self);
       }
 
-      double raw[CT_MAX_BANDS];
-      double peak = 0.0;
-      const int n = stats->nrungs;
-      for(int r = 0; r < n; r++)
+      if(!ok)
       {
-        // both queries walk the same live ladder this pick's own `stats`
-        // came from and share its fine-to-coarse rung order, so index r
-        // here is index r there too -- `_box_block_percentiles`/
-        // `_frame_gauss_baseline` just don't stop early at the box's own
-        // lambda_max the way `_measure_box` does, hence the `have_*` guards
-        // plus `r < box_nrungs`/`r < gauss_nrungs` rather than assuming
-        // they cover exactly `n`.
-        double q = 1.0;  // "no concentration measured here" -> g_r == 1 -> contributes nothing
-        if(have_box_q && r < box_nrungs && p99[r] > 0.0)
+        // §5's own "nothing to do" case: the default curve is already
+        // applied, so refusing here is a no-op, not a fallback. A box with
+        // no measurable rung at all is a different refusal: nothing was
+        // read, so nothing can be said about its evenness. _fit_spectrum's
+        // own CT_MIN_SPAN refusal does not cover it -- a 16 px box keeps
+        // the four rungs the fit wants but overlaps only 2x2 finest-rung
+        // super-blocks -- so quote the smallest box that would, the way
+        // the fit's own refusal does.
+        if(nmeasured == 0)
         {
-          q = p90[r] / p99[r];
-          if(have_gauss && r < gauss_nrungs && q_gauss[r] > 0.0) q = fmin(1.0, q / q_gauss[r]);
+          const double min_side = CT_BLOCK * ceil(sqrt((double)CT_PERCENTILE_MIN_BLOCKS));
+          dt_control_log(_("the picked area is too small to measure local contrast levels from -- "
+                            "try at least %.0f x %.0f px"), min_side, min_side);
         }
-        const double g_r = pow((1.0 - CT_PERCENTILE_EPS) * q + CT_PERCENTILE_EPS,
-                               CT_PERCENTILE_GAMMA - 1.0);
-        raw[r] = g_r - 1.0;
-        peak = fmax(peak, raw[r]);
-      }
-
-      // §5's own "nothing to do" case: local contrast is already even at
-      // every measured scale in the picked area -- the default curve is
-      // already applied, so refusing here is a no-op, not a fallback.
-      if(n == 0 || peak <= 0.0)
-      {
-        dt_control_log(_("local contrast is already even at every size in the picked area"));
+        else
+          dt_control_log(_("local contrast is already even at every size in the picked area"));
         return FALSE;
       }
-
-      double s_r[CT_MAX_BANDS];
-      for(int r = 0; r < n; r++) s_r[r] = raw[r] / peak;
-
-      _ct_smooth_log_octave(stats->sigma, s_r, n);
-
-      // re-normalise after smoothing: the Gaussian kernel is a weighted
-      // average of already-<=1 values, so this can only ever pull the peak
-      // down, never past 1 -- but does not itself guarantee the new peak is
-      // exactly 1, and the module's own strength convention (§3.2, band[k]
-      // = 1 + CT_DEFAULT_PEAK_EFF*s_k) wants a shape that actually reaches
-      // its peak amplitude at its own strongest rung.
-      double speak = 0.0;
-      for(int r = 0; r < n; r++) speak = fmax(speak, s_r[r]);
-      if(speak > 0.0) for(int r = 0; r < n; r++) s_r[r] /= speak;
-
-      double shape01[CT_PROJECT_GRID];
-      _ct_project_rung_shape(stats->sigma, s_r, n, sigma_grid, m, shape01);
-      for(int j = 0; j < m; j++) shape[j] = 1.0 + CT_DEFAULT_PEAK_EFF * shape01[j];
 
       *absolute = TRUE;
       return TRUE;
@@ -4517,6 +4454,12 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
 // per-rung sort over up to bw*bh blocks (<= 21600 per §5.4) -- called only
 // from CT_PICK_PERCENTILE's own overlay case (Phase 5.2), not the hot path
 // every redraw takes regardless of mode.
+//
+// Stops at the first rung where the whole frame overlaps fewer than
+// CT_PERCENTILE_MIN_BLOCKS distinct super-blocks, for the same reason
+// _ct_percentile_shape does: past that the ratio is 1 by construction, and
+// drawing it would show the curve climbing to the top of the plot at the
+// coarse end as if the frame's contrast were even there.
 static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
                                                  double *const restrict p90,
                                                  double *const restrict p99,
@@ -4539,9 +4482,13 @@ static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
     if(scratch)
     {
       const float *const restrict buf = g->pd.buf;
-      *nrungs = g->ladder_nrungs;
+      *nrungs = 0;
       for(int r = 0; r < g->ladder_nrungs; r++)
       {
+        const double step = exp2((double)(r / CT_SCALES_PER_OCTAVE));
+        const size_t grp = _ladder_superblock_side(step);
+        if(((bw + grp - 1) / grp) * ((bh + grp - 1) / grp) < CT_PERCENTILE_MIN_BLOCKS) break;
+
         size_t n = 0;
         for(size_t by = 0; by < bh; by++)
           for(size_t bx = 0; bx < bw; bx++)
@@ -4550,6 +4497,7 @@ static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
         qsort(scratch, n, sizeof(double), _ct_cmp_double);
         p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
         p99[r] = _ct_percentile_sorted(scratch, n, 0.99);
+        *nrungs = r + 1;
       }
       dt_free_align(scratch);
       ok = TRUE;
@@ -4766,21 +4714,38 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
       }
       case CT_PICK_PERCENTILE:
       {
-        // Phase 5.2: q_r per rung against the frame-wide q_r and the noise
-        // baseline -- three curves on the same linear [0,1] ratio axis
-        // _draw_ratio_curve above draws. mode_overlay[]/pick_lambda[] is
-        // this pick's own box q_r, published by _mode_shape's
-        // CT_PICK_PERCENTILE case; the other two are cheap enough
-        // (O(1)/O(blocks) per rung, no box clipping) to recompute on every
-        // redraw rather than caching, the same way the always-on frame
-        // spectrum curve above does.
+        // Phase 5.2: q_r per rung against the frame-wide q_r, between the
+        // two rails the shape is read off -- all on the same linear [0,1]
+        // ratio axis _draw_ratio_curve above draws. mode_overlay[]/
+        // pick_lambda[] is this pick's own box q_r, published by
+        // _mode_shape's CT_PICK_PERCENTILE case; the frame-wide curve is
+        // cheap enough (O(blocks) per rung, no box clipping) to recompute
+        // on every redraw rather than caching, the same way the always-on
+        // frame spectrum curve above does.
+        //
+        // rails first, dashed and full width like structure mode's kappa
+        // rails above, so the curves drawn on top read against a fixed
+        // scale. Q_NOISE is the upper one on this axis (a ratio near 1 is
+        // even, near 0 is concentrated), Q_STRUCT the lower.
+        {
+          const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
+          cairo_set_dash(cr, dashes, 2, 0.0);
+          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                                   darktable.bauhaus->graph_border.green,
+                                   darktable.bauhaus->graph_border.blue, 0.6);
+          const float y_noise = height * (1.0f - (float)CT_PERCENTILE_Q_NOISE);
+          dt_draw_line(cr, 0, y_noise, width, y_noise);
+          cairo_stroke(cr);
+          const float y_struct = height * (1.0f - (float)CT_PERCENTILE_Q_STRUCT);
+          dt_draw_line(cr, 0, y_struct, width, y_struct);
+          cairo_stroke(cr);
+          cairo_set_dash(cr, NULL, 0, 0.0);
+        }
+
         double frame_p90[CT_MAX_BANDS], frame_p99[CT_MAX_BANDS];
         int frame_q_nrungs = 0;
         const gboolean have_frame_q =
           _spectrum_frame_wide_percentiles(self, frame_p90, frame_p99, &frame_q_nrungs);
-        double q_gauss[CT_MAX_BANDS];
-        int gauss_nrungs = 0;
-        const gboolean have_gauss = _frame_gauss_baseline(self, q_gauss, &gauss_nrungs);
 
         if(have_pick && mode_overlay_n > 0)
         {
@@ -4801,18 +4766,6 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
                                    darktable.bauhaus->graph_border.blue, 0.8);
           _draw_ratio_curve(cr, width, height, frame_lambda, frame_q, frame_q_nrungs,
                             roi_long_edge, axis);
-        }
-
-        if(have_gauss && gauss_nrungs > 0)
-        {
-          const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
-          cairo_set_dash(cr, dashes, 2, 0.0);
-          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
-                                   darktable.bauhaus->graph_border.green,
-                                   darktable.bauhaus->graph_border.blue, 0.5);
-          _draw_ratio_curve(cr, width, height, frame_lambda, q_gauss, gauss_nrungs,
-                            roi_long_edge, axis);
-          cairo_set_dash(cr, NULL, 0, 0.0);
         }
         break;
       }
