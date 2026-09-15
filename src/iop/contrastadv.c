@@ -360,12 +360,11 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
 // measuring the detail level from the ladder: the model and the fit
 // ---------------------------------------------------------------------------
 //
-// §2.2: the ladder itself is built frame-wide now (§2.1's _build_ladder,
-// queried through the SAT tables color_picker_apply() reads directly) rather
-// than inside the picked box, so the box no longer bounds how far the ladder
-// can reach -- what is left here is only the fit: given a rung's (wavelength,
-// energy, weight) triples for the picked box, what texture size explains
-// them. §2.3's `_fit_spectrum`, below, is that fit.
+// §2.2: the ladder is built frame-wide (§2.1's _build_ladder) and queried
+// per box through its SAT tables by _measure_box, so the box does not bound
+// how far the ladder can reach -- what is left here is only the fit: given a
+// rung's (wavelength, energy, weight) triples for the picked box, what
+// texture size explains them. §2.3's `_fit_spectrum`, below, is that fit.
 //
 // detail_level is a low-pass size: the filter radius is 2^-detail_level of the
 // image's long edge, and everything finer than that window ends up in the
@@ -474,8 +473,8 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
 // CT_SIGMA_TO_LAMBDA = 7.09 px, so together these put the floor at
 // CT_MIN_SPAN * 7.09 = 14.2 px on the short axis -- the number the refusal
 // message below actually quotes. 24 px is a different, unstated claim: the
-// worst case *after* _fit_curve_from_box's outward block rounding (three
-// 8 px blocks).
+// worst case *after* _measure_box's outward block rounding (three 8 px
+// blocks).
 #define CT_MIN_SPAN 2.0
 #define CT_MIN_BANDS 4
 
@@ -494,15 +493,14 @@ static inline double _dog_shape(const double s, const double tau)
 
 // research.md §5.4's model: E(s) = N*_dog_shape(s,0) + C*s^((beta-2)/2) +
 // A*_dog_shape(s,tau) -- sensor noise, self-similar scene content, and a
-// texture with a size, respectively. replaces `_fit_texture_scale`'s
-// single-hump-plus-floor fit: that fit could locate a texture's size but had
-// no way to tell a real one from a patch of self-similar content that simply
-// disagreed with beta = 2, nor from a noise floor rising into the fine end
-// of the ladder -- both read as "texture" before. N, C, A are amplitudes and
-// so constrained >= 0; tau (texture size^2) and beta (spectral slope) are
-// fit by grid search, same discipline as the argmax-is-hopeless reasoning
-// `_fit_texture_scale` documented: locate the hump by fitting its whole
-// shape in log energy, not by reading off a raw peak.
+// texture with a size, respectively. a single hump plus a floor could
+// locate a texture's size but had no way to tell a real one from a patch of
+// self-similar content that simply disagreed with beta = 2, nor from a noise
+// floor rising into the fine end of the ladder -- both read as "texture".
+// N, C, A are amplitudes and so constrained >= 0; tau (texture size^2) and
+// beta (spectral slope) are fit by grid search: locate the hump by fitting
+// its whole shape in log energy, not by reading off a raw peak, whose
+// argmax on a falling spectrum carries no information.
 typedef struct _ct_fit_t
 {
   double noise, self_similar, texture;  // amplitudes N, C, A -- all >= 0
@@ -645,7 +643,7 @@ static void _fit_spectrum_at_beta(const double beta,
       col_a[i] = _dog_shape(s[i], tau);
     }
 
-    // 2-3 IRLS passes to approximate a log-space fit (research.md §5.5)
+    // three IRLS passes to approximate a log-space fit (research.md §5.5)
     // while keeping every inner solve linear: reweight by 1/E_model^2
     // after each solve, starting from the sampling weights alone.
     double w[CT_MAX_BANDS];
@@ -716,15 +714,16 @@ static void _fit_spectrum_at_beta(const double beta,
   }
 }
 
-// fit the model to one box's per-rung (wavelength, energy, weight) triples.
+// fit the model to one box's per-rung (sigma, energy, weight) triples.
 // noise_prior >= 0 fixes N to that value instead of fitting it (research.md
-// §5.5: "prefer fixing N from the block-minimum noise estimate... stabilises
-// everything else") -- §2.4 is what will supply a real prior; until then
-// every caller passes -1 and N fits freely alongside C and A.
+// §5.5: "prefer fixing N from the block-minimum noise estimate... stabilizes
+// everything else"); _measure_box supplies §2.4's _ladder_estimate_noise
+// estimate, which is < 0 when no rung had a usable floor, and N then fits
+// freely alongside C and A.
 //
-// returns FALSE under the same refusals `_fit_texture_scale` used: too few
-// rungs or too narrow a span to trust a fit, or nothing above the noise
-// floor anywhere in the box -- *reason says which (implementation-plan-2.md
+// returns FALSE, leaving *fit untouched, when there are too few rungs or
+// too narrow a span to trust a fit, or nothing above the noise floor
+// anywhere in the box -- *reason says which (implementation-plan-2.md
 // §6.1), so the caller can say something specific.
 static gboolean _fit_spectrum(const double *const restrict sigma,
                               const double *const restrict energy,
@@ -760,10 +759,9 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   const gboolean fix_noise = noise_prior >= 0.0;
   const gboolean init_active[3] = { !fix_noise, TRUE, TRUE };
 
-  // candidate texture sizes: from half the finest rung to the coarsest one,
-  // same range `_fit_texture_scale` scanned and for the same reason -- the
-  // top of it puts the hump's peak just past the end of the ladder, as far
-  // as the rising flank alone can honestly be pushed.
+  // candidate texture sizes: from half the finest rung to the coarsest one.
+  // the top of it puts the hump's peak just past the end of the ladder, as
+  // far as the rising flank alone can honestly be pushed.
   const double lo = sigma[0] * 0.5;
   const double hi = sigma[n - 1];
   const int tau_steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * log2(hi / lo)), 1);
@@ -834,7 +832,7 @@ static inline void _ct_fit_eval(const _ct_fit_t *const fit, const double sigma,
 // general two-radius covariance below, which needs no rung: for any pair of
 // Gaussian blur radii (sigma_a, sigma_b), Var[blur_a - blur_b] of that same
 // field is K*[1/(sigma_a^2+tau) + 1/(sigma_b^2+tau)] - 4K/(sigma_a^2+
-// sigma_b^2+2*tau), and matching this at sigma_b = k2*sigma_a against
+// sigma_b^2+2*tau), and matching this at sigma_b^2 = k2*sigma_a^2 against
 // _dog_shape's own closed form fixes K = 1/2 -- verified by direct
 // arithmetic and against raw numeric quadrature of the filter
 // (picker-regression/harness_v2/dig_calibration_scale.py's own approach,
@@ -845,9 +843,10 @@ static inline double _ct_dog_shape2(const double sa, const double sb, const doub
   return 0.5 * (1.0 / (sa + tau) + 1.0 / (sb + tau)) - 2.0 / (sa + sb + 2.0 * tau);
 }
 
-// ladder rung ratio (2^(2/CT_SCALES_PER_OCTAVE), CT_SCALES_PER_OCTAVE = 3),
-// matching _dog_shape's own local k2 -- needed again below since
-// _ct_selfsimilar_shape2 has no single fixed rung to work from.
+// ladder rung ratio in s = sigma^2 (2^(2/CT_SCALES_PER_OCTAVE),
+// CT_SCALES_PER_OCTAVE = 3), matching _dog_shape's own local k2 -- needed
+// again below since _ct_selfsimilar_shape2 has no single fixed rung to work
+// from.
 #define CT_LADDER_K2 1.5874010519681994
 
 static inline double _ct_xlnx(const double x)
@@ -859,8 +858,8 @@ static inline double _ct_xlnx(const double x)
 // _ct_dog_shape2 above. fit->self_similar multiplies pow(s,(beta-2)/2) in
 // _ct_fit_eval, but that coefficient is not the self-similar spectrum's own
 // amplitude C0 -- integrating a w^-beta 2D spectrum against a DoG(sigma_a,
-// sigma_b) filter gives C0 * (1/2)*Gamma(1-beta/2) * bracket(sigma_a,
-// sigma_b,beta), bracket(a,b,e) = a^e+b^e-2*((a+b)/2)^e, e=(beta-2)/2 -- and
+// sigma_b) filter gives C0 * (1/2)*Gamma(1-beta/2) * bracket(sa, sb, e),
+// bracket(a,b,e) = a^e+b^e-2*((a+b)/2)^e, e=(beta-2)/2, sa = sigma_a^2 -- and
 // _fit_spectrum solved for the coefficient of pow(s,(beta-2)/2), which is
 // C0*(1/2)*Gamma(1-beta/2)*bracket(1,k2,beta) (bracket(.) factors out
 // s^e exactly, leaving an s-independent, beta-dependent shape term). Dividing
@@ -994,8 +993,7 @@ static double _ct_predict_band_energy(const _ct_fit_t *const fit,
 }
 
 // §2.5: which of research.md §5.6's target shapes a fit earns. DETAIL is
-// the A-negligible fallback -- "a self-similar area with no size";
-// `_fit_curve_from_box` below decides which.
+// the A-negligible fallback -- "a self-similar area with no size".
 // implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is research.md §5.6's
 // third shape, "boost what's weak" rather than TEXTURE's now-deleted "boost
 // whatever carries the most energy" -- already shipped, unchanged, as the
@@ -1009,7 +1007,7 @@ static double _ct_predict_band_energy(const _ct_fit_t *const fit,
 // picker's job shrinks to "which fixed shape" (never "no shape", since
 // DETAIL's own shape is flat and un-derived) rather than "derive a shape".
 // DETAIL/EQUALIZE stay reachable by other callers (EQUALIZE by the "flatten
-// spectrum" preset, DETAIL by nothing left, see _fit_curve_from_box's §2.2).
+// spectrum" preset, DETAIL by nothing left).
 typedef enum _ct_target_mode_t
 {
   CT_TARGET_DETAIL   = 0,
