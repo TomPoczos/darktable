@@ -4806,7 +4806,7 @@ void gui_init(dt_iop_module_t *self)
                                 "graph for which bands still have headroom."));
   dt_bauhaus_widget_set_quad(g->gain_local_contrast, self, dtgtk_cairo_paint_showmask, TRUE, show_details_callback,
                              _("visualize the accumulated correction -- what this module is doing.\n"
-                               "ctrl+click: visualize the raw, un-gained detail sum (v1's behaviour)."));
+                               "ctrl+click: visualize the raw, un-gained detail sum"));
 
   // Filter settings section
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "filter settings")));
