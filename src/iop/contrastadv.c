@@ -3064,8 +3064,12 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
       stats->lambda[nrungs] = lam;
       // §4.2: frame-relative, so it lines up with §4.1's band sigma
       stats->sigma[nrungs] = g->ladder_sigma[r] / (double)long_edge;
-      stats->energies[nrungs] = s2 / n_eff;
-      stats->s1_energy[nrungs] = s1 / n_eff;
+      // the SAT is narrowed to float when published (_ladder_fill_cb), so a
+      // box whose true sum is far below the table's own rounding (a rung
+      // that sees nothing in a clipped area) comes back as +-noise, and a
+      // negative energy turns _ct_structure_shape's sqrt() into NaN
+      stats->energies[nrungs] = fmax(s2, 0.0) / n_eff;
+      stats->s1_energy[nrungs] = fmax(s1, 0.0) / n_eff;
       stats->weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
       stats->noise_floor[nrungs] = g->ladder_noise_floor[r];
 
