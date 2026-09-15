@@ -906,6 +906,28 @@ static double _ct_selfsimilar_shape2(const double sa, const double sb, const dou
   return num / den;
 }
 
+// the shape term _ct_selfsimilar_shape2's comment divides out, made
+// explicit for the shelf below: (1/2)*Gamma(1-beta/2)*bracket(1,k2,e) is a
+// ladder rung's own gain on a w^-beta spectrum, in the normalization
+// _ct_dog_shape2 gives the noise and texture terms, so fit->self_similar /
+// this is the amplitude that multiplies w^-beta directly in the same units
+// fit->noise multiplies 1 and fit->texture multiplies exp(-tau*w^2). It is
+// ~0.026-0.034 over the whole beta grid, so leaving it out (as the shelf
+// integrand did) under-predicted the self-similar part of the shelf ~35x.
+// finite through Gamma's poles at beta = 2 and 4 because bracket vanishes
+// there: Gamma(z) = Gamma(z+2)/(z*(z+1)) with z = -e turns the poles into
+// 1/(e*(e-1)), and the two branches are the same L'Hopital limits
+// _ct_selfsimilar_shape2 takes at those e.
+static double _ct_selfsimilar_rung_gain(const double beta)
+{
+  const double e = (beta - 2.0) * 0.5;
+  const double k2 = CT_LADDER_K2, m = (1.0 + k2) * 0.5;
+  const double g = 0.5 * tgamma(2.0 - e);  // Gamma(z+2), z = 1 - beta/2 = -e
+  if(fabs(e) < 1e-4) return g * (2.0 * log(m) - log(k2)) / (1.0 - e);
+  if(fabs(e - 1.0) < 1e-4) return g * (k2 * log(k2) - (1.0 + k2) * log(m)) / e;
+  return g * (1.0 + pow(k2, e) - 2.0 * pow(m, e)) / (e * (e - 1.0));
+}
+
 #define CT_CALIBRATION_QUAD_POINTS 200
 
 // implementation-plan-4.md §1.2: the finest *measured* band (sigma_a == 0,
@@ -928,6 +950,10 @@ static double _ct_predict_shelf_energy(const _ct_fit_t *const fit,
 {
   const double wmin = wmax * 1e-4;
   const double du = log(wmax / wmin) / (double)(CT_CALIBRATION_QUAD_POINTS - 1);
+  // fit->noise and fit->texture already are their PSDs' amplitudes in the
+  // normalization this integrand uses; fit->self_similar is not, see
+  // _ct_selfsimilar_rung_gain
+  const double c0 = fit->self_similar / _ct_selfsimilar_rung_gain(fit->beta);
 
   double total = 0.0, prev = 0.0;
   for(int i = 0; i < CT_CALIBRATION_QUAD_POINTS; i++)
@@ -936,7 +962,7 @@ static double _ct_predict_shelf_energy(const _ct_fit_t *const fit,
     const double H = 1.0 - exp(-sb * w * w * 0.5);
     const double psd = fit->noise
                       + fit->texture * exp(-fit->tau * w * w)
-                      + fit->self_similar * pow(w, -fit->beta);
+                      + c0 * pow(w, -fit->beta);
     // H^2 * P(w) * w [2D polar measure] * w [dw = w du, log-spaced grid]
     const double g = H * H * psd * w * w;
     if(i > 0) total += 0.5 * (g + prev) * du;
