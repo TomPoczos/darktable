@@ -3397,12 +3397,15 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // way around, syncing widgets to params that have already changed.
   dt_iop_contrast_params_t *p = self->params;
 
-  // §2.5/research.md §5.6: the picker sets shape, never strength -- with one
-  // exception, the same one blackwhite's picker uses to turn its filter on:
-  // a shape with no strength behind it (gain still at its neutral default)
-  // would be invisible, so raise it first.
-  if(p->gain_local_contrast == 1.0f) p->gain_local_contrast = CT_POST_PICK_MASTER;
-
+  // plan-8 §3.2 Phase 1.2: the picker never touches gain_local_contrast any
+  // more -- CT_TARGET_DEFAULT's shape now carries its own full effective
+  // strength directly (CT_DEFAULT_PEAK_EFF, written at whatever master is
+  // already set), so there is no "shape with no strength behind it" case
+  // left to rescue the way blackwhite's picker still has to for its own
+  // filter-enable exception. The graph at gain_local_contrast == 1.0 now
+  // shows exactly what a fixed-mode pick applies -- plan-7 §4.2's "the
+  // graph tells the truth", finished.
+  //
   // implementation-plan-2.md §4.1: the nominal per-band boundary sigma,
   // frame-relative (sigma / long edge) and finest-first (idx 0) to match
   // `_project_to_bands`'s H_k derivation. The band ladder is frame-relative
