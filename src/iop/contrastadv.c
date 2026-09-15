@@ -194,15 +194,15 @@ typedef struct dt_iop_contrast_data_t
   float band[CT_BANDS];        // gains, copied verbatim from params
   int   nbands;                 // bands that survive the current roi scale
   float sigma[CT_BANDS];        // boundary sigmas, finest-surviving-first, in pixels of this roi
-  float gain[CT_BANDS];         // matching gains, same order as sigma
-  float feathering[CT_BANDS];   // §3.3: per-band edge protection, same order as sigma/gain
+  float feathering[CT_BANDS];   // §3.3: per-band edge protection, same order as sigma
   float feathering_base;        // from edge_protection/filter_iterations, before the per-band scaling
   // implementation-plan-6.md §5.3/§6 Phase 6, revised implementation-plan-7.md
-  // §4.1(d)/§6 Phase 1.3: gain_local_contrast after the per-band countershading
-  // knee, one value per band (same order as sigma/gain), computed once
-  // modify_roi_in knows d->sigma[]/d->gain[] -- process() reads this, not
-  // gain_local_contrast directly.
-  float band_master[CT_BANDS];
+  // §4.1(d)/§6 Phase 1.3: the multiplier on each band's own detail b_k,
+  // effective gain - 1 after gain_local_contrast and the per-band
+  // countershading knee (_ct_band_scale), one value per band (same order
+  // as sigma), filled by modify_roi_in -- process() reads this, not
+  // gain_local_contrast or band[] directly.
+  float band_scale[CT_BANDS];
   int iterations;
   float noise_bias;
 } dt_iop_contrast_data_t;
@@ -1645,9 +1645,9 @@ static inline void compute_luminance(const float *const restrict in,
 // (research.md §2.4 option A; see phase0-hybrid-pyramid.md for why this is
 // the decomposition this module ships).
 //
-// correction ends up holding sum_k band_master_k * (gain_k - 1) * b_k, in
-// EV, with each band's own knee-bent master already folded in (see the loop
-// body) but still missing the Wiener gate, a cheap scalar-per-pixel
+// correction ends up holding sum_k band_scale_k * b_k, in EV, with each
+// band's own master and knee already folded into band_scale_k (see the
+// loop body) but still missing the Wiener gate, a cheap scalar-per-pixel
 // operation applied once by the caller rather than here.
 //
 // b_k is research.md §2.1's incremental band: log2(blur_{k-1}) - log2(blur_k),
@@ -1707,11 +1707,10 @@ static void _decompose_and_accumulate(const float *const restrict lum,
     // baked in here, per band, before bands are summed -- not as a single
     // scalar applied to the sum afterward. That final-scalar structure is
     // exactly what made every earlier candidate discount every band by
-    // whichever one band was tightest; folding d->band_master[k] into each
+    // whichever one band was tightest; folding d->band_scale[k] into each
     // band's own contribution before it is added to correction[] is what
     // makes a band with headroom keep its full requested gain.
-    const float gain_minus_one = d->gain[k] - 1.0f;
-    const float band_scale = gain_minus_one * d->band_master[k];
+    const float band_scale = d->band_scale[k];
     const gboolean is_display = (display_band == k);
     const gboolean detail_mode = (display_band == -2);
 
@@ -2035,7 +2034,7 @@ void process(dt_iop_module_t *self,
   dt_free_align(coarsest);
 }
 
-// dt_iop_contrast_data_t (sigma[]/gain[]/nbands on top of the params it
+// dt_iop_contrast_data_t (sigma[]/band_scale[]/nbands on top of the params it
 // copies) is bigger than dt_iop_contrast_params_t, but without an init_pipe
 // of its own the module got develop/imageop.c's default_init_pipe, which
 // sizes piece->data at self->params_size -- too small. commit_params below
@@ -2100,8 +2099,8 @@ static double _ct_halo_gain_ceiling(const double sigma_frame)
 // tightest. The ceiling budget varies ~3x across the ladder (§8.2), so any
 // single global number either under-uses a loose band's headroom or
 // overspends the tight one's. Evaluating the same knee shape per band, off
-// that band's own R_k, means a band with headroom is never discounted for a
-// different band's constraint -- confirmed on real B&W frames
+// that band's own ceiling budget, means a band with headroom is never
+// discounted for a different band's constraint -- confirmed on real B&W frames
 // (plan-7-evidence/phase1-2-ceiling-renders/) and reasoned through with the
 // user directly.
 //
@@ -2114,15 +2113,16 @@ static double _ct_halo_gain_ceiling(const double sigma_frame)
 // joined smoothly (C-infinity) instead of at a corner. s controls how wide
 // the transition is: s -> infinity recovers the old hard corner exactly;
 // s=6 keeps the deviation from an unclamped curve under 0.01% at the
-// masters every preset and the post-pick default actually use (~1.0-1.5),
+// masters every preset and the default curve actually use (~1.0-1.5),
 // while still giving R itself a real, visible give instead of a slope
-// discontinuity.
+// discontinuity. x is a band's requested boost (master * (g_k - 1)) and
+// Rk that band's ceiling budget (ceiling - 1).
 #define CT_HALO_KNEE_Q 0.5
 #define CT_HALO_KNEE_S 6.0
 
 static double _ct_halo_smooth_knee(const double x, const double Rk)
 {
-  if(x <= 0.0 || Rk == DBL_MAX) return x;
+  if(x <= 0.0) return x;
   const double u = pow(x / Rk, CT_HALO_KNEE_S);
   return x * pow(1.0 + u, (CT_HALO_KNEE_Q - 1.0) / CT_HALO_KNEE_S);
 }
@@ -2143,13 +2143,26 @@ static double _ct_band_ceiling(const int k, const float scale_shift)
   return _ct_halo_gain_ceiling(sigma_frame);
 }
 
-static double _ct_band_master(const int k, const float band_gain, const float master,
-                              const float scale_shift)
+// the multiplier on a band's own detail b_k: effective gain - 1. A boost
+// is 1 + master * (g_k - 1), bent by the knee against the band's own
+// ceiling budget. A cut is the reciprocal of the same master applied to
+// the reciprocal boost, g_k / (g_k + master * (1 - g_k)): a band at 1/g
+// then lands at exactly 1 / (1 + master * (g - 1)), the mirror image on the
+// graph's log2 axis of the band at g, at every master. Applying the
+// linear form to a cut as well scaled its linear distance from 1 rather
+// than its log2 one, so at master 2.5 a band at 0.5 already reached
+// -0.25 (its detail inverted, and growing with every further step) while
+// the same band at 2.0 was knee-limited to ~2.3. The cut is never bent:
+// removing detail cannot countershade, and its effective gain stays in
+// [0, 1] (0 only at a band gain of 0), so no master can change its sign.
+static double _ct_band_scale(const int k, const float band_gain, const float master,
+                             const float scale_shift)
 {
-  if(band_gain <= 1.0f) return (double)master;  // no boost requested: nothing to bend
-  const double ceiling = _ct_band_ceiling(k, scale_shift);
-  const double Rk = (ceiling - 1.0) / ((double)band_gain - 1.0);
-  return _ct_halo_smooth_knee((double)master, Rk);
+  const double g = band_gain;
+  const double m = master;
+  if(g >= 1.0) return _ct_halo_smooth_knee(m * (g - 1.0), _ct_band_ceiling(k, scale_shift) - 1.0);
+  const double denom = g + m * (1.0 - g);  // 0 only at g == 0 with master 0: neutral
+  return denom > 0.0 ? g / denom - 1.0 : 0.0;
 }
 
 void modify_roi_in(dt_iop_module_t *self,
@@ -2168,22 +2181,22 @@ void modify_roi_in(dt_iop_module_t *self,
   const float S = MAX(piece->iwidth, piece->iheight);
   int nbands = 0;
 
-  // implementation-plan-7.md §4.4/§4.2: each band's own ratio
-  // (ceiling - 1)/(g_k - 1), taken by each band's nominal frame-relative
-  // sigma -- not only over bands that survive this pass' fine-tail drop
-  // below. The ceiling is a property of the *fixed* CT_BANDS ladder, which
-  // is frame-relative; which bands survive is a property of the current
+  // implementation-plan-7.md §4.4/§4.2: each band's own ceiling budget
+  // (ceiling - 1), taken by each band's nominal frame-relative sigma --
+  // not only over bands that survive this pass' fine-tail drop below.
+  // The ceiling is a property of the *fixed* CT_BANDS ladder, which is
+  // frame-relative; which bands survive is a property of the current
   // roi/zoom. Coupling the two made the per-band master (and therefore the
   // rendered image) differ between preview and export at the same master
   // (§2.3) -- a band dropped here for being unresolvable at this roi scale
   // is not thereby exempt from the ceiling it would bind at full
-  // resolution. _ct_band_master (above) needs no roi to run, so it is
+  // resolution. _ct_band_scale (above) needs no roi to run, so it is
   // called directly per surviving band below rather than precomputed for
   // every k up front -- unlike a global minimum (which every single-scalar
   // candidate reduced to, discounting every band by whichever one was
-  // tightest), each band's own R_k depends on nothing outside that band, so
-  // there is nothing to gain by computing it before we know which bands
-  // survive.
+  // tightest), each band's own budget depends on nothing outside that
+  // band, so there is nothing to gain by computing it before we know which
+  // bands survive.
 
   for(int k = CT_BANDS - 1; k >= 0; k--)
   {
@@ -2194,9 +2207,8 @@ void modify_roi_in(dt_iop_module_t *self,
     if(nbands == 0 && sigma < 0.7f) continue;  // unresolvable fine tail: drop
 
     d->sigma[nbands] = sigma;
-    d->gain[nbands] = d->band[k];
-    d->band_master[nbands] =
-      (float)_ct_band_master(k, d->band[k], d->gain_local_contrast, d->scale_shift);
+    d->band_scale[nbands] =
+      (float)_ct_band_scale(k, d->band[k], d->gain_local_contrast, d->scale_shift);
 
     // §3.3/research.md §2.4: eigf's a = v/(v+eps) saturates toward a = 1 (no
     // blurring at all) as the window grows, so a single global eps leaves
@@ -2270,8 +2282,8 @@ static void _area_set_tooltip(dt_iop_module_t *self)
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the thin dashed curve is the *effective* gain after the gain\n"
-         "slider is applied; a red node/number means that band's effective gain has\n"
-         "gone at or below zero, inverting its detail.\n"
+         "slider is applied; a red node/number means that band's effective gain is\n"
+         "zero, removing its detail entirely.\n"
          "the dotted curve is a perceptual countershading ceiling: past it,\n"
          "that band's own effective gain bends off instead of climbing\n"
          "further as you raise gain.\n"
@@ -2283,8 +2295,8 @@ static void _area_set_tooltip(dt_iop_module_t *self)
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the thin dashed curve is the *effective* gain after the gain\n"
-         "slider is applied; a red node/number means that band's effective gain has\n"
-         "gone at or below zero, inverting its detail.\n"
+         "slider is applied; a red node/number means that band's effective gain is\n"
+         "zero, removing its detail entirely.\n"
          "the dotted curve is a perceptual countershading ceiling: past it,\n"
          "that band's own effective gain bends off instead of climbing\n"
          "further as you raise gain"));
@@ -4182,21 +4194,18 @@ static float _graph_gain_to_yfrac(const float gain)
 
 // implementation-plan-6.md §6 Phase 4.1: the node position is the *shape*
 // the picker wrote (or the user hand-drew); what reaches the pixels is
-// 1 + band_master * (shape - 1), the per-band scale modify_roi_in stores in
-// d->band_master[] and _decompose_and_accumulate folds into each band. It
-// can go negative (inverting that octave's detail) even on a shape that
-// itself never goes below zero.
+// 1 + band_scale, the per-band multiplier modify_roi_in stores in
+// d->band_scale[] and _decompose_and_accumulate folds into each band.
 //
-// implementation-plan-7.md §4.2: band_master is the band's own post-knee
-// master (_ct_band_master), not the raw slider value -- past each band's
-// own R_k the raw value keeps climbing while the pixels stand still, and
+// implementation-plan-7.md §4.2: band_scale is the band's own post-knee
+// boost (_ct_band_scale), not master * (shape - 1) -- past each band's
+// own ceiling the raw value keeps climbing while the pixels stand still, and
 // the knee bends even at master == 1 once the shape itself sits above the
-// band's ceiling (R_k < 1).
+// band's ceiling.
 static float _graph_effective_gain(const int k, const float band_gain, const float master,
                                    const float scale_shift)
 {
-  const float band_master = (float)_ct_band_master(k, band_gain, master, scale_shift);
-  return 1.0f + band_master * (band_gain - 1.0f);
+  return 1.0f + (float)_ct_band_scale(k, band_gain, master, scale_shift);
 }
 
 static void _graph_curve_from_params(dt_draw_curve_t *curve,
@@ -4416,12 +4425,12 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   cairo_stroke(cr);
 
   // 4b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
-  // 1 + band_master*(shape-1) -- what §1's bug report actually judged.
+  // 1 + band_scale -- what §1's bug report actually judged.
   // Dashed, since it's derived from the shape curve rather than directly
   // editable (this file's convention: solid = editable, dashed = derived).
   // Skipped only where it would trace the shape curve on top of itself and
   // add nothing to look at: that is not simply master == 1, since the
-  // per-band knee (_ct_band_master) already bends a band whose shape sits
+  // per-band knee (_ct_band_scale) already bends a band whose shape sits
   // above its own ceiling at that master. g->curve is scratch state private
   // to this draw call (nothing after this point reads it), so reusing it
   // here rather than allocating a second curve is safe.
@@ -4456,7 +4465,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   // self->params, not published from the pipe (see _ct_band_ceiling's own
   // comment). Drawn unconditionally, like the envelope rails (3b): with the
   // per-band knee (§4.1(d)) this is where 4b's dashed line is headed once a
-  // band's own R_k starts binding, and that is worth seeing before the
+  // band's own ceiling starts binding, and that is worth seeing before the
   // slider is ever touched, not only after. Dotted rather than dashed so it
   // reads as a third, distinct line rather than a second copy of 4b's dash
   // style; graph_border rather than graph_fg keeps it visually behind the
@@ -4506,13 +4515,14 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     const gboolean extrapolated =
       have_pick_window && (node_raw < window_lo_raw || node_raw > window_hi_raw);
 
-    // implementation-plan-6.md §6 Phase 4.1: a node sitting innocently inside
-    // the envelope (e.g. the EQUALIZE floor at 0.30) can still have master
-    // push its *effective* gain at or below zero, inverting that octave's
-    // detail (§2.2) -- the node bullet itself is what a user actually looks
-    // at when judging a curve, so this is marked here, not only on the 4b
-    // overlay curve, and it overrides the extrapolated color (not the dash,
-    // which is a separate question per §4.5).
+    // implementation-plan-6.md §6 Phase 4.1: a band whose slider sits at
+    // 0 (below the graph's own 0.2 floor) has its octave's detail removed
+    // outright, and its node is drawn on the floor like a 0.2 one -- the
+    // node bullet itself is what a user actually looks at when judging a
+    // curve, so this is marked here, not only on the 4b overlay curve, and
+    // it overrides the extrapolated color (not the dash, which is a
+    // separate question per §4.5). Since _ct_band_scale keeps the
+    // effective gain non-negative, zero is the only case left.
     const float effective_gain = effective[k];
     const gboolean negative_effective = effective_gain <= 0.0f;
 
@@ -4554,10 +4564,10 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     }
 
     // implementation-plan-6.md §6 Phase 4.1's acceptance bullet is explicit:
-    // a railed node must read as *negative*, not as a node sitting innocently
-    // on its rail -- the log axis can't place a negative y at all (§4.1
-    // above already collapses it to the floor), so the actual signed number
-    // is printed at the floor instead, in the same warning color as the node.
+    // a railed node must read as *zero*, not as a node sitting innocently
+    // on its rail -- the log axis can't place y = 0 at all (§4.1 above
+    // already collapses it to the floor), so the actual number is printed
+    // at the floor instead, in the same warning color as the node.
     if(negative_effective)
     {
       char eff_buf[16];
@@ -4826,7 +4836,8 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_format(g->gain_local_contrast, "x");
   gtk_widget_set_tooltip_text(g->gain_local_contrast,
                               _("scales the picked (or hand-drawn) curve up or down: each\n"
-                                "band's effective gain is 1 + this * (band gain - 1).\n"
+                                "band's effective gain is 1 + this * (band gain - 1), and a\n"
+                                "band cut below 1 mirrors the boost of its reciprocal.\n"
                                 "past a perceptual countershading limit, which varies by band and\n"
                                 "is drawn as the graph's third, dotted curve, a band's own effective\n"
                                 "gain bends off smoothly rather than climbing further -- see the\n"
