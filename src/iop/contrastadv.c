@@ -144,8 +144,10 @@ DT_MODULE_INTROSPECTION(4, dt_iop_contrast_params_t)
 
 // implementation-plan-2.md §3.1: peak wavelength of the DoG between sigma and
 // 2^(1/CT_SCALES_PER_OCTAVE)*sigma -- lambda = pi*sqrt(2*(k2-1)/ln k2) * sigma,
-// k2 = 2^(2/CT_SCALES_PER_OCTAVE) -- _band_peak_lambda's formula specialised
-// to the ladder's own fixed rung ratio. The single conversion factor between
+// k2 = 2^(2/CT_SCALES_PER_OCTAVE) -- the general two-Gaussian DoG peak
+// formula specialised to the ladder's own fixed rung ratio (CT_BAND_PEAK_FACTOR
+// below is the same formula at the module bands' own octave ratio, k2 = 4).
+// The single conversion factor between
 // a rung's sigma and the wavelength label it is published under; recompute if
 // CT_SCALES_PER_OCTAVE ever changes.
 #define CT_SIGMA_TO_LAMBDA 5.0091626
@@ -2396,12 +2398,10 @@ static double _ct_band_coverage(const double lambda, const float *const restrict
 // HP_k - HP_{k-1} pair (sigma_k = 2*sigma_km1) -- pi*sqrt(6/ln 4). The finest
 // band (sigma_km1 = 0) is a shelf, not a bump (research.md §2.2), so it will
 // not land exactly on its node under the formula below; that is correct and
-// should be left alone. implementation-plan-4.md §1.2: the general (any
-// sigma_km1, sigma_k, not only an octave pair) peak-wavelength formula this
-// specialises from used to be needed here to point-sample the fit at a
-// band's own peak; §1.2 replaced that point sample with an integral over the
-// band's whole transfer, so the general form is gone and this specialised
-// constant is what remains, used only to anchor the graph's own x axis.
+// should be left alone. Used only to anchor _spectrum_lambda_to_raw_x's node
+// axis (the graph, the presets' shapes and _ct_sigma_to_node all go through
+// it); the fit itself is never point-sampled at a band's peak
+// (_ct_predict_band_energy integrates over the band's whole transfer).
 #define CT_BAND_PEAK_FACTOR 6.5357852
 
 // map a wavelength (in some roi's own pixels, or a frame-relative fraction
@@ -2412,15 +2412,14 @@ static double _ct_band_coverage(const double lambda, const float *const restrict
 // k's own, under §4.1's octave-spaced frame-relative ladder) -- working
 // through §4.1's sigma[k] = 2^-(D0+k+1.5) puts that peak at
 // 2^-(D0+k+0.5) * (CT_BAND_PEAK_FACTOR/4). Anchoring the axis there,
-// instead of at the nominal detail level the old formula used, is what
+// rather than at the band's nominal detail level (0.7083606 octave toward
+// the coarse end, implementation-plan-2.md §5.1's own measurement), is what
 // makes a rung/preset shape and the node whose H_k actually responds to it
-// land at the same x -- the old nominal-level axis drew the spectrum
-// 0.7083606 octave toward the coarse end of the band it belonged to
-// (implementation-plan-2.md §5.1's own measurement). Verified here as an
-// identity against _band_peak_lambda for all nine bands, per §5.1's own
-// acceptance criterion; the doc's own inline code snippet has this
-// correction term's sign backwards (confirmed by that check -- an additive
-// +log2(F/4), not the doc's -log2(F/4)). Ignores scale_shift, exactly as
+// land at the same x: with this formula band k's own H_k peak maps to
+// exactly (k+0.5)/CT_BANDS for all nine bands, per §5.1's own acceptance
+// criterion. The doc's own inline code snippet has this correction term's
+// sign backwards (an additive +log2(F/4), not the doc's -log2(F/4)); the
+// identity above is the check. Ignores scale_shift, exactly as
 // the nodes' own fixed screen positions do, so a rung/preset shape and the
 // node it nominally corresponds to line up regardless of where scale_shift
 // has since moved the *physical* meaning of that node. Shared by §3.2's
@@ -2445,9 +2444,11 @@ static float _spectrum_lambda_to_x(const double lambda, const double roi_long_ed
 
 // implementation-plan-6.md §6 Phase 2.1: sigma (frame-relative, i.e. already
 // divided by the long edge) to the module's own node axis -- the inverse of
-// _spectrum_lambda_to_raw_x's ((k+0.5)/CT_BANDS at node k) convention, so
-// _ct_sigma_to_node of the wavelength a band's H_k actually peaks at returns
-// that band's own integer node index exactly. Used only to place
+// _spectrum_lambda_to_raw_x's ((k+0.5)/CT_BANDS at node k) convention,
+// taking a rung sigma the way the projection grid does (its wavelength is
+// sigma * CT_SIGMA_TO_LAMBDA), so the rung whose wavelength is band k's own
+// H_k peak returns exactly the node index k (+ scale_shift, since the axis
+// ignores it and the ladder does not). Used only to place
 // CT_TARGET_DEFAULT's fixed hump (§5B.1) in the same units the graph draws,
 // so the shape and the axis cannot disagree.
 static double _ct_sigma_to_node(const double sigma)
