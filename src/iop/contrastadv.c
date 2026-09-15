@@ -784,7 +784,8 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   // and wide enough that the fit cannot land on a real slope and buys the
   // shortfall with a texture term that isn't there: on an exact power law at
   // beta = 2.4 the coarse grid returns 2.483 plus an A large enough to push
-  // texture_peak past the 1% of peak_e that selects EQUALIZE over DETAIL.
+  // texture_peak past the 1% of peak_e that decides whether a pick reports
+  // a sized texture (_mode_shape's found_texture).
   // One refinement pass over the winner's +-1 coarse step, at 8 sub-steps,
   // takes beta to 0.027 resolution: it recovers 2.402 with texture_peak
   // an order of magnitude *below* the threshold, at every box size, and
@@ -999,25 +1000,15 @@ static double _ct_predict_band_energy(const _ct_fit_t *const fit,
   return N + A + C;
 }
 
-// §2.5: which of research.md §5.6's target shapes a fit earns. DETAIL is
-// the A-negligible fallback -- "a self-similar area with no size".
-// implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is research.md §5.6's
-// third shape, "boost what's weak" rather than TEXTURE's now-deleted "boost
-// whatever carries the most energy" -- already shipped, unchanged, as the
-// "flatten spectrum" preset; §8.1 wired it into the live picker path so a
-// pick can use it too, and TEXTURE lost that choice outright (plan-2 §8.2,
-// rendered crops) -- implementation-plan-4.md §7.2 removes the mode itself.
-// implementation-plan-6.md §5B.1/§6 Phase 2.2: CT_TARGET_DEFAULT replaces
-// both DETAIL and EQUALIZE on the picker path -- plan-6 §3.7b measured that
-// this photographer's own accepted curves are predicted worse by a shape
-// derived from the picked area's own excess than by one fixed shape, so the
-// picker's job shrinks to "which fixed shape" (never "no shape", since
-// DETAIL's own shape is flat and un-derived) rather than "derive a shape".
-// DETAIL/EQUALIZE stay reachable by other callers (EQUALIZE by the "flatten
-// spectrum" preset, DETAIL by nothing left).
+// §2.5: which target curve _target_curve writes. CT_TARGET_DEFAULT is the
+// picker path's one fixed shape (implementation-plan-6.md §5B.1: plan-6
+// §3.7b measured that this photographer's own accepted curves are predicted
+// worse by a shape derived from the picked area's own excess than by one
+// fixed shape, so the picker's job is "which fixed shape", never "derive a
+// shape"). CT_TARGET_EQUALIZE is research.md §5.6's "boost what's weak"
+// curve, reached only by the "flatten spectrum" preset (§3.4).
 typedef enum _ct_target_mode_t
 {
-  CT_TARGET_DETAIL   = 0,
   CT_TARGET_EQUALIZE = 1,
   CT_TARGET_DEFAULT  = 2
 } _ct_target_mode_t;
@@ -2468,25 +2459,15 @@ static double _ct_sigma_to_node(const double sigma)
 // §2.5: from the fit to a target gain curve, and from that curve to nodes
 // ---------------------------------------------------------------------------
 //
-// research.md §5.6: the picker's job stops at *shape*, never strength -- the
-// caller (color_picker_apply) is what turns this into an actual gain curve,
-// by lerping between 1 (no effect) and the master gain along the shape
-// below, so dragging the master gain afterwards keeps behaving predictably.
-
-// §2.5/research.md §5.6: shape(sigma), peak-normalised where the table says
-// so -- T_hat carries its own peak-1 normalisation (over the grid actually
-// evaluated, since that is the only "max(A*G)" available here); DETAIL's
-// S/(S+N) is used exactly as it falls out, per the table, with no further
-// rescaling.
+// research.md §5.6: the picker's job stops at *shape*, never strength --
+// both modes below write an absolute, master-independent target curve
+// (shape[] is the gain curve itself, used by the caller as-is), so dragging
+// the master gain afterwards keeps behaving predictably.
 //
-// implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is different in *kind*,
-// not degree, from DETAIL -- research.md §5.6's own table gives it as
-// a bounded absolute curve, clamp((E_ref/S_hat)^alpha) * S/(S+N), already
-// shipped unchanged as the "flatten spectrum" preset's own expression (§3.4)
-// -- not a [0,1] boost shape with a separate strength knob. shape[] here for
-// CT_TARGET_EQUALIZE *is* that curve directly: the caller must use it as the
-// target curve as-is, not lerp it between 1 and a master gain the way
-// DETAIL's shape[] is.
+// implementation-plan-2.md §8.1: CT_TARGET_EQUALIZE is research.md §5.6's
+// own bounded absolute curve, clamp((E_ref/S_hat)^alpha) * S/(S+N) -- the
+// "flatten spectrum" preset's own expression (§3.4), not a [0,1] boost shape
+// with a separate strength knob.
 //
 // implementation-plan-3.md §5.1: E_ref used to be evaluated at the geometric
 // mean of the *projection grid*'s own bounds, which only equalled the band
@@ -2630,16 +2611,9 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
     _ct_fit_eval(fit, sigma_grid[j], &S, &N);
     const double wiener = S / fmax(S + N, DBL_MIN);
 
-    if(mode == CT_TARGET_EQUALIZE)
-    {
-      double p = CT_EQUALIZE_ALPHA * log(s_ref / fmax(S, DBL_MIN)) + log(fmax(wiener, DBL_MIN));
-      p = (p >= 0.0) ? Lhi * tanh(p / Lhi) : Llo * tanh(p / Llo);
-      shape[j] = CLAMP(exp(p), CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI);
-    }
-    else
-    {
-      shape[j] = wiener;
-    }
+    double p = CT_EQUALIZE_ALPHA * log(s_ref / fmax(S, DBL_MIN)) + log(fmax(wiener, DBL_MIN));
+    p = (p >= 0.0) ? Lhi * tanh(p / Lhi) : Llo * tanh(p / Llo);
+    shape[j] = CLAMP(exp(p), CT_EQUALIZE_GAIN_LO, CT_EQUALIZE_GAIN_HI);
   }
 }
 
