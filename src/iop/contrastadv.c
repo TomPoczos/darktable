@@ -2276,7 +2276,7 @@ static void _area_set_tooltip(dt_iop_module_t *self)
          "that band's own effective gain bends off instead of climbing\n"
          "further as you raise gain.\n"
          "the shaded bands on the right are too fine to resolve at the\n"
-         "current zoom level and have no effect until you zoom in.")
+         "current zoom level and have no effect until you zoom in")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list, and again there to come back.\n"
@@ -2287,7 +2287,7 @@ static void _area_set_tooltip(dt_iop_module_t *self)
          "gone at or below zero, inverting its detail.\n"
          "the dotted curve is a perceptual countershading ceiling: past it,\n"
          "that band's own effective gain bends off instead of climbing\n"
-         "further as you raise gain."));
+         "further as you raise gain"));
 }
 
 // redraw the graph once a pipe has actually run, so its stripe shading
@@ -4830,7 +4830,7 @@ void gui_init(dt_iop_module_t *self)
                                 "past a perceptual countershading limit, which varies by band and\n"
                                 "is drawn as the graph's third, dotted curve, a band's own effective\n"
                                 "gain bends off smoothly rather than climbing further -- see the\n"
-                                "graph for which bands still have headroom."));
+                                "graph for which bands still have headroom"));
   dt_bauhaus_widget_set_quad(g->gain_local_contrast, self, dtgtk_cairo_paint_showmask, TRUE, show_details_callback,
                              _("visualize the accumulated correction -- what this module is doing.\n"
                                "ctrl+click: visualize the raw, un-gained detail sum"));
@@ -4929,14 +4929,14 @@ void gui_init(dt_iop_module_t *self)
        "local contrast levels -- boosts the bands whose local contrast is\n"
        "  spatially uneven across the picked area, usually leaning toward\n"
        "  the finer end on real content. declines where local contrast is\n"
-       "  as even as noise at every size."));
+       "  as even as noise at every size"));
   g_signal_connect(G_OBJECT(g->picker_mode), "value-changed", G_CALLBACK(_picker_mode_callback), self);
 
   g->scale_shift = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
                                        dt_bauhaus_slider_from_params(self, "scale_shift"));
   gtk_widget_set_tooltip_text(g->scale_shift,
      _("shifts every band's node together, finer or coarser.\n"
-       "half a step moves the whole ladder by half an octave."));
+       "half a step moves the whole ladder by half an octave"));
   // implementation-plan-4.md §6.1: this quad no longer moves scale_shift --
   // it never has, since plan-3 Phase 6 decided against ladder placement and
   // routed the picker through band[]/gain_local_contrast instead (§6.2's own
@@ -4960,7 +4960,7 @@ void gui_init(dt_iop_module_t *self)
        "an area with nothing in it to enhance -- clear sky, an out-of-focus\n"
        "background -- is declined rather than guessed at. if a pick over deep\n"
        "shadow logs \"looks like noise\", raise the noise bias below and pick\n"
-       "again."));
+       "again"));
 
   g->edge_protection = dt_bauhaus_slider_from_params(self, "edge_protection");
   dt_bauhaus_slider_set_soft_range(g->edge_protection, -2.0, 2.0);
@@ -4981,7 +4981,7 @@ void gui_init(dt_iop_module_t *self)
   dt_bauhaus_slider_set_digits(g->noise_bias, 4);
   dt_bauhaus_slider_set_step(g->noise_bias, 0.0001);
   gtk_widget_set_tooltip_text(g->noise_bias, _("add bias to reduce shadow noise amplification.\n"
-                                               "only affects dark parts of the image."));
+                                               "only affects dark parts of the image"));
 }
 
 // §1.8: dt_iop_gui_cleanup_module() (develop/imageop.c) already
