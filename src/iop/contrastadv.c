@@ -2364,7 +2364,7 @@ static void _ct_grid_bounds(const float *const restrict sigma, double *const lo,
 }
 
 // implementation-plan-3.md §3.2/§4.3: sum_k H_k(lambda) -- how much of a
-// wavelength's energy the nine bands can address between them, in [0,1].
+// wavelength's amplitude the nine bands can address between them, in [0,1].
 // The same quantity _project_to_bands weights each grid row by (its own
 // loop keeps h[k] too, for the A matrix, so it is not simply routed through
 // here); this standalone copy is for callers that only need the sum, i.e.
@@ -2619,9 +2619,11 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
 // curve).
 //
 // H_k(lambda) = HP_k(lambda) - HP_{k-1}(lambda), HP_k(lambda) = 1 -
-// exp(-2*pi^2*sigma_k^2/lambda^2) is the cumulative fraction of energy at
-// wavelength `lambda` band k's own highpass (relative to its boundary sigma)
-// would capture; the incremental H_k is what setting gain_k alone adds to
+// exp(-2*pi^2*sigma_k^2/lambda^2) is the amplitude transfer at wavelength
+// `lambda` of band k's own highpass (relative to its boundary sigma) -- an
+// amplitude, not an energy: the solve is linear in gain, and
+// _compute_band_calibration's sqrt() converts its energy ratio to match --
+// and the incremental H_k is what setting gain_k alone adds to
 // the module's net response, treating boundary -1 as sigma = 0 (nothing
 // captured before band 0).
 //
@@ -2692,7 +2694,7 @@ static gboolean _project_to_bands(const double *const restrict lambda_grid,
       h[k] = hp_k - hp_km1;
       sum_h += h[k];
     }
-    // implementation-plan-3.md §3.2: sum_k H_k is the fraction of the energy
+    // implementation-plan-3.md §3.2: sum_k H_k is the fraction of the amplitude
     // at this wavelength the whole band ladder touches at all -- 1.0 from the
     // fine end through the ladder, then falling away past the coarsest band,
     // where there is simply no band left to respond. §3.1 has already
