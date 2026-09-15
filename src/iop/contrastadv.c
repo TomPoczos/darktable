@@ -284,6 +284,14 @@ typedef struct dt_iop_contrast_gui_data_t
   // _preview_pipe_finished_retry_pick once a fresh pass actually lands,
   // rather than silently dropped.
   gboolean pick_pending;
+
+  // implementation-plan-8.md §4.1/§4.3: the picker-mode dropbox, placed
+  // directly above scale_shift's picker row below. Conf-backed, not
+  // params-backed -- read directly off this widget wherever the mode is
+  // needed (_color_picker_apply_now, the graph overlay), the same way
+  // gain_local_contrast/scale_shift are read through their own params-backed
+  // widgets, so there is no separate cached copy to go stale.
+  GtkWidget *picker_mode;
 } dt_iop_contrast_gui_data_t;
 
 
@@ -1058,6 +1066,23 @@ typedef enum _ct_target_mode_t
   CT_TARGET_EQUALIZE = 1,
   CT_TARGET_DEFAULT  = 2
 } _ct_target_mode_t;
+
+// implementation-plan-8.md §4.1: which *shape* the next pick writes -- a GUI
+// preference (conf key below), not a param: it decides what the next pick
+// does, not what the pixels do, so a mode change must not create a history
+// item or land in a style, and needs no version bump. §4.2's own numbering:
+// CT_PICK_FIXED stays entry 0 both because Phase 6's A/B needs an in-app
+// control to return to, and because "reset the curve to default from a
+// pick" is the one thing the pre-plan-8 picker did that a user might still
+// want to keep reaching for.
+typedef enum _ct_picker_mode_t
+{
+  CT_PICK_FIXED      = 0,   // writes the default curve, same as every picker_mode.c-era pick
+  CT_PICK_STRUCTURE  = 1,   // §5.1: not implemented until plan-8 Phase 4 -- falls back to CT_PICK_FIXED
+  CT_PICK_PERCENTILE = 2,   // §5.2: not implemented until plan-8 Phase 5 -- falls back to CT_PICK_FIXED
+} _ct_picker_mode_t;
+
+#define CT_PICKER_MODE_CONF "plugins/darkroom/contrastadv/picker_mode"
 
 // ---------------------------------------------------------------------------
 // §2.1: the frame-wide DoG ladder + block energy tables
@@ -3652,6 +3677,17 @@ static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self
   _apply_details_display(self, mode);
 }
 
+// implementation-plan-8.md §4.1: writes the picker-mode preference to conf
+// -- a GUI setting, not a param, so this is the combobox's only side
+// effect: no dt_dev_add_history_item, no dirty flag, no pipe reprocess. The
+// next pick (color_picker_apply) reads the combobox itself when it needs
+// the mode, so there is nothing else to keep in sync here.
+static void _picker_mode_callback(GtkWidget *combo, dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+  dt_conf_set_int(CT_PICKER_MODE_CONF, dt_bauhaus_combobox_get(combo));
+}
+
 // ---------------------------------------------------------------------------
 // the graph (implementation-plan.md §1.4)
 // ---------------------------------------------------------------------------
@@ -4569,6 +4605,35 @@ void gui_init(dt_iop_module_t *self)
   dt_action_define_iop(self, NULL, N_("sliders"), GTK_WIDGET(g->stack), NULL);
   dt_gui_box_add(self->widget, g->stack);
 
+  // implementation-plan-8.md §4.1/§4.3: a GUI preference, not a param --
+  // placed directly above the picker row below so the mode and the button
+  // that uses it are adjacent. Selecting an entry has no effect on its own;
+  // it changes what the *next pick* does.
+  g->picker_mode = dt_bauhaus_combobox_new(self);
+  dt_bauhaus_widget_set_label(g->picker_mode, NULL, N_("picker mode"));
+  dt_bauhaus_combobox_add(g->picker_mode, _("fixed curve"));
+  dt_bauhaus_combobox_add(g->picker_mode, _("structured detail"));
+  dt_bauhaus_combobox_add(g->picker_mode, _("local contrast levels"));
+  dt_bauhaus_combobox_set(g->picker_mode,
+                          CLAMP(dt_conf_get_int(CT_PICKER_MODE_CONF), CT_PICK_FIXED, CT_PICK_PERCENTILE));
+  dt_gui_box_add(self->widget, g->picker_mode);
+  gtk_widget_set_tooltip_text
+    (g->picker_mode,
+     _("what the area picker measures, and how it turns that into a curve:\n"
+       "fixed curve -- ignores the picked area's own texture and writes the\n"
+       "  same default hump every time. the one thing an old-style pick did\n"
+       "  that you might still want on its own.\n"
+       "structured detail -- boosts the bands whose energy in the picked area\n"
+       "  is concentrated in edges and lines rather than spread out like\n"
+       "  texture or noise. declines on a uniformly textured pick.\n"
+       "local contrast levels -- boosts the bands whose local contrast is\n"
+       "  spatially uneven across the picked area, usually leaning toward\n"
+       "  the finer end on real content. declines where local contrast is\n"
+       "  already even at every size.\n"
+       "(structured detail and local contrast levels are not implemented yet\n"
+       "and currently behave like fixed curve.)"));
+  g_signal_connect(G_OBJECT(g->picker_mode), "value-changed", G_CALLBACK(_picker_mode_callback), self);
+
   g->scale_shift = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
                                        dt_bauhaus_slider_from_params(self, "scale_shift"));
   gtk_widget_set_tooltip_text(g->scale_shift,
@@ -4582,10 +4647,14 @@ void gui_init(dt_iop_module_t *self)
   // (scale_shift-less picks "coming back at the finest setting") that cannot
   // occur -- what a noisy pick actually produces is the dt_control_log
   // warning quoted below.
+  // implementation-plan-8.md §4.3: rewritten -- it used to promise "set each
+  // band's gain from what was found", which is exactly what the fixed mode
+  // does not do (plan-6 §5B.2 onward); what a pick does now is set by the
+  // picker-mode dropbox above.
   dt_bauhaus_widget_set_quad_tooltip
     (g->scale_shift,
-     _("pick an area: measure the texture in it and set each band's gain\n"
-       "from what was found.\n"
+     _("pick an area: measure it and shape the curve according to the picker\n"
+       "mode set above.\n"
        "click to use the whole frame, then drag on the image to work from the\n"
        "subject that matters instead. a small box cannot report structure\n"
        "larger than itself, so pick over as much of the texture as you want\n"
