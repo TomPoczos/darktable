@@ -162,6 +162,17 @@ typedef struct _ct_ladder_t
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
   double *sat1;                  // Sum(|b|), same layout
   double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _fit_curve_from_box/_spectrum_frame_wide now read instead of assuming every block full
+  // implementation-plan-8.md §5.4: raw (non-cumulative) per-block RMS, one
+  // value per rung, aggregated to super-blocks of >= CT_SUPERBLOCK_MIN_PIX
+  // level pixels (§5.2's noise-floor argument for why 64). Same nrungs *
+  // (bw+1)*(bh+1) allocation as sat2/sat1/sat_n purely so every rung's
+  // component sits at the same node stride in g->pd -- this is NOT a SAT,
+  // node (y, x) for y < bh, x < bw holds block (by=y, bx=x)'s own aggregated
+  // value directly (a super-block's footprint repeats its one value across
+  // every base block it covers), and the padding row (y==bh) / column
+  // (x==bw) the real SATs need for their zero border is left at 0 here too,
+  // simply unused.
+  double *blockrms;
   double noise_floor[CT_MAX_BANDS];  // §2.4: per-rung, frame-wide block-minimum noise estimate
 } _ct_ladder_t;
 
@@ -1120,11 +1131,19 @@ typedef enum _ct_picker_mode_t
 #define CT_BLOCK 8            // block-statistics granularity, in level-0 (finest rung) pixels
 #define CT_LADDER_MIN_DIM 4   // stop decimating once the next level would be smaller than this
 
+// implementation-plan-8.md §5.2/§5.4: a super-block must average at least
+// this many (decimated-level) pixels before its RMS is trustworthy enough to
+// feed a p90/p99 concentration read -- below it, Gaussian noise alone gives
+// a spuriously low p90/p99 (a single sample's |v| has p90/p99 = 1.645/2.576
+// = 0.64). 64 is the plan's own number, matching its q_gauss(64) baseline.
+#define CT_SUPERBLOCK_MIN_PIX 64.0
+
 static void _ladder_free(_ct_ladder_t *const ladder)
 {
   dt_free_align(ladder->sat2);
   dt_free_align(ladder->sat1);
   dt_free_align(ladder->sat_n);
+  dt_free_align(ladder->blockrms);
   memset(ladder, 0, sizeof(_ct_ladder_t));
 }
 
@@ -1236,6 +1255,64 @@ static void _ladder_build_sat(const double *const restrict blk,
   }
 }
 
+// implementation-plan-8.md §5.2/§5.4: aggregate this rung's own blk2/blkn
+// (already accumulated by _ladder_accumulate_blocks, same call the SATs
+// above are built from) into super-blocks of at least CT_SUPERBLOCK_MIN_PIX
+// real (decimated-level) pixels, and write each super-block's RMS
+// (sqrt(sum b^2 / sum n)) into every base block it covers -- so a later box
+// query can index this component by the same (by, bx) coordinates it
+// already uses for sat2/sat1/sat_n, with no per-rung resolution bookkeeping.
+//
+// Group side is derived from this rung's own *nominal* (edge-clipping-free)
+// pixel count per CT_BLOCK cell, (CT_BLOCK/step)^2, floored at 1 the same
+// way _ladder_accumulate_blocks' own x1<=x0 rescue floors a block at one
+// real pixel (a block can never hold less than one sample). That quantity
+// exactly quarters each octave (step doubles), so the smallest power-of-two
+// group reaching CT_SUPERBLOCK_MIN_PIX doubles right along with it, matching
+// §5.2's own "block side doubles per octave past the point where
+// CT_BLOCK/step < 8" -- derived here from the real per-block pixel count
+// rather than asserted, so it stays correct if CT_BLOCK or the octave
+// scheme ever change. Using each group's real summed blkn (not the nominal
+// figure used only to size the group) rather than a fixed group size also
+// makes a frame-edge group -- whose blocks hold fewer real pixels than an
+// interior one -- self-correcting: it still divides by what it actually
+// summed.
+static void _ladder_build_blockrms(const double *const restrict blk2,
+                                   const double *const restrict blkn,
+                                   const size_t bw, const size_t bh,
+                                   const double step,
+                                   double *const restrict dst)
+{
+  const size_t sw = bw + 1;
+
+  const double per_block = (double)CT_BLOCK / step;
+  const double nominal = fmax(1.0, per_block * per_block);
+  size_t grp = 1;
+  while((double)(grp * grp) * nominal < CT_SUPERBLOCK_MIN_PIX && grp < 4096) grp *= 2;
+
+  for(size_t gy = 0; gy < bh; gy += grp)
+  {
+    const size_t y1 = MIN(gy + grp, bh);
+    for(size_t gx = 0; gx < bw; gx += grp)
+    {
+      const size_t x1 = MIN(gx + grp, bw);
+
+      double sum2 = 0.0, sumn = 0.0;
+      for(size_t y = gy; y < y1; y++)
+        for(size_t x = gx; x < x1; x++)
+        {
+          sum2 += blk2[y * bw + x];
+          sumn += blkn[y * bw + x];
+        }
+      const double rms = (sumn > 0.0) ? sqrt(sum2 / sumn) : 0.0;
+
+      for(size_t y = gy; y < y1; y++)
+        for(size_t x = gx; x < x1; x++)
+          dst[y * sw + x] = rms;  // padding row bh / column bw untouched, stays 0
+    }
+  }
+}
+
 // §2.4/research.md §5.2, §5.5: this rung's noise floor -- the minimum block
 // energy among blocks whose L2/L1 ratio (kappa) is close to what pure
 // Gaussian noise gives. Restricting to near-Gaussian blocks is what keeps a
@@ -1324,6 +1401,9 @@ static gboolean _build_ladder(const float *const restrict lum,
   double *const restrict sat2 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
   double *const restrict sat1 = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
   double *const restrict sat_n = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
+  // §5.4: same nrungs * sat_stride sizing as sat2/sat1/sat_n, zeroed below so
+  // the SAT-style padding row/column (never written below) reads back as 0.
+  double *const restrict blockrms = dt_alloc_align_double(sat_stride * CT_MAX_BANDS);
   double *const restrict blk2 = dt_alloc_align_double(ladder->bw * ladder->bh);
   double *const restrict blk1 = dt_alloc_align_double(ladder->bw * ladder->bh);
   double *const restrict blkn = dt_alloc_align_double(ladder->bw * ladder->bh);
@@ -1332,7 +1412,7 @@ static gboolean _build_ladder(const float *const restrict lum,
   float *restrict band = dt_alloc_align_float(npixels);
   float *restrict rung[CT_SCALES_PER_OCTAVE + 1] = { 0 };
 
-  gboolean ok = sat2 && sat1 && sat_n && blk2 && blk1 && blkn && level && next && band;
+  gboolean ok = sat2 && sat1 && sat_n && blockrms && blk2 && blk1 && blkn && level && next && band;
   for(int s = 0; ok && s <= CT_SCALES_PER_OCTAVE; s++)
   {
     rung[s] = dt_alloc_align_float(npixels);
@@ -1341,13 +1421,18 @@ static gboolean _build_ladder(const float *const restrict lum,
 
   if(!ok)
   {
-    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n);
+    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n); dt_free_align(blockrms);
     dt_free_align(blk2); dt_free_align(blk1); dt_free_align(blkn);
     dt_free_align(level); dt_free_align(next); dt_free_align(band);
     for(int s = 0; s <= CT_SCALES_PER_OCTAVE; s++) dt_free_align(rung[s]);
     memset(ladder, 0, sizeof(_ct_ladder_t));
     return FALSE;
   }
+
+  // §5.4: the padding row/column blockrms leaves unwritten below must read
+  // back as 0, same as a real SAT's own zero border -- memset once here
+  // rather than special-casing it in the per-rung writer.
+  memset(blockrms, 0, sat_stride * CT_MAX_BANDS * sizeof(double));
 
   // mean-centre log2 luminance once, over the whole frame -- everything
   // downstream is a difference of blurs and so ignores this offset
@@ -1425,6 +1510,8 @@ static gboolean _build_ladder(const float *const restrict lum,
       _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blkn, ladder->bw, ladder->bh, sat_n + (size_t)nrungs * sat_stride);
+      _ladder_build_blockrms(blk2, blkn, ladder->bw, ladder->bh, step,
+                             blockrms + (size_t)nrungs * sat_stride);
 
       // implementation-plan-2.md §3.1: label the rung by its own lower-
       // boundary sigma, not the geometric mean of its two rung sigmas -- the
@@ -1468,7 +1555,7 @@ static gboolean _build_ladder(const float *const restrict lum,
 
   if(!ok || nrungs == 0)
   {
-    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n);
+    dt_free_align(sat2); dt_free_align(sat1); dt_free_align(sat_n); dt_free_align(blockrms);
     memset(ladder, 0, sizeof(_ct_ladder_t));
     return FALSE;
   }
@@ -1476,6 +1563,7 @@ static gboolean _build_ladder(const float *const restrict lum,
   ladder->sat2 = sat2;
   ladder->sat1 = sat1;
   ladder->sat_n = sat_n;
+  ladder->blockrms = blockrms;
   return TRUE;
 }
 
@@ -1495,7 +1583,12 @@ static void _ladder_fill_cb(void *const user_data, float *const buf, const size_
 {
   const _ct_ladder_t *const ladder = (const _ct_ladder_t *)user_data;
   const size_t sw = ladder->bw + 1, sh = ladder->bh + 1;
-  const size_t comps = (size_t)(3 * ladder->nrungs);
+  // implementation-plan-8.md §5.4: a 4th component, blockrms, alongside
+  // sat2/sat1/sat_n -- comps is now 4 per rung, not 3. blockrms is not a SAT
+  // (see _ct_ladder_t's own comment), but it is stored at the identical
+  // (bw+1)*(bh+1)-per-rung stride so this reshape needs no special case for
+  // it: node (y, x) just gets a 4th float instead of 3.
+  const size_t comps = (size_t)(4 * ladder->nrungs);
   (void)nelems;  // == sw * sh * comps, by construction of the caller's resize
 
   for(size_t y = 0; y < sh; y++)
@@ -1504,9 +1597,10 @@ static void _ladder_fill_cb(void *const user_data, float *const buf, const size_
       float *const dst = buf + (y * sw + x) * comps;
       for(int r = 0; r < ladder->nrungs; r++)
       {
-        dst[3 * r]     = (float)ladder->sat2[(size_t)r * sw * sh + y * sw + x];
-        dst[3 * r + 1] = (float)ladder->sat1[(size_t)r * sw * sh + y * sw + x];
-        dst[3 * r + 2] = (float)ladder->sat_n[(size_t)r * sw * sh + y * sw + x];
+        dst[4 * r]     = (float)ladder->sat2[(size_t)r * sw * sh + y * sw + x];
+        dst[4 * r + 1] = (float)ladder->sat1[(size_t)r * sw * sh + y * sw + x];
+        dst[4 * r + 2] = (float)ladder->sat_n[(size_t)r * sw * sh + y * sw + x];
+        dst[4 * r + 3] = (float)ladder->blockrms[(size_t)r * sw * sh + y * sw + x];
       }
     }
 }
@@ -1857,9 +1951,11 @@ void process(dt_iop_module_t *self,
       // resize (by invalidating the stored dimensions) whenever nrungs, and
       // so components, has changed since the last publish.
       dt_iop_gui_enter_critical_section(self);
-      if(g->pd.components != (size_t)(3 * built.nrungs))
+      // implementation-plan-8.md §5.4: 4 components per rung now (sat2/sat1/
+      // sat_n/blockrms), not 3.
+      if(g->pd.components != (size_t)(4 * built.nrungs))
       {
-        g->pd.components = (size_t)(3 * built.nrungs);
+        g->pd.components = (size_t)(4 * built.nrungs);
         g->pd.width = 0;
         g->pd.height = 0;
       }
@@ -2966,7 +3062,7 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
   const size_t comps = g->pd.components;
   const gboolean have_data =
     g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-    && comps == (size_t)(3 * g->ladder_nrungs);
+    && comps == (size_t)(4 * g->ladder_nrungs);
 
   if(have_data)
   {
@@ -2998,14 +3094,14 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
     {
       if(g->ladder_lambda[r] > lambda_max) break;  // rungs run fine -> coarse
 
-      const double s2 = buf[(by1 * sat_w + bx1) * comps + 3 * r]
-                       - buf[(by0 * sat_w + bx1) * comps + 3 * r]
-                       - buf[(by1 * sat_w + bx0) * comps + 3 * r]
-                       + buf[(by0 * sat_w + bx0) * comps + 3 * r];
-      const double s1 = buf[(by1 * sat_w + bx1) * comps + 3 * r + 1]
-                       - buf[(by0 * sat_w + bx1) * comps + 3 * r + 1]
-                       - buf[(by1 * sat_w + bx0) * comps + 3 * r + 1]
-                       + buf[(by0 * sat_w + bx0) * comps + 3 * r + 1];
+      const double s2 = buf[(by1 * sat_w + bx1) * comps + 4 * r]
+                       - buf[(by0 * sat_w + bx1) * comps + 4 * r]
+                       - buf[(by1 * sat_w + bx0) * comps + 4 * r]
+                       + buf[(by0 * sat_w + bx0) * comps + 4 * r];
+      const double s1 = buf[(by1 * sat_w + bx1) * comps + 4 * r + 1]
+                       - buf[(by0 * sat_w + bx1) * comps + 4 * r + 1]
+                       - buf[(by1 * sat_w + bx0) * comps + 4 * r + 1]
+                       + buf[(by0 * sat_w + bx0) * comps + 4 * r + 1];
 
       // implementation-plan-4.md §8.2: n_eff from the same box query as s2/
       // s1, over the real level-pixel count sat_n carries -- not
@@ -3015,10 +3111,10 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
       // multiple of CT_BLOCK*step), so that assumption read every box
       // touching the frame edge low by an amount a whole-frame pick measured
       // at 1-2% on real crops (dig_block_edge_norm.c).
-      const double n_eff = fmax(buf[(by1 * sat_w + bx1) * comps + 3 * r + 2]
-                              - buf[(by0 * sat_w + bx1) * comps + 3 * r + 2]
-                              - buf[(by1 * sat_w + bx0) * comps + 3 * r + 2]
-                              + buf[(by0 * sat_w + bx0) * comps + 3 * r + 2], 1.0);
+      const double n_eff = fmax(buf[(by1 * sat_w + bx1) * comps + 4 * r + 2]
+                              - buf[(by0 * sat_w + bx1) * comps + 4 * r + 2]
+                              - buf[(by1 * sat_w + bx0) * comps + 4 * r + 2]
+                              + buf[(by0 * sat_w + bx0) * comps + 4 * r + 2], 1.0);
       const double lam = g->ladder_lambda[r];
 
       // §1.2: n_eff is a pixel count and is the wrong denominator for the
@@ -3858,7 +3954,7 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
   const size_t sat_w = g->pd.width, sat_h = g->pd.height;
   const size_t comps = g->pd.components;
   if(g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-     && comps == (size_t)(3 * g->ladder_nrungs))
+     && comps == (size_t)(4 * g->ladder_nrungs))
   {
     const float *const restrict buf = g->pd.buf;
     const size_t corner = (sat_h - 1) * sat_w + (sat_w - 1);
@@ -3871,9 +3967,9 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
       // the grid's own clipped last column/row) was a full one. Measured to
       // move a whole-frame reading 1-2% on real crops
       // (dig_block_edge_norm.c).
-      const double n_eff = fmax((double)buf[corner * comps + 3 * r + 2], 1.0);
+      const double n_eff = fmax((double)buf[corner * comps + 4 * r + 2], 1.0);
       lambda[r] = g->ladder_lambda[r];
-      energy[r] = (double)buf[corner * comps + 3 * r] / n_eff;
+      energy[r] = (double)buf[corner * comps + 4 * r] / n_eff;
     }
     ok = TRUE;
   }
