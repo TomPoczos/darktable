@@ -3764,6 +3764,24 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
       const gboolean have_box_q = _box_block_percentiles(self, box, p90, p99, &box_nrungs);
       const gboolean have_gauss = _frame_gauss_baseline(self, q_gauss, &gauss_nrungs);
 
+      // implementation-plan-8.md §4.4/§5.4 Phase 2.3/5.2: publish this
+      // pick's own *raw* q_r (p90/p99, before the q_gauss normalisation
+      // below) for the graph overlay -- the overlay draws it against the
+      // frame-wide q_r and the noise baseline on the same un-normalised
+      // axis, the same way the fixed mode's spectrum overlay a few lines
+      // above draws raw energies rather than anything already folded into
+      // a shape.
+      {
+        const int overlay_n = have_box_q ? MIN(box_nrungs, stats->nrungs) : 0;
+        double overlay_q[CT_MAX_BANDS];
+        for(int r = 0; r < overlay_n; r++) overlay_q[r] = (p99[r] > 0.0) ? p90[r] / p99[r] : 0.0;
+        dt_iop_contrast_gui_data_t *const g = self->gui_data;
+        dt_iop_gui_enter_critical_section(self);
+        if(overlay_n > 0) memcpy(g->mode_overlay, overlay_q, sizeof(double) * overlay_n);
+        g->mode_overlay_n = overlay_n;
+        dt_iop_gui_leave_critical_section(self);
+      }
+
       double raw[CT_MAX_BANDS];
       double peak = 0.0;
       const int n = stats->nrungs;
@@ -4606,14 +4624,9 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
 // _spectrum_frame_wide above: that one is read on every graph redraw (it
 // backs the always-on frame spectrum curve) and is O(1) per rung by
 // construction (a single already-summed SAT corner); this one is a full
-// per-rung sort over up to bw*bh blocks (<= 21600 per §5.4) and has no
-// caller yet (Phase 5's), so it must not be forced onto that same hot path
-// before something actually needs it -- __attribute__((unused)) says so
-// rather than hiding it behind a dead #if.
-static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
-                                                 double *const restrict p90,
-                                                 double *const restrict p99,
-                                                 int *const restrict nrungs) __attribute__((unused));
+// per-rung sort over up to bw*bh blocks (<= 21600 per §5.4) -- called only
+// from CT_PICK_PERCENTILE's own overlay case (Phase 5.2), not the hot path
+// every redraw takes regardless of mode.
 static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
                                                  double *const restrict p90,
                                                  double *const restrict p99,
@@ -4670,6 +4683,29 @@ static void _draw_spectrum_curve(cairo_t *cr, const int width, const int height,
   {
     const float x = _graph_lambda_to_x(lambda[r], roi_long_edge, axis) * width;
     const float y = height * (1.0f - _spectrum_energy_to_y(energy[r], peak));
+    if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
+    else cairo_line_to(cr, x, y);
+  }
+  cairo_stroke(cr);
+}
+
+// implementation-plan-8.md §4.4/§5.4 Phase 5.2: percentile mode's own
+// overlay draws q_r (p90/p99, a ratio in (0, 1]) directly, not through
+// _spectrum_energy_to_y's log-energy mapping built for the always-on
+// energy curves above -- linear top-to-bottom over [0, 1] is the whole
+// range this quantity can ever take.
+static void _draw_ratio_curve(cairo_t *cr, const int width, const int height,
+                              const double *const restrict lambda,
+                              const double *const restrict ratio,
+                              const int n, const double roi_long_edge,
+                              const _ct_axis_t *const axis)
+{
+  if(n < 1) return;
+  gboolean started = FALSE;
+  for(int r = 0; r < n; r++)
+  {
+    const float x = _graph_lambda_to_x(lambda[r], roi_long_edge, axis) * width;
+    const float y = height * (1.0f - CLAMP((float)ratio[r], 0.0f, 1.0f));
     if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
     else cairo_line_to(cr, x, y);
   }
@@ -4840,9 +4876,57 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
         break;
       }
       case CT_PICK_PERCENTILE:
+      {
         // Phase 5.2: q_r per rung against the frame-wide q_r and the noise
-        // baseline.
+        // baseline -- three curves on the same linear [0,1] ratio axis
+        // _draw_ratio_curve above draws. mode_overlay[]/pick_lambda[] is
+        // this pick's own box q_r, published by _mode_shape's
+        // CT_PICK_PERCENTILE case; the other two are cheap enough
+        // (O(1)/O(blocks) per rung, no box clipping) to recompute on every
+        // redraw rather than caching, the same way the always-on frame
+        // spectrum curve above does.
+        double frame_p90[CT_MAX_BANDS], frame_p99[CT_MAX_BANDS];
+        int frame_q_nrungs = 0;
+        const gboolean have_frame_q =
+          _spectrum_frame_wide_percentiles(self, frame_p90, frame_p99, &frame_q_nrungs);
+        double q_gauss[CT_MAX_BANDS];
+        int gauss_nrungs = 0;
+        const gboolean have_gauss = _frame_gauss_baseline(self, q_gauss, &gauss_nrungs);
+
+        if(have_pick && mode_overlay_n > 0)
+        {
+          cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
+                                   darktable.bauhaus->color_fill.green,
+                                   darktable.bauhaus->color_fill.blue, 0.9);
+          _draw_ratio_curve(cr, width, height, pick_lambda, mode_overlay, mode_overlay_n,
+                            roi_long_edge, axis);
+        }
+
+        if(have_frame_q && frame_q_nrungs > 0)
+        {
+          double frame_q[CT_MAX_BANDS];
+          for(int r = 0; r < frame_q_nrungs; r++)
+            frame_q[r] = (frame_p99[r] > 0.0) ? frame_p90[r] / frame_p99[r] : 0.0;
+          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                                   darktable.bauhaus->graph_border.green,
+                                   darktable.bauhaus->graph_border.blue, 0.8);
+          _draw_ratio_curve(cr, width, height, frame_lambda, frame_q, frame_q_nrungs,
+                            roi_long_edge, axis);
+        }
+
+        if(have_gauss && gauss_nrungs > 0)
+        {
+          const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
+          cairo_set_dash(cr, dashes, 2, 0.0);
+          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                                   darktable.bauhaus->graph_border.green,
+                                   darktable.bauhaus->graph_border.blue, 0.5);
+          _draw_ratio_curve(cr, width, height, frame_lambda, q_gauss, gauss_nrungs,
+                            roi_long_edge, axis);
+          cairo_set_dash(cr, NULL, 0, 0.0);
+        }
         break;
+      }
       case CT_PICK_FIXED:
       default:
         break;
