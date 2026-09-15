@@ -2950,11 +2950,9 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
 
 // implementation-plan-8.md §5: what a box query reads off the ladder's own
 // SAT tables, before any picker mode decides what to do with it -- the
-// shared skeleton's `_measure_box` output. Same fields the pre-plan-8
-// `_fit_curve_from_box` kept as locals (see its comment, preserved below on
-// `_measure_box`), gathered into one struct so `_fit_spectrum` and
-// `_mode_shape` can both take a single argument instead of the same eight
-// arrays threaded through by hand.
+// shared skeleton's `_measure_box` output, gathered into one struct so
+// `_fit_spectrum` and `_mode_shape` can both take a single argument
+// instead of the same eight arrays threaded through by hand.
 typedef struct _ct_box_stats_t
 {
   int nrungs;
@@ -3092,12 +3090,6 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
   return TRUE;
 }
 
-// implementation-plan-8.md §5.4 Phase 5.1: moved up from just after _mode_shape
-// so CT_PICK_PERCENTILE's own case below can call _box_block_percentiles directly
-// -- these three functions were already grouped together in the file (plan-8's
-// own Phase 3.2 commit put them right after _mode_shape), so the move carries the
-// whole group rather than adding a forward declaration (implementation-plan-6.md
-// §6 Phase 2.1 set the precedent for preferring this over a forward declaration).
 // ascending comparator for the p90/p99 reads below.
 static int _ct_cmp_double(const void *a, const void *b)
 {
@@ -3119,8 +3111,8 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 // implementation-plan-8.md §5.2/§5.4: percentile mode's own observable
 // needs p90/p99 of the per-block RMS a box's blocks carry at each rung --
 // the *distribution* §5.4's 4th component (Phase 3.1) publishes, not the
-// sum _fit_curve_from_box's SAT query reads. Called by CT_PICK_PERCENTILE's
-// own case in _mode_shape below (Phase 5.1).
+// sum _measure_box's SAT query reads. Called by CT_PICK_PERCENTILE's own
+// case in _mode_shape below (Phase 5.1).
 //
 // A super-block's one aggregated RMS value is repeated once per base block
 // it covers (the same repetition _ladder_build_blockrms wrote into the
@@ -3140,7 +3132,7 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 // know which rungs it can trust (CT_PERCENTILE_MIN_BLOCKS).
 //
 // The box-to-blocks clipping below is the same arithmetic
-// _fit_curve_from_box uses (see there); not factored into a shared helper
+// _measure_box uses (see there); not factored into a shared helper
 // since the two loops that follow it diverge immediately (four-corner SAT
 // lookups there, a full block walk here) and there is no third caller yet
 // to justify the indirection.
@@ -3305,7 +3297,7 @@ static void _ct_smooth_log_octave(const double *const restrict sigma_r,
   free(smoothed);
 }
 
-// evaluate the per-rung shape (already smoothed, peak normalised to 1) on
+// evaluate the per-rung shape (already smoothed, each rung in [0, 1]) on
 // the dense projection grid: log-linear interpolation between measured
 // rungs, a one-octave linear taper to 0 past the finest measured rung
 // (§5's own rule, see _ct_smooth_log_octave's comment), and constant
@@ -3469,17 +3461,10 @@ static gboolean _ct_structure_shape(const _ct_box_stats_t *const stats,
 // fallback write); CT_PICK_FIXED's Gaussian hump is never all-zero and so
 // never returns FALSE.
 //
-// `self`/`box` are needed only by CT_PICK_PERCENTILE (§5.4's box + frame
-// block-RMS percentile queries read `self->gui_data` directly, and the box
-// query needs the original pixel box, not anything `_ct_box_stats_t` keeps)
-// -- CT_PICK_FIXED and CT_PICK_STRUCTURE (kappa is already in `stats`) have
-// no use for either.
-//
-// CT_PICK_FIXED's body below is the pre-plan-8 `_fit_curve_from_box`'s own
-// post-`_fit_spectrum` code, moved verbatim (the found_texture advisories,
-// then the CT_TARGET_DEFAULT hump via `_target_curve`) -- implementation-
-// plan-8.md §6 Phase 2.2's own regression bar: "a fixed-mode pick writes
-// byte-identical band[] to before."
+// `self`/`box` are needed only by CT_PICK_PERCENTILE (§5.4's block-RMS
+// percentile query reads `self->gui_data` directly and needs the original
+// pixel box, not anything `_ct_box_stats_t` keeps) -- CT_PICK_FIXED and
+// CT_PICK_STRUCTURE (kappa is already in `stats`) have no use for either.
 static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
                             const _ct_picker_mode_t mode,
                             const _ct_box_stats_t *const stats,
