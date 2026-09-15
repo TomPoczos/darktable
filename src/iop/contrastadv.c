@@ -213,7 +213,7 @@ typedef enum dt_iop_details_display_t
 {
   DT_CT_MASK_OFF = -1,
   DT_CT_MASK_CORRECTION = CT_BANDS,      // sum (g_k - 1) b_k, i.e. what the module is doing
-  DT_CT_MASK_DETAIL     = CT_BANDS + 1   // sum b_k, i.e. the v1 behaviour
+  DT_CT_MASK_DETAIL     = CT_BANDS + 1   // sum b_k, the un-gained detail texture
 } dt_iop_details_display_t;
 
 typedef struct dt_iop_contrast_gui_data_t
@@ -351,106 +351,6 @@ dt_iop_colorspace_type_t default_colorspace(dt_iop_module_t *self,
                                             dt_dev_pixelpipe_iop_t *piece)
 {
   return IOP_CS_RGB;
-}
-
-int legacy_params(dt_iop_module_t *self,
-                  const void *const old_params,
-                  const int old_version,
-                  void **new_params,
-                  int32_t *new_params_size,
-                  int *new_version)
-{
-  typedef struct dt_iop_contrast_params_v1_t
-  {
-    float gain_local_contrast;
-    float detail_level;
-    float edge_protection;
-    int filter_iterations;
-    float noise_bias;
-  } dt_iop_contrast_params_v1_t;
-
-  if(old_version == 1)
-  {
-    const dt_iop_contrast_params_v1_t *o = (dt_iop_contrast_params_v1_t *)old_params;
-    dt_iop_contrast_params_t *n = malloc(sizeof(dt_iop_contrast_params_t));
-
-    // v1 had one gain over everything finer than detail_level.
-    // Reproduce it: put the ladder's coarsest boundary at detail_level and open
-    // every band. The bands telescope, so this is exact up to the ladder's
-    // half-octave quantisation, which scale_shift absorbs. The new master gain
-    // stays neutral -- the old strength lives entirely in the opened bands now.
-    const float d = CLAMP(o->detail_level, CT_BAND_D0, CT_BAND_D0 + CT_BANDS - 1);
-    n->gain_local_contrast = 1.0f;
-    n->scale_shift = CLAMP(d - roundf(d), -0.5f, 0.5f);
-    for(int k = 0; k < CT_BANDS; k++)
-      n->band[k] = (CT_BAND_D0 + k >= roundf(d)) ? o->gain_local_contrast : 1.0f;
-    n->edge_protection = o->edge_protection;
-    n->filter_iterations = o->filter_iterations;
-    n->noise_bias = o->noise_bias;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_contrast_params_t);
-    *new_version = 4;
-    return 0;
-  }
-  if(old_version == 2)
-  {
-    typedef struct dt_iop_contrast_params_v2_t
-    {
-      float gain_local_contrast;
-      float band[CT_BANDS];
-      float scale_shift;
-      float edge_protection;
-      int filter_iterations;
-      float noise_bias;
-      int decomposition;  // dropped in v4: was accurate(0)/fast(1), only accurate ever shipped as default
-    } dt_iop_contrast_params_v2_t;
-
-    const dt_iop_contrast_params_v2_t *o = (dt_iop_contrast_params_v2_t *)old_params;
-    dt_iop_contrast_params_t *n = malloc(sizeof(dt_iop_contrast_params_t));
-
-    n->gain_local_contrast = o->gain_local_contrast;
-    for(int k = 0; k < CT_BANDS; k++) n->band[k] = o->band[k];
-    n->scale_shift = o->scale_shift;
-    n->edge_protection = o->edge_protection;
-    n->filter_iterations = o->filter_iterations;
-    n->noise_bias = o->noise_bias;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_contrast_params_t);
-    *new_version = 4;
-    return 0;
-  }
-  if(old_version == 3)
-  {
-    typedef struct dt_iop_contrast_params_v3_t
-    {
-      float gain_local_contrast;
-      float band[CT_BANDS];
-      float scale_shift;
-      float edge_protection;
-      int filter_iterations;
-      float noise_bias;
-      int decomposition;      // dropped in v4: accurate is now the only behavior
-      int calibration_mode;   // dropped in v4: spectral model is now the only behavior
-    } dt_iop_contrast_params_v3_t;
-
-    const dt_iop_contrast_params_v3_t *o = (dt_iop_contrast_params_v3_t *)old_params;
-    dt_iop_contrast_params_t *n = malloc(sizeof(dt_iop_contrast_params_t));
-
-    n->gain_local_contrast = o->gain_local_contrast;
-    for(int k = 0; k < CT_BANDS; k++) n->band[k] = o->band[k];
-    n->scale_shift = o->scale_shift;
-    n->edge_protection = o->edge_protection;
-    n->filter_iterations = o->filter_iterations;
-    n->noise_bias = o->noise_bias;
-
-    *new_params = n;
-    *new_params_size = sizeof(dt_iop_contrast_params_t);
-    *new_version = 4;
-    return 0;
-  }
-  return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,9 +1627,8 @@ static inline void compute_luminance(const float *const restrict in,
 // diffed against the *previous* band's own blur (blur_{-1} = the untouched
 // luminance), not always against the original -- that is what makes
 // sum_k b_k telescope to a single log2(L) - log2(blur_{nbands-1}) highpass
-// when every gain is equal, which is the property legacy_params's v1
-// conversion and DT_CT_MASK_DETAIL both rely on to reproduce v1's own
-// single-band behaviour exactly. A cumulative log2(L) - log2(blur_k) here
+// when every gain is equal, which is what makes DT_CT_MASK_DETAIL a plain
+// single-band highpass. A cumulative log2(L) - log2(blur_k) here
 // (diffing every band against the original image) does not telescope and
 // silently over-boosts whenever more than one band is open at once.
 //
@@ -1737,7 +1636,7 @@ static inline void compute_luminance(const float *const restrict in,
 // >= 0 writes that one surviving band's raw b_k, instead of accumulating,
 // so the per-band mask view can reuse this same pass rather than a second
 // traversal; -2 accumulates the unweighted sum of every band's b_k (the
-// DETAIL view, i.e. v1's own behaviour, with no gain applied); -1 (or
+// DETAIL view, with no gain applied); -1 (or
 // anything else negative) is the normal gain-weighted accumulate, which
 // doubles as the CORRECTION view before the caller's gate and master gain.
 __DT_CLONE_TARGETS__
@@ -1807,7 +1706,7 @@ static void _decompose_and_accumulate(const float *const restrict lum,
 }
 
 // the Wiener gate, gauged off the coarsest band -- the closest thing this
-// module has to v1's single smoothed reference -- and applied once to the
+// module has to a single smoothed reference -- and applied once to the
 // whole accumulated correction rather than per band (research.md's noise
 // model is about the local signal level, which the coarsest band already
 // estimates about as well as any finer one would).
