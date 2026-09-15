@@ -4110,7 +4110,23 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
   if(in) return;
 
   dt_iop_contrast_gui_data_t *g = self->gui_data;
-  if(g) g->pick_pending = FALSE;
+  if(g)
+  {
+    g->pick_pending = FALSE;
+
+    // lost focus: stop showing the mask, as toneequal.c does. process()
+    // keys the full pipe's display off g->details_display alone, with no
+    // focus check of its own, so without this the mask would stay up
+    // under whatever module is opened next
+    if(g->details_display != DT_CT_MASK_OFF)
+    {
+      g->details_display = DT_CT_MASK_OFF;
+      dt_bauhaus_widget_set_quad_active(GTK_WIDGET(g->gain_local_contrast), FALSE);
+      for(int k = 0; k < CT_BANDS; k++)
+        dt_bauhaus_widget_set_quad_active(GTK_WIDGET(g->band[k]), FALSE);
+      dt_dev_reprocess_center(self->dev, self->iop_order);
+    }
+  }
 
   dt_iop_color_picker_reset(self, TRUE);
 }
