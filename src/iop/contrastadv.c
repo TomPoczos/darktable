@@ -3938,6 +3938,28 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // a GUI preference with no cached copy to go stale (see its own comment
   // in gui_init).
   const _ct_picker_mode_t picker_mode = (_ct_picker_mode_t)dt_bauhaus_combobox_get(g->picker_mode);
+
+  // implementation-plan-8.md §4.4/§5.4 Phase 4.2: CT_PICK_STRUCTURE's own
+  // overlay diagnostic -- the box-wide kappa per rung (not the block-median
+  // kappa the curve itself is built from, per Phase 4.3's own decision:
+  // "the box-wide kappa of 4.1 is what the overlay's box-wide rail shows,
+  // not what drives the curve"). Published unconditionally, even if
+  // `_mode_shape` below finds nothing to write, since the overlay's whole
+  // point is to make a pick legible -- including a pick that landed on
+  // nothing.
+  dt_iop_gui_enter_critical_section(self);
+  if(picker_mode == CT_PICK_STRUCTURE)
+  {
+    for(int r = 0; r < stats.nrungs; r++)
+      g->mode_overlay[r] = (stats.s1_energy[r] > 0.0) ? sqrt(stats.energies[r]) / stats.s1_energy[r] : 0.0;
+    g->mode_overlay_n = stats.nrungs;
+  }
+  else
+  {
+    g->mode_overlay_n = 0;
+  }
+  dt_iop_gui_leave_critical_section(self);
+
   gboolean is_absolute_target = FALSE;
   if(!_mode_shape(picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref, p->scale_shift,
                   shape, &is_absolute_target))
@@ -4243,6 +4265,22 @@ static float _spectrum_energy_to_y(const double energy, const double peak)
   return CLAMP((float)(1.0 + log2(energy / peak) / CT_SPECTRUM_LOG_RANGE), 0.0f, 1.0f);
 }
 
+// implementation-plan-8.md §4.4 Phase 4.2: kappa's own y-mapping, for
+// CT_PICK_STRUCTURE's overlay -- linear, not the log/peak-relative mapping
+// above: kappa is already a bounded O(1) ratio (>= 1.0 by the L2/L1
+// power-mean inequality), so a log-relative-to-peak scale would waste most
+// of the plot on values that never occur. The range is fixed, not
+// peak-relative, so the CT_KAPPA_GAUSSIAN/CT_KAPPA_STRUCT rails sit at the
+// same screen height on every pick rather than sliding around with
+// whatever kappa this box happened to reach.
+#define CT_KAPPA_PLOT_LO 1.0
+#define CT_KAPPA_PLOT_HI (CT_KAPPA_STRUCT + (CT_KAPPA_STRUCT - CT_KAPPA_GAUSSIAN) * 0.3)
+
+static float _kappa_to_y(const double kappa)
+{
+  return CLAMP((float)((kappa - CT_KAPPA_PLOT_LO) / (CT_KAPPA_PLOT_HI - CT_KAPPA_PLOT_LO)), 0.0f, 1.0f);
+}
+
 // the frame-wide ladder's own spectrum: one (lambda, energy) point per rung,
 // energy = S2/n over the *whole* ladder grid. Since a summed-area table is
 // zero-padded on its low side (§2.1's _ladder_build_sat), the frame total is
@@ -4480,9 +4518,49 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     switch(picker_mode)
     {
       case CT_PICK_STRUCTURE:
-        // Phase 4.2: kappa per rung, with the CT_KAPPA_GAUSSIAN and
-        // CT_KAPPA_STRUCT rails.
+      {
+        // implementation-plan-8.md §4.4 Phase 4.2: the two rails first --
+        // dashed, full width, graph_border like the other reference lines
+        // on this graph -- so the kappa curve drawn on top of them reads
+        // against a fixed scale rather than a floating one.
+        const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
+        cairo_set_dash(cr, dashes, 2, 0.0);
+        cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
+                                 darktable.bauhaus->graph_border.green,
+                                 darktable.bauhaus->graph_border.blue, 0.6);
+        const float y_gauss = height * (1.0f - _kappa_to_y(CT_KAPPA_GAUSSIAN));
+        dt_draw_line(cr, 0, y_gauss, width, y_gauss);
+        cairo_stroke(cr);
+        const float y_struct = height * (1.0f - _kappa_to_y(CT_KAPPA_STRUCT));
+        dt_draw_line(cr, 0, y_struct, width, y_struct);
+        cairo_stroke(cr);
+        cairo_set_dash(cr, NULL, 0, 0.0);
+
+        // the box-wide kappa itself (Phase 4.3's own decision: the overlay
+        // shows the box-wide reading, the curve is built from the
+        // block-median one instead) -- dotted, over `pick_lambda[]`'s same
+        // rungs mode_overlay[] was measured on, in color_fill so it reads
+        // as "this pick's own measurement" like the energy curve above,
+        // distinguished from it by the dotted stroke and the different
+        // (linear, fixed-range) y scale.
+        const double dots[2] = { DT_PIXEL_APPLY_DPI(1.0), DT_PIXEL_APPLY_DPI(2.0) };
+        cairo_set_dash(cr, dots, 2, 0.0);
+        cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
+                                 darktable.bauhaus->color_fill.green,
+                                 darktable.bauhaus->color_fill.blue, 0.9);
+        gboolean started = FALSE;
+        const int n = MIN(mode_overlay_n, pick_nrungs);
+        for(int r = 0; r < n; r++)
+        {
+          const float x = _graph_lambda_to_x(pick_lambda[r], roi_long_edge, axis) * width;
+          const float y = height * (1.0f - _kappa_to_y(mode_overlay[r]));
+          if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
+          else cairo_line_to(cr, x, y);
+        }
+        cairo_stroke(cr);
+        cairo_set_dash(cr, NULL, 0, 0.0);
         break;
+      }
       case CT_PICK_PERCENTILE:
         // Phase 5.2: q_r per rung against the frame-wide q_r and the noise
         // baseline.
