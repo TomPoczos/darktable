@@ -2656,10 +2656,10 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
 // picks, both clamp violations, neither a real measurement); this is a hard
 // clamp rather than a clamp-and-resolve active set because that ringing was
 // small in practice -- revisit if a legitimate curve is measured to flatten
-// visibly against it. The picker passes [min(1,master), max(1,master)];
-// presets pass their own envelope directly since some (soften) are
-// deliberately < 1 and one (flatten spectrum) straddles 1 on both sides,
-// neither of which a single "master" scalar can express.
+// visibly against it. The picker and init() pass the fixed hump's own
+// [1, 1+CT_DEFAULT_PEAK_EFF]; presets pass their own envelope directly
+// since some (soften) are deliberately < 1 and one (flatten spectrum)
+// straddles 1 on both sides.
 static gboolean _project_to_bands(const double *const restrict lambda_grid,
                                   const double *const restrict g_target,
                                   const int m,
