@@ -161,7 +161,7 @@ typedef struct _ct_ladder_t
   size_t bw, bh;                 // block grid, the same for every rung
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
   double *sat1;                  // Sum(|b|), same layout
-  double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _fit_curve_from_box/_spectrum_frame_wide now read instead of assuming every block full
+  double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _measure_box/_spectrum_frame_wide read instead of assuming every block full
   // implementation-plan-8.md §5.4: raw (non-cumulative) per-block RMS, one
   // value per rung, aggregated to super-blocks of >= CT_SUPERBLOCK_MIN_PIX
   // level pixels (§5.2's noise-floor argument for why 64). Same nrungs *
@@ -253,10 +253,12 @@ typedef struct dt_iop_contrast_gui_data_t
   // §2.2: the frame-wide DoG ladder's block SAT tables, republished through
   // dt_preview_data_t each untiled preview pass while the module is
   // expanded (§2.1's _build_ladder does the actual building). pd's buffer
-  // is laid out node-major: (bw+1) x (bh+1) SAT nodes, 2*nrungs floats per
-  // node (Sum(b^2), Sum(|b|), block pixel count interleaved per rung --
-  // implementation-plan-4.md §8.2) -- pd.width/height are therefore the SAT
-  // dimensions, one more than the block grid on each axis. ladder_nrungs/
+  // is laid out node-major: (bw+1) x (bh+1) SAT nodes, 4*nrungs floats per
+  // node (Sum(b^2), Sum(|b|), block pixel count and the non-cumulative
+  // block rms interleaved per rung -- implementation-plan-4.md §8.2 and
+  // implementation-plan-8.md §5.4, see _ladder_fill_cb) -- pd.width/height
+  // are therefore the SAT dimensions, one more than the block grid on each
+  // axis. ladder_nrungs/
   // lambda are the ladder metadata dt_preview_data_t has no room for;
   // protected by the same self->gui_lock dt_preview_data_t itself uses
   // (dt_iop_gui_enter/leave_critical_section), since pd.module == self.
@@ -272,8 +274,9 @@ typedef struct dt_iop_contrast_gui_data_t
   // _decompose_and_accumulate's optional _ct_band_tables_t argument) and
   // queried the same way to calibrate the picker's linear H_k model against
   // what eigf's edge-awareness actually delivers (research.md §5.8).
-  // components is fixed at 2*CT_BANDS -- unlike the ladder's nrungs, CT_BANDS
-  // never changes, so this pd needs no resize-on-change dance.
+  // components is fixed at 2*CT_BANDS + 1 (Sum(b^2)/Sum(|b|) per band plus
+  // one shared block pixel count, see _band_fill_cb) -- unlike the ladder's
+  // nrungs, CT_BANDS never changes, so this pd needs no resize-on-change dance.
   dt_preview_data_t band_pd;
   int band_nbands;               // how many of CT_BANDS survived the pass that built band_pd
   float band_sigma[CT_BANDS];    // finest-first, pixels of that same pass's roi (== ladder_roi_in)
@@ -1619,9 +1622,10 @@ static inline void compute_luminance(const float *const restrict in,
 // (research.md §2.4 option A; see phase0-hybrid-pyramid.md for why this is
 // the decomposition this module ships).
 //
-// correction ends up holding sum_k (gain_k - 1) * b_k, in EV, still missing
-// the master gain and the Wiener gate -- both are cheap scalar-per-pixel
-// operations applied once by the caller, rather than folded in here.
+// correction ends up holding sum_k band_master_k * (gain_k - 1) * b_k, in
+// EV, with each band's own knee-bent master already folded in (see the loop
+// body) but still missing the Wiener gate, a cheap scalar-per-pixel
+// operation applied once by the caller rather than here.
 //
 // b_k is research.md §2.1's incremental band: log2(blur_{k-1}) - log2(blur_k),
 // diffed against the *previous* band's own blur (blur_{-1} = the untouched
@@ -1638,7 +1642,7 @@ static inline void compute_luminance(const float *const restrict in,
 // traversal; -2 accumulates the unweighted sum of every band's b_k (the
 // DETAIL view, with no gain applied); -1 (or
 // anything else negative) is the normal gain-weighted accumulate, which
-// doubles as the CORRECTION view before the caller's gate and master gain.
+// doubles as the CORRECTION view before the caller's gate.
 __DT_CLONE_TARGETS__
 static void _decompose_and_accumulate(const float *const restrict lum,
                                       float *const restrict correction,
