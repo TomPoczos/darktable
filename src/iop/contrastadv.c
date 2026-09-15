@@ -3435,12 +3435,10 @@ static gboolean _ct_structure_shape(const _ct_box_stats_t *const stats,
 
 // implementation-plan-8.md §5: given a `_measure_box` + `_fit_spectrum` that
 // already succeeded, decide what shape `mode` writes onto the projection
-// grid `sigma_grid`/`m`. `*absolute` reports whether `shape[]` is already
-// the module's own absolute target -- master-independent, the way
-// CT_TARGET_DEFAULT/EQUALIZE are in `_target_curve` -- rather than a [0,1]
-// shape meant to be lerped with gain_local_contrast; every mode built by
-// plan-8 is the former (§5's "the picker sets shape, never strength"), but
-// the caller still needs to be told which.
+// grid `sigma_grid`/`m`. `shape[]` is always the module's own absolute
+// target -- master-independent, the way CT_TARGET_DEFAULT/EQUALIZE are in
+// `_target_curve` -- never a [0,1] shape to be lerped with
+// gain_local_contrast (§5's "the picker sets shape, never strength").
 //
 // CT_PICK_STRUCTURE (§5.1, `_ct_structure_shape`) and CT_PICK_PERCENTILE
 // (§5.2/§5.4, below) each have their own case. Returns FALSE only for a
@@ -3466,8 +3464,7 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
                             const _ct_fit_t *const fit,
                             const double *const restrict sigma_grid, const int m,
                             const double sigma_ref, const float scale_shift,
-                            double *const restrict shape,
-                            gboolean *const absolute)
+                            double *const restrict shape)
 {
   // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is not
   // derived from what was measured here (§3.7b) for the fixed mode -- kept,
@@ -3583,7 +3580,6 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
         return FALSE;
       }
 
-      *absolute = TRUE;
       return TRUE;
     }
 
@@ -3600,7 +3596,6 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
                           "it is texture or noise at every size"));
         return FALSE;
       }
-      *absolute = TRUE;
       return TRUE;
     }
 
@@ -3608,7 +3603,6 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
     default:
     {
       _target_curve(fit, CT_TARGET_DEFAULT, sigma_grid, m, sigma_ref, scale_shift, shape);
-      *absolute = TRUE;
       return TRUE;
     }
   }
@@ -3965,8 +3959,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // moved s_ref (§5.1) and let the outermost band absorb the tail. This
   // bound is fixed, frame-relative, and identical for every pick and every
   // preset.
-  double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID];
-  double shape[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
+  double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID], target[CT_PROJECT_GRID];
   double lo, hi;
   _ct_grid_bounds(sigma, &lo, &hi);
   for(int j = 0; j < CT_PROJECT_GRID; j++)
@@ -4003,18 +3996,14 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   }
   dt_iop_gui_leave_critical_section(self);
 
-  gboolean is_absolute_target = FALSE;
+  // §8.1: every mode's shape is an absolute target (§5's "the picker sets
+  // shape, never strength"), used as-is rather than lerped between 1 and
+  // master -- master-independent by design, so a pick lands at the same
+  // effective strength regardless of what the master slider was set to
+  // beforehand.
   if(!_mode_shape(self, box, picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref,
-                  p->scale_shift, shape, &is_absolute_target))
+                  p->scale_shift, target))
     return;  // Phase 4/5's all-zero case: the default curve is already applied, nothing to do
-
-  // §8.1: an absolute target (every mode plan-8 builds, §5's "the picker
-  // sets shape, never strength") is used as target[] as-is, not lerped
-  // between 1 and master the way a relative [0,1] shape would be --
-  // master-independent by design, so a pick lands at the same effective
-  // strength regardless of what the master slider was set to beforehand.
-  for(int j = 0; j < CT_PROJECT_GRID; j++)
-    target[j] = is_absolute_target ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
   // §3.1: how much of its own linear H_k each band actually delivered over
   // this same box, last time the module's own bands were measured there --
@@ -4024,17 +4013,14 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
 
   // §4.4: the envelope the target curve itself was built to. No band should
   // leave it. implementation-plan-6.md §5.3/§6 Phase 2.3/implementation-
-  // plan-8.md §5: every picker-reachable target is now absolute, so this is
+  // plan-8.md §5: every picker-reachable target is absolute, so this is
   // [1, 1+CT_DEFAULT_PEAK_EFF] unconditionally -- gain_lo pinned at 1.0 (not
   // min(1,master)) so R1 (never cut a band below neutral on the autopick
   // path) holds by construction, and gain_hi at the shape's own known
   // ceiling (the Gaussian never exceeds 1) rather than anything
-  // master-derived, since this target is master-independent. The
-  // CT_TARGET_EQUALIZE bounds this ternary used to carry were already dead
-  // on the picker path -- _mode_shape never produces that mode -- and are
-  // dropped rather than threaded through as a case nothing can reach.
-  const float gain_lo = is_absolute_target ? 1.0f : fminf(1.0f, p->gain_local_contrast);
-  const float gain_hi = is_absolute_target ? (1.0f + CT_DEFAULT_PEAK_EFF) : fmaxf(1.0f, p->gain_local_contrast);
+  // master-derived, since this target is master-independent.
+  const float gain_lo = 1.0f;
+  const float gain_hi = 1.0f + CT_DEFAULT_PEAK_EFF;
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
   if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration,
