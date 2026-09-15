@@ -4182,18 +4182,17 @@ static float _graph_gain_to_yfrac(const float gain)
 }
 
 // implementation-plan-6.md §6 Phase 4.1: the node position is the *shape*
-// the picker wrote (or the user hand-drew) -- process() then multiplies its
-// deviation from 1 by the master gain once more (§2.2's `correction *= gate
-// * gain_local_contrast`), so what actually reaches the pixels is this,
-// which can go negative (inverting that octave's detail) even on a shape
-// that itself never goes below zero.
+// the picker wrote (or the user hand-drew); what reaches the pixels is
+// 1 + band_master * (shape - 1), the per-band scale modify_roi_in stores in
+// d->band_master[] and _decompose_and_accumulate folds into each band. It
+// can go negative (inverting that octave's detail) even on a shape that
+// itself never goes below zero.
 //
-// implementation-plan-7.md §4.2: `master` here is no longer the raw slider
-// value directly -- it is that band's own post-knee master
-// (_ct_band_master), the same per-band value process() actually multiplies
-// by (§4.1(d)/§6 Phase 1.3). Using the raw slider value here, as before this
-// plan, is exactly §2.2's bug: past each band's own R_k the dashed line kept
-// climbing while the pixels stood still.
+// implementation-plan-7.md §4.2: band_master is the band's own post-knee
+// master (_ct_band_master), not the raw slider value -- past each band's
+// own R_k the raw value keeps climbing while the pixels stand still, and
+// the knee bends even at master == 1 once the shape itself sits above the
+// band's ceiling (R_k < 1).
 static float _graph_effective_gain(const int k, const float band_gain, const float master,
                                    const float scale_shift)
 {
@@ -4418,19 +4417,27 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   cairo_stroke(cr);
 
   // 5b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
-  // 1 + master*(shape-1) -- what §1's bug report actually judged. Dashed,
-  // since it's derived from the shape curve rather than directly editable
-  // (this file's convention: solid = editable, dashed = derived). Skipped at
-  // master == 1 exactly, where it would trace the shape curve on top of
-  // itself and add nothing to look at. g->curve is scratch state private to
-  // this draw call (nothing after this point reads it), so reusing it here
-  // rather than allocating a second curve is safe.
-  if(p->gain_local_contrast != 1.0f)
+  // 1 + band_master*(shape-1) -- what §1's bug report actually judged.
+  // Dashed, since it's derived from the shape curve rather than directly
+  // editable (this file's convention: solid = editable, dashed = derived).
+  // Skipped only where it would trace the shape curve on top of itself and
+  // add nothing to look at: that is not simply master == 1, since the
+  // per-band knee (_ct_band_master) already bends a band whose shape sits
+  // above its own ceiling at that master. g->curve is scratch state private
+  // to this draw call (nothing after this point reads it), so reusing it
+  // here rather than allocating a second curve is safe.
+  float effective[CT_BANDS];
+  gboolean effective_differs = FALSE;
+  for(int k = 0; k < CT_BANDS; k++)
+  {
+    effective[k] = _graph_effective_gain(k, p->band[k], p->gain_local_contrast, p->scale_shift);
+    if(fabsf(effective[k] - p->band[k]) > 1e-4f) effective_differs = TRUE;
+  }
+  if(effective_differs)
   {
     for(int k = 0; k < CT_BANDS; k++)
       dt_draw_curve_set_point(g->curve, k, _graph_node_x(k, &axis),
-                              _graph_gain_to_yfrac(_graph_effective_gain(k, p->band[k], p->gain_local_contrast,
-                                                                        p->scale_shift)));
+                              _graph_gain_to_yfrac(effective[k]));
     float exs[CT_GRAPH_RES], eys[CT_GRAPH_RES];
     dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, exs, eys);
     const double eff_dashes[2] = { DT_PIXEL_APPLY_DPI(3.0), DT_PIXEL_APPLY_DPI(2.0) };
@@ -4507,8 +4514,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     // at when judging a curve, so this is marked here, not only on the 5b
     // overlay curve, and it overrides the extrapolated color (not the dash,
     // which is a separate question per §4.5).
-    const float effective_gain = _graph_effective_gain(k, p->band[k], p->gain_local_contrast,
-                                                       p->scale_shift);
+    const float effective_gain = effective[k];
     const gboolean negative_effective = effective_gain <= 0.0f;
 
     cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(6));
