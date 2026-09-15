@@ -3244,6 +3244,22 @@ void init_presets(dt_iop_module_so_t *self)
     lambda_grid[j] = sigma_grid[j] * CT_SIGMA_TO_LAMBDA;
   }
 
+  // "default curve" (plan-8 §3.3): the module's own baseline (§3.1's
+  // init()) as an explicit preset, so it is reachable again after a pick or
+  // a hand edit without resetting the whole module, and so the preset list
+  // states the baseline next to clarity/texture/etc rather than leaving it
+  // implicit. Same projection as init() -- CT_TARGET_DEFAULT's shape at
+  // scale_shift = 0, envelope [1, 1+CT_DEFAULT_PEAK_EFF] -- not a
+  // hand-rolled bump like the presets below it.
+  {
+    _ct_fit_t unused_fit;
+    memset(&unused_fit, 0, sizeof(unused_fit));
+    _target_curve(&unused_fit, CT_TARGET_DEFAULT, sigma_grid, CT_PROJECT_GRID, 0.0, 0.0f, target);
+  }
+  if(_preset_apply_target(lambda_grid, target, CT_PROJECT_GRID, sigma, 1.0f, 1.0f + CT_DEFAULT_PEAK_EFF, &p))
+    dt_gui_presets_add_generic(_("default curve"), self->op, self->version(), &p, sizeof(p), TRUE,
+                               DEVELOP_BLEND_CS_RGB_SCENE);
+
   // "clarity": a broad boost centred mid-ladder, slightly toward the coarse
   // side -- traditional medium/large-scale local contrast.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
