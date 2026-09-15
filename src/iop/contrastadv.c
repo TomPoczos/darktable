@@ -1661,6 +1661,9 @@ static void _decompose_and_accumulate(const float *const restrict lum,
   float *const restrict blur = dt_alloc_align_float(npixels);
   if(!log_lum || !blur)
   {
+    // correction is already zero and coarsest already holds lum, so the
+    // caller falls through to an identity render; only the message is owed
+    dt_control_log(_("advanced contrast failed to allocate memory, check your RAM settings"));
     dt_free_align(log_lum);
     dt_free_align(blur);
     return;
@@ -1809,7 +1812,10 @@ void process(dt_iop_module_t *self,
 
   if(!luminance || !correction || !coarsest)
   {
-    dt_control_log(_("local contrast failed to allocate memory, check your RAM settings"));
+    // downstream modules read ovoid regardless, so hand them the input
+    // rather than an uninitialized buffer
+    dt_iop_copy_image_roi(out, in, 4, roi_in, roi_out);
+    dt_control_log(_("advanced contrast failed to allocate memory, check your RAM settings"));
     dt_free_align(luminance);
     dt_free_align(correction);
     dt_free_align(coarsest);
