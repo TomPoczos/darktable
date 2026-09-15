@@ -3331,145 +3331,12 @@ static gboolean _ct_structure_shape(const _ct_box_stats_t *const stats,
   return TRUE;
 }
 
-// implementation-plan-8.md §5/§8.2: the box-quality advisories every mode
-// shares -- "the refusals and the advisories are properties of the box,
-// not of the mode" -- pulled out of `_mode_shape`'s own shared case below
-// so CT_PICK_STRUCTURE (which no longer falls through to that case) still
-// runs them. Moved verbatim, no behaviour change.
-static void _ct_box_advisories(const _ct_box_stats_t *const stats, const _ct_fit_t *const fit)
-{
-  const gboolean found_texture = fit->texture_peak > stats->peak_e * 1e-2;
-
-  // §2.4/research.md §5.9: advisory only, neither warning below refuses
-  // the pick -- both just explain a result that might otherwise look
-  // like nothing happened, or like an untrustworthy size.
-  {
-    int peak_idx = 0;
-    for(int r = 1; r < stats->nrungs; r++)
-      if(stats->energies[r] > stats->energies[peak_idx]) peak_idx = r;
-    double S, N;
-    _ct_fit_eval(fit, stats->sigma[peak_idx], &S, &N);
-    if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
-      dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
-  }
-
-  // §8.2: fit->tau/fit->texture feed _ct_fit_eval's S(sigma) the same
-  // way regardless of mode -- so the fitted size is still worth warning
-  // about whenever a texture was found at all.
-  if(found_texture)
-  {
-    const double target_sigma = sqrt(fit->tau);
-
-    // §6.2: the fitted size sits within half an octave of the window's
-    // own coarse edge (§1.1's lambda_max) -- there is no peak inside
-    // what the box could see, only a rising flank, so the reported size
-    // is read off the edge of the window rather than measured. Warn,
-    // don't refuse: this is the honest answer, not a bad one.
-    if(target_sigma >= stats->sigma[stats->nrungs - 1] / M_SQRT2)
-      dt_control_log(_("the measured size sits at the edge of what this box can see -- "
-                        "it may be larger than reported"));
-
-    // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure
-    // -- the box is too small to *contain* the feature, so the fit
-    // can't place any peak inside what it measured and instead
-    // collapses tau toward the ladder's finest rung, railing beta high
-    // to explain the rest. A full-octave margin catches this without
-    // false-positiving on a legitimate fine-texture pick -- see
-    // findings.md for the sweep this threshold came from.
-    if(target_sigma <= stats->sigma[0] * 2.0)
-    {
-      const double min_side = 2.0 * stats->window_lambda_max;
-      dt_control_log(_("the box is too small to see how big this is -- "
-                        "try at least %.0f x %.0f px"), min_side, min_side);
-    }
-
-    int nearest = 0;
-    double best_d = DBL_MAX;
-    for(int r = 0; r < stats->nrungs; r++)
-    {
-      const double dist = fabs(log(stats->sigma[r] / target_sigma));
-      if(dist < best_d) { best_d = dist; nearest = r; }
-    }
-    if(stats->s1_energy[nearest] > 0.0)
-    {
-      const double kappa = sqrt(stats->energies[nearest]) / stats->s1_energy[nearest];
-      if(kappa > CT_KAPPA_EDGE)
-        dt_control_log(_("the picked area looks more like a hard edge than dense texture -- "
-                          "the measured size may be unreliable"));
-    }
-  }
-}
-
-// implementation-plan-8.md §5: given a `_measure_box` + `_fit_spectrum` that
-// already succeeded, decide what shape `mode` writes onto the projection
-// grid `sigma_grid`/`m`. `*absolute` reports whether `shape[]` is already
-// the module's own absolute target -- master-independent, the way
-// CT_TARGET_DEFAULT/EQUALIZE are in `_target_curve` -- rather than a [0,1]
-// shape meant to be lerped with gain_local_contrast; every mode built by
-// plan-8 is the former (§5's "the picker sets shape, never strength"), but
-// the caller still needs to be told which.
-//
-// CT_PICK_STRUCTURE/CT_PICK_PERCENTILE are plan-8 Phase 4/5's own work and
-// fall through to CT_PICK_FIXED's case until then (Phase 2's own intro:
-// "No behaviour change yet: every entry runs the fixed path"). Returns
-// FALSE only for a mode whose shape comes back all-zero (Phase 4/5's own
-// "nothing to do" case -- the default curve is already applied, so this is
-// a no-op, not a fallback write); CT_PICK_FIXED's Gaussian hump is never
-// all-zero and so never returns FALSE.
-//
-// CT_PICK_FIXED's body below is the pre-plan-8 `_fit_curve_from_box`'s own
-// post-`_fit_spectrum` code, moved verbatim (the found_texture advisories,
-// then the CT_TARGET_DEFAULT hump via `_target_curve`) -- implementation-
-// plan-8.md §6 Phase 2.2's own regression bar: "a fixed-mode pick writes
-// byte-identical band[] to before."
-static gboolean _mode_shape(const _ct_picker_mode_t mode,
-                            const _ct_box_stats_t *const stats,
-                            const _ct_fit_t *const fit,
-                            const double *const restrict sigma_grid, const int m,
-                            const double sigma_ref, const float scale_shift,
-                            double *const restrict shape,
-                            gboolean *const absolute)
-{
-  switch(mode)
-  {
-    // implementation-plan-8.md §5.1 Phase 4.1/4.4: structure's own shape,
-    // from the box's block-median kappa -- see `_ct_structure_shape`. The
-    // advisories are still every mode's own (§5/§8.2's "properties of the
-    // box, not of the mode"), just no longer folded into the fixed shape's
-    // own case now that structure has left it.
-    case CT_PICK_STRUCTURE:
-    {
-      _ct_box_advisories(stats, fit);
-      if(!_ct_structure_shape(stats, fit, sigma_grid, m, shape))
-      {
-        // §5's own rule: "a mode whose shape comes back all-zero logs its
-        // own message and writes nothing -- the default curve is already
-        // applied, so 'nothing to do' is a no-op, not a fallback write."
-        dt_control_log(_("nothing in the picked area reads as structure -- "
-                          "it is texture or noise at every size"));
-        return FALSE;
-      }
-      *absolute = TRUE;
-      return TRUE;
-    }
-
-    case CT_PICK_PERCENTILE:
-    case CT_PICK_FIXED:
-    default:
-    {
-      // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is
-      // not derived from what was measured here (§3.7b) -- every mode's
-      // "not implemented yet" fallback and CT_PICK_FIXED itself both write
-      // the same fixed CT_TARGET_DEFAULT shape.
-      _ct_box_advisories(stats, fit);
-
-      _target_curve(fit, CT_TARGET_DEFAULT, sigma_grid, m, sigma_ref, scale_shift, shape);
-      *absolute = TRUE;
-      return TRUE;
-    }
-  }
-}
-
+// implementation-plan-8.md §5.4 Phase 5.1: moved up from just after _mode_shape
+// so CT_PICK_PERCENTILE's own case below can call _box_block_percentiles directly
+// -- these three functions were already grouped together in the file (plan-8's
+// own Phase 3.2 commit put them right after _mode_shape), so the move carries the
+// whole group rather than adding a forward declaration (implementation-plan-6.md
+// §6 Phase 2.1 set the precedent for preferring this over a forward declaration).
 // ascending comparator for the p90/p99 reads below.
 static int _ct_cmp_double(const void *a, const void *b)
 {
@@ -3489,12 +3356,10 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 }
 
 // implementation-plan-8.md §5.2/§5.4: percentile mode's own observable
-// (Phase 5, not built by this phase) needs p90/p99 of the per-block RMS a
-// box's blocks carry at each rung -- the *distribution* §5.4's 4th
-// component (Phase 3.1) publishes, not the sum _fit_curve_from_box's SAT
-// query reads. Pure infrastructure, shipped ahead of the picker mode that
-// will call it -- unused this phase, hence __attribute__((unused)) rather
-// than hiding it behind a dead #if.
+// needs p90/p99 of the per-block RMS a box's blocks carry at each rung --
+// the *distribution* §5.4's 4th component (Phase 3.1) publishes, not the
+// sum _fit_curve_from_box's SAT query reads. Called by CT_PICK_PERCENTILE's
+// own case in _mode_shape below (Phase 5.1).
 //
 // A super-block's one aggregated RMS value is repeated once per base block
 // it covers (the same repetition _ladder_build_blockrms wrote into the
@@ -3510,10 +3375,6 @@ static double _ct_percentile_sorted(const double *const restrict sorted, const s
 // since the two loops that follow it diverge immediately (four-corner SAT
 // lookups there, a full block walk here) and there is no third caller yet
 // to justify the indirection.
-static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const box,
-                                       double *const restrict p90,
-                                       double *const restrict p99,
-                                       int *const restrict nrungs_out) __attribute__((unused));
 static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const box,
                                        double *const restrict p90,
                                        double *const restrict p99,
@@ -3567,6 +3428,423 @@ static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const b
 
   dt_iop_gui_leave_critical_section(self);
   return ok;
+}
+
+// implementation-plan-8.md §5.2/§5.4's correction: `q_gauss`, the baseline
+// `percentile` mode's own q_r = p90/p99 is measured against, is not the
+// closed-form iid constant (0.920 for 64 samples) §5.2 first guessed --
+// Phase 0.2 measured it at a pooled median of 0.601 on real sensor data,
+// because a super-block's samples are not independent at native resolution
+// (demosaicing correlates neighbours). So it has to be measured per image,
+// per rung, the same way _ladder_rung_noise_floor measures its own noise
+// floor: frame-wide, restricted to super-blocks whose own kappa reads as
+// near-Gaussian (within CT_KAPPA_NOISE_TOL of CT_KAPPA_GAUSSIAN -- the same
+// test _ladder_rung_noise_floor already applies at the base-block
+// granularity, applied here one level up at the super-block grouping
+// _ladder_superblock_side/_ladder_build_blockrms use).
+//
+// Ported from the offline harness's own version of this
+// (picker-regression/harness_v2/dig_phase0.c's for_each_superblock +
+// _cb_gauss_rms), adapted to box-query the live module's published SAT
+// buffer (g->pd, the 4-component sat2/sat1/sat_n/blockrms layout) instead
+// of a standalone _ct_ladder_t the harness keeps around for its own use --
+// the live module has no such struct outside the pixelpipe's own ladder
+// build, only what it publishes.
+//
+// A rung with fewer than 20 near-Gaussian super-blocks in the whole frame
+// has no reliable ratio of its own; §5.4 says to fall back to this frame's
+// own median over rungs that did clear 20, and only to the pooled constant
+// 0.60 (plan-8-evidence/00-families-on-12-crops.txt §0.2's own empirical
+// median across 11 frames) when nothing in the frame clears it anywhere.
+static gboolean _frame_gauss_baseline(dt_iop_module_t *self,
+                                      double *const restrict q_gauss,
+                                      int *const restrict nrungs_out)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+
+  dt_iop_gui_enter_critical_section(self);
+
+  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
+  const size_t comps = g->pd.components;
+  const gboolean have_data =
+    g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
+    && comps == (size_t)(4 * g->ladder_nrungs);
+
+  gboolean ok = FALSE;
+  if(have_data)
+  {
+    const size_t bw = sat_w - 1, bh = sat_h - 1;
+    const float *const restrict buf = g->pd.buf;
+    *nrungs_out = g->ladder_nrungs;
+
+    double ratio[CT_MAX_BANDS];
+    gboolean valid[CT_MAX_BANDS];
+    double *const restrict scratch = dt_alloc_align_double(MAX(bw * bh, (size_t)1));
+    if(scratch)
+    {
+      for(int r = 0; r < g->ladder_nrungs; r++)
+      {
+        // _build_ladder's own step: constant across one octave's
+        // CT_SCALES_PER_OCTAVE rungs, doubling per octave -- see its
+        // comment on the ladder-building loop.
+        const double step = exp2((double)(r / CT_SCALES_PER_OCTAVE));
+        const size_t grp = _ladder_superblock_side(step);
+
+        size_t n = 0;
+        for(size_t gy = 0; gy < bh; gy += grp)
+        {
+          const size_t y1 = MIN(gy + grp, bh);
+          for(size_t gx = 0; gx < bw; gx += grp)
+          {
+            const size_t x1 = MIN(gx + grp, bw);
+            const double s2 = buf[(y1 * sat_w + x1) * comps + 4 * r]
+                             - buf[(gy * sat_w + x1) * comps + 4 * r]
+                             - buf[(y1 * sat_w + gx) * comps + 4 * r]
+                             + buf[(gy * sat_w + gx) * comps + 4 * r];
+            const double s1 = buf[(y1 * sat_w + x1) * comps + 4 * r + 1]
+                             - buf[(gy * sat_w + x1) * comps + 4 * r + 1]
+                             - buf[(y1 * sat_w + gx) * comps + 4 * r + 1]
+                             + buf[(gy * sat_w + gx) * comps + 4 * r + 1];
+            const double sn = buf[(y1 * sat_w + x1) * comps + 4 * r + 2]
+                             - buf[(gy * sat_w + x1) * comps + 4 * r + 2]
+                             - buf[(y1 * sat_w + gx) * comps + 4 * r + 2]
+                             + buf[(gy * sat_w + gx) * comps + 4 * r + 2];
+            if(sn <= 0.0 || s1 <= 0.0) continue;
+            const double e_mean = s2 / sn;
+            const double s1_mean = s1 / sn;
+            const double kappa = sqrt(e_mean) / s1_mean;
+            if(fabs(kappa - CT_KAPPA_GAUSSIAN) <= CT_KAPPA_NOISE_TOL * CT_KAPPA_GAUSSIAN)
+              scratch[n++] = sqrt(e_mean);
+          }
+        }
+
+        if(n >= 20)
+        {
+          qsort(scratch, n, sizeof(double), _ct_cmp_double);
+          const double p90 = _ct_percentile_sorted(scratch, n, 0.90);
+          const double p99 = _ct_percentile_sorted(scratch, n, 0.99);
+          ratio[r] = (p99 > 0.0) ? p90 / p99 : 1.0;
+          valid[r] = TRUE;
+        }
+        else
+        {
+          ratio[r] = 0.0;
+          valid[r] = FALSE;
+        }
+      }
+      dt_free_align(scratch);
+
+      double have_ratios[CT_MAX_BANDS];
+      int nhave = 0;
+      for(int r = 0; r < g->ladder_nrungs; r++) if(valid[r]) have_ratios[nhave++] = ratio[r];
+      double frame_fallback = 0.60;
+      if(nhave > 0)
+      {
+        qsort(have_ratios, nhave, sizeof(double), _ct_cmp_double);
+        frame_fallback = (nhave % 2) ? have_ratios[nhave / 2]
+                                      : 0.5 * (have_ratios[nhave / 2 - 1] + have_ratios[nhave / 2]);
+      }
+      for(int r = 0; r < g->ladder_nrungs; r++) q_gauss[r] = valid[r] ? ratio[r] : frame_fallback;
+
+      ok = TRUE;
+    }
+  }
+
+  dt_iop_gui_leave_critical_section(self);
+  return ok;
+}
+
+// implementation-plan-8.md §5.2: Bonnier & Simoncelli's own defaults, kept
+// as-is -- Phase 0.2's sweep of gamma over {0.3, 0.5, 0.7} on the twelve
+// crops found no value clearly better than 0.5.
+#define CT_PERCENTILE_GAMMA 0.5
+#define CT_PERCENTILE_EPS 0.01
+// plan-8-evidence/00-families-on-12-crops.txt §0.2's own pooled empirical
+// q_gauss median across 11 real frames -- not the 0.920 iid closed form for
+// 64 independent samples, which demosaiced sensor data never clears
+// (measured median 0.601, because neighbouring level pixels are correlated,
+// not independent). Last-resort fallback only, when a whole frame has no
+// rung with >= 20 near-Gaussian super-blocks.
+#define CT_PERCENTILE_GAUSS_FALLBACK 0.60
+
+// implementation-plan-8.md §5's shared taper/smoothing rule for both
+// adaptive modes: "The three finest nodes are never measured at preview
+// scale. Each mode's shape is defined on measured rungs only and tapered
+// linearly to 0 over one octave past the finest measured rung." Applied
+// here as a one-octave-wide linear ramp in log-sigma, past sigma_r[0] (the
+// finest measured rung -- rungs run fine-to-coarse, matching
+// _ct_box_stats_t's own convention).
+//
+// implementation-plan-8.md §5: "each mode's per-rung shape is smoothed with
+// a one-octave Gaussian in log sigma before it is evaluated on the
+// projection grid" -- val_r is smoothed in place, in log-sigma space, with
+// a Gaussian kernel of standard deviation one octave. Rungs are evenly
+// spaced in log2(sigma) at CT_SCALES_PER_OCTAVE per octave, so this is a
+// small discrete convolution over the rung index, weighted by each pair's
+// actual log-sigma separation rather than assumed-uniform spacing (true
+// near a resolution-boundary octave transition, but cheap enough not to
+// assume it).
+static void _ct_smooth_log_octave(const double *const restrict sigma_r,
+                                  double *const restrict val_r, const int n)
+{
+  if(n < 2) return;
+  double *const restrict smoothed = malloc(sizeof(double) * n);
+  if(!smoothed) return;
+  for(int i = 0; i < n; i++)
+  {
+    double wsum = 0.0, vsum = 0.0;
+    const double log_si = log2(sigma_r[i]);
+    for(int j = 0; j < n; j++)
+    {
+      const double dz = log2(sigma_r[j]) - log_si;
+      const double w = exp(-0.5 * dz * dz);  // sigma = 1 octave
+      wsum += w;
+      vsum += w * val_r[j];
+    }
+    smoothed[i] = (wsum > 0.0) ? vsum / wsum : val_r[i];
+  }
+  memcpy(val_r, smoothed, sizeof(double) * n);
+  free(smoothed);
+}
+
+// evaluate the per-rung shape (already smoothed, peak normalised to 1) on
+// the dense projection grid: log-linear interpolation between measured
+// rungs, a one-octave linear taper to 0 past the finest measured rung
+// (§5's own rule, see _ct_smooth_log_octave's comment), and constant
+// extrapolation (hold the coarsest measured rung's own value) past the
+// coarse end -- the plan states a fine-end taper explicitly and says
+// nothing about the coarse end, so holding flat there is this
+// implementation's own choice, not a stated rule; a future reader who
+// wants a coarse-end taper too should treat this as a one-line change, not
+// a discovered bug.
+static void _ct_project_rung_shape(const double *const restrict sigma_r,
+                                   const double *const restrict s_r, const int nrungs,
+                                   const double *const restrict sigma_grid, const int m,
+                                   double *const restrict shape01)
+{
+  const double log_finest = log2(sigma_r[0]);
+  for(int j = 0; j < m; j++)
+  {
+    const double log_sg = log2(sigma_grid[j]);
+    if(log_sg < log_finest - 1.0) { shape01[j] = 0.0; continue; }
+    if(log_sg < log_finest)
+    {
+      // linear taper, 1 octave wide, from s_r[0] at the finest measured
+      // rung down to 0 one octave finer than it.
+      shape01[j] = s_r[0] * (1.0 - (log_finest - log_sg));
+      continue;
+    }
+    if(nrungs == 1 || log_sg >= log2(sigma_r[nrungs - 1])) { shape01[j] = s_r[nrungs - 1]; continue; }
+
+    int hi = 1;
+    while(hi < nrungs - 1 && log2(sigma_r[hi]) < log_sg) hi++;
+    const int lo = hi - 1;
+    const double lo_z = log2(sigma_r[lo]), hi_z = log2(sigma_r[hi]);
+    const double t = (hi_z > lo_z) ? (log_sg - lo_z) / (hi_z - lo_z) : 0.0;
+    shape01[j] = s_r[lo] + t * (s_r[hi] - s_r[lo]);
+  }
+}
+
+// implementation-plan-8.md §5: given a `_measure_box` + `_fit_spectrum` that
+// already succeeded, decide what shape `mode` writes onto the projection
+// grid `sigma_grid`/`m`. `*absolute` reports whether `shape[]` is already
+// the module's own absolute target -- master-independent, the way
+// CT_TARGET_DEFAULT/EQUALIZE are in `_target_curve` -- rather than a [0,1]
+// shape meant to be lerped with gain_local_contrast; every mode built by
+// plan-8 is the former (§5's "the picker sets shape, never strength"), but
+// the caller still needs to be told which.
+//
+// CT_PICK_STRUCTURE (§5.1, `_ct_structure_shape`) and CT_PICK_PERCENTILE
+// (§5.2/§5.4, below) each have their own case. Returns FALSE only for a
+// mode whose shape comes back all-zero (Phase 4/5's own "nothing to do"
+// case -- the default curve is already applied, so this is a no-op, not a
+// fallback write); CT_PICK_FIXED's Gaussian hump is never all-zero and so
+// never returns FALSE.
+//
+// `self`/`box` are needed only by CT_PICK_PERCENTILE (§5.4's box + frame
+// block-RMS percentile queries read `self->gui_data` directly, and the box
+// query needs the original pixel box, not anything `_ct_box_stats_t` keeps)
+// -- CT_PICK_FIXED and CT_PICK_STRUCTURE (kappa is already in `stats`) have
+// no use for either.
+//
+// CT_PICK_FIXED's body below is the pre-plan-8 `_fit_curve_from_box`'s own
+// post-`_fit_spectrum` code, moved verbatim (the found_texture advisories,
+// then the CT_TARGET_DEFAULT hump via `_target_curve`) -- implementation-
+// plan-8.md §6 Phase 2.2's own regression bar: "a fixed-mode pick writes
+// byte-identical band[] to before."
+static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
+                            const _ct_picker_mode_t mode,
+                            const _ct_box_stats_t *const stats,
+                            const _ct_fit_t *const fit,
+                            const double *const restrict sigma_grid, const int m,
+                            const double sigma_ref, const float scale_shift,
+                            double *const restrict shape,
+                            gboolean *const absolute)
+{
+  // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is not
+  // derived from what was measured here (§3.7b) for the fixed mode -- kept,
+  // for every mode, purely to gate the size-sanity advisories that follow
+  // (fit->tau/fit->texture are meaningless without a texture to have
+  // measured); §8.2's own note, "fit->tau/fit->texture feed _ct_fit_eval's
+  // S(sigma) the same way regardless of mode", is why these advisories run
+  // ahead of the mode switch instead of once per case.
+  const gboolean found_texture = fit->texture_peak > stats->peak_e * 1e-2;
+
+  // §2.4/research.md §5.9: advisory only, neither warning below refuses the
+  // pick -- both just explain a result that might otherwise look like
+  // nothing happened, or like an untrustworthy size.
+  {
+    int peak_idx = 0;
+    for(int r = 1; r < stats->nrungs; r++)
+      if(stats->energies[r] > stats->energies[peak_idx]) peak_idx = r;
+    double S, N;
+    _ct_fit_eval(fit, stats->sigma[peak_idx], &S, &N);
+    if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
+      dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
+  }
+
+  if(found_texture)
+  {
+    const double target_sigma = sqrt(fit->tau);
+
+    // §6.2: the fitted size sits within half an octave of the window's own
+    // coarse edge (§1.1's lambda_max) -- there is no peak inside what the
+    // box could see, only a rising flank, so the reported size is read off
+    // the edge of the window rather than measured. Warn, don't refuse: this
+    // is the honest answer, not a bad one.
+    if(target_sigma >= stats->sigma[stats->nrungs - 1] / M_SQRT2)
+      dt_control_log(_("the measured size sits at the edge of what this box can see -- "
+                        "it may be larger than reported"));
+
+    // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure --
+    // the box is too small to *contain* the feature, so the fit can't place
+    // any peak inside what it measured and instead collapses tau toward the
+    // ladder's finest rung, railing beta high to explain the rest. A
+    // full-octave margin catches this without false-positiving on a
+    // legitimate fine-texture pick -- see findings.md for the sweep this
+    // threshold came from.
+    if(target_sigma <= stats->sigma[0] * 2.0)
+    {
+      const double min_side = 2.0 * stats->window_lambda_max;
+      dt_control_log(_("the box is too small to see how big this is -- "
+                        "try at least %.0f x %.0f px"), min_side, min_side);
+    }
+
+    int nearest = 0;
+    double best_d = DBL_MAX;
+    for(int r = 0; r < stats->nrungs; r++)
+    {
+      const double dist = fabs(log(stats->sigma[r] / target_sigma));
+      if(dist < best_d) { best_d = dist; nearest = r; }
+    }
+    if(stats->s1_energy[nearest] > 0.0)
+    {
+      const double kappa = sqrt(stats->energies[nearest]) / stats->s1_energy[nearest];
+      if(kappa > CT_KAPPA_EDGE)
+        dt_control_log(_("the picked area looks more like a hard edge than dense texture -- "
+                          "the measured size may be unreliable"));
+    }
+  }
+
+  switch(mode)
+  {
+    // implementation-plan-8.md §5.2/§5.4: spatial concentration per rung,
+    // Bonnier & Simoncelli's per-subband multiplier collapsed to one gain
+    // per band. q_r = p90/p99 of the box's own per-super-block RMS,
+    // normalised against this *frame's* own measured near-Gaussian
+    // baseline (§5.4's correction -- not a constant), then
+    // g_r = ((1-eps)*q_r' + eps)^(gamma-1) >= 1, and the shape is
+    // (g_r - 1) peak-normalised to 1.
+    case CT_PICK_PERCENTILE:
+    {
+      double p90[CT_MAX_BANDS], p99[CT_MAX_BANDS];
+      int box_nrungs = 0;
+      double q_gauss[CT_MAX_BANDS];
+      int gauss_nrungs = 0;
+      const gboolean have_box_q = _box_block_percentiles(self, box, p90, p99, &box_nrungs);
+      const gboolean have_gauss = _frame_gauss_baseline(self, q_gauss, &gauss_nrungs);
+
+      double raw[CT_MAX_BANDS];
+      double peak = 0.0;
+      const int n = stats->nrungs;
+      for(int r = 0; r < n; r++)
+      {
+        // both queries walk the same live ladder this pick's own `stats`
+        // came from and share its fine-to-coarse rung order, so index r
+        // here is index r there too -- `_box_block_percentiles`/
+        // `_frame_gauss_baseline` just don't stop early at the box's own
+        // lambda_max the way `_measure_box` does, hence the `have_*` guards
+        // plus `r < box_nrungs`/`r < gauss_nrungs` rather than assuming
+        // they cover exactly `n`.
+        double q = 1.0;  // "no concentration measured here" -> g_r == 1 -> contributes nothing
+        if(have_box_q && r < box_nrungs && p99[r] > 0.0)
+        {
+          q = p90[r] / p99[r];
+          if(have_gauss && r < gauss_nrungs && q_gauss[r] > 0.0) q = fmin(1.0, q / q_gauss[r]);
+        }
+        const double g_r = pow((1.0 - CT_PERCENTILE_EPS) * q + CT_PERCENTILE_EPS,
+                               CT_PERCENTILE_GAMMA - 1.0);
+        raw[r] = g_r - 1.0;
+        peak = fmax(peak, raw[r]);
+      }
+
+      // §5's own "nothing to do" case: local contrast is already even at
+      // every measured scale in the picked area -- the default curve is
+      // already applied, so refusing here is a no-op, not a fallback.
+      if(n == 0 || peak <= 0.0)
+      {
+        dt_control_log(_("local contrast is already even at every size in the picked area"));
+        return FALSE;
+      }
+
+      double s_r[CT_MAX_BANDS];
+      for(int r = 0; r < n; r++) s_r[r] = raw[r] / peak;
+
+      _ct_smooth_log_octave(stats->sigma, s_r, n);
+
+      // re-normalise after smoothing: the Gaussian kernel is a weighted
+      // average of already-<=1 values, so this can only ever pull the peak
+      // down, never past 1 -- but does not itself guarantee the new peak is
+      // exactly 1, and the module's own strength convention (§3.2, band[k]
+      // = 1 + CT_DEFAULT_PEAK_EFF*s_k) wants a shape that actually reaches
+      // its peak amplitude at its own strongest rung.
+      double speak = 0.0;
+      for(int r = 0; r < n; r++) speak = fmax(speak, s_r[r]);
+      if(speak > 0.0) for(int r = 0; r < n; r++) s_r[r] /= speak;
+
+      double shape01[CT_PROJECT_GRID];
+      _ct_project_rung_shape(stats->sigma, s_r, n, sigma_grid, m, shape01);
+      for(int j = 0; j < m; j++) shape[j] = 1.0 + CT_DEFAULT_PEAK_EFF * shape01[j];
+
+      *absolute = TRUE;
+      return TRUE;
+    }
+
+    // implementation-plan-8.md §5.1 Phase 4.1/4.4: structure's own shape,
+    // from the box's block-median kappa -- see `_ct_structure_shape`.
+    case CT_PICK_STRUCTURE:
+    {
+      if(!_ct_structure_shape(stats, fit, sigma_grid, m, shape))
+      {
+        // §5's own rule: "a mode whose shape comes back all-zero logs its
+        // own message and writes nothing -- the default curve is already
+        // applied, so 'nothing to do' is a no-op, not a fallback write."
+        dt_control_log(_("nothing in the picked area reads as structure -- "
+                          "it is texture or noise at every size"));
+        return FALSE;
+      }
+      *absolute = TRUE;
+      return TRUE;
+    }
+
+    case CT_PICK_FIXED:
+    default:
+    {
+      _target_curve(fit, CT_TARGET_DEFAULT, sigma_grid, m, sigma_ref, scale_shift, shape);
+      *absolute = TRUE;
+      return TRUE;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3961,8 +4239,8 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   dt_iop_gui_leave_critical_section(self);
 
   gboolean is_absolute_target = FALSE;
-  if(!_mode_shape(picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref, p->scale_shift,
-                  shape, &is_absolute_target))
+  if(!_mode_shape(self, box, picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref,
+                  p->scale_shift, shape, &is_absolute_target))
     return;  // Phase 4/5's all-zero case: the default curve is already applied, nothing to do
 
   // §8.1: an absolute target (every mode plan-8 builds, §5's "the picker
