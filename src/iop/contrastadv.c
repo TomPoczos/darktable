@@ -1070,10 +1070,8 @@ static void _ladder_free(_ct_ladder_t *const ladder)
 // pixels than a full one, and every box query touching it was averaging that
 // smaller sum over a denominator sized for a full block -- reading the whole
 // box's mean low by an amount a whole-frame pick measured at 1-2% on real
-// crops (dig_block_edge_norm.c), not the "self-cancels" case
-// _ladder_rung_noise_floor's own kappa ratio is (kappa's two divisions by the
-// same n_per_block cancel algebraically; a box query's numerator carries no
-// such matching division to cancel against).
+// crops (dig_block_edge_norm.c). _ladder_rung_noise_floor reads blkn too,
+// to leave those partial blocks out of the frame-wide floor altogether.
 static void _ladder_accumulate_blocks(const float *const restrict band,
                                       const size_t cw, const size_t ch,
                                       const double step,
@@ -1256,8 +1254,19 @@ static void _ladder_build_blockrms(const double *const restrict blk2,
 // _ladder_estimate_noise's min-over-rungs still lands on one of the fine
 // rungs, giving a small, sane N rather than swamping the fit (§7.4 confirms
 // the fits themselves stayed sane downstream of it).
+//
+// only full blocks take part: a block clipped by the frame edge holds fewer
+// than n_per_block level pixels (blkn, see _ladder_accumulate_blocks), and
+// dividing its sums by the nominal count does not cancel out of kappa --
+// sqrt(e)/m scales as sqrt(n_per_block/n), so a Gaussian block at 90% fill
+// still read as noise-like while its energy came out 10% low, dragging a
+// minimum-based floor down with it. Smaller partial blocks fell outside the
+// kappa tolerance anyway, so skipping them all changes nothing there; using
+// their real n instead would let an 8-sample block's noisy energy win the
+// minimum, which is worse than leaving it out.
 static double _ladder_rung_noise_floor(const double *const restrict blk2,
                                        const double *const restrict blk1,
+                                       const double *const restrict blkn,
                                        const size_t nblocks,
                                        const double step)
 {
@@ -1265,6 +1274,7 @@ static double _ladder_rung_noise_floor(const double *const restrict blk2,
   double floor_e = -1.0;
   for(size_t i = 0; i < nblocks; i++)
   {
+    if(blkn[i] < n_per_block) continue;
     const double m = blk1[i] / n_per_block;
     if(m <= 0.0) continue;
     const double e = blk2[i] / n_per_block;
@@ -1427,7 +1437,7 @@ static gboolean _build_ladder(const float *const restrict lum,
 
       _ladder_accumulate_blocks(band, cw, ch, step, ladder->bw, ladder->bh, blk2, blk1, blkn);
       ladder->noise_floor[nrungs] =
-        _ladder_rung_noise_floor(blk2, blk1, ladder->bw * ladder->bh, step);
+        _ladder_rung_noise_floor(blk2, blk1, blkn, ladder->bw * ladder->bh, step);
       _ladder_build_sat(blk2, ladder->bw, ladder->bh, sat2 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blk1, ladder->bw, ladder->bh, sat1 + (size_t)nrungs * sat_stride);
       _ladder_build_sat(blkn, ladder->bw, ladder->bh, sat_n + (size_t)nrungs * sat_stride);
