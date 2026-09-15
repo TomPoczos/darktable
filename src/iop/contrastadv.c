@@ -163,7 +163,7 @@ typedef struct _ct_ladder_t
   size_t bw, bh;                 // block grid, the same for every rung
   double *sat2;                  // Sum(b^2) over blocks, nrungs * (bw+1) * (bh+1) doubles
   double *sat1;                  // Sum(|b|), same layout
-  double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _measure_box/_spectrum_frame_wide read instead of assuming every block full
+  double *sat_n;                  // implementation-plan-4.md §8.2: real level-pixel count per block, same layout -- the box-query denominator _measure_box reads instead of assuming every block full
   // implementation-plan-8.md §5.4: raw (non-cumulative) per-block RMS, one
   // value per rung, aggregated to super-blocks of >= CT_SUPERBLOCK_MIN_PIX
   // level pixels (§5.2's noise-floor argument for why 64). Same nrungs *
@@ -283,26 +283,14 @@ typedef struct dt_iop_contrast_gui_data_t
   int band_nbands;               // how many of CT_BANDS survived the pass that built band_pd
   float band_sigma[CT_BANDS];    // finest-first, pixels of that same pass's roi (== ladder_roi_in)
 
-  // §3.2: the last successful pick's own raw per-rung spectrum and fit, for
-  // the graph's live overlay -- a record of the last measurement, drawn
-  // every _area_draw regardless of whether the picker itself is still
-  // "fresh". The fit's scalar fields are stored individually rather than as
-  // a _ct_fit_t so this struct doesn't need that type's (later) definition.
+  // the rungs the last successful pick measured (its §1.1 window, fine to
+  // coarse), read by _area_draw for the "outside this pick's window"
+  // shading and the extrapolated-node marks -- a record of the last
+  // measurement, kept regardless of whether the picker itself is still
+  // "fresh".
   gboolean spectrum_valid;
   int spectrum_nrungs;
   double spectrum_lambda[CT_MAX_BANDS];
-  double spectrum_energy[CT_MAX_BANDS];
-  double spectrum_noise, spectrum_self_similar, spectrum_texture, spectrum_tau, spectrum_beta;
-
-  // implementation-plan-8.md §4.4/§5.4: each adaptive picker mode's own
-  // per-rung diagnostic overlay -- kappa with its Gaussian/structured rails
-  // for CT_PICK_STRUCTURE (§5.1, Phase 4), p90/p99 concentration with its
-  // noise baseline for CT_PICK_PERCENTILE (§5.2, Phase 5) -- drawn on the
-  // same rung axis as spectrum_energy above so a pick is legible instead of
-  // magic. Populated by Phase 4/5's own _mode_shape case; unused while
-  // picker_mode == CT_PICK_FIXED, which draws no extra overlay at all.
-  double mode_overlay[CT_MAX_BANDS];
-  int mode_overlay_n;
 
   // a pick that landed while g->pd was stale (DT_SIGNAL_CONTROL_PICKERDATA_READY
   // is dispatched async -- see color_picker_apply -- so the GUI thread can
@@ -314,7 +302,7 @@ typedef struct dt_iop_contrast_gui_data_t
   // implementation-plan-8.md §4.1/§4.3: the picker-mode dropbox, placed
   // directly above scale_shift's picker row below. Conf-backed, not
   // params-backed -- read directly off this widget wherever the mode is
-  // needed (_color_picker_apply_now, the graph overlay), the same way
+  // needed (_color_picker_apply_now), the same way
   // gain_local_contrast/scale_shift are read through their own params-backed
   // widgets, so there is no separate cached copy to go stale.
   GtkWidget *picker_mode;
@@ -1537,7 +1525,7 @@ static gboolean _build_ladder(const float *const restrict lum,
 // §5.4: the fourth is blockrms, which is not a SAT (see _ct_ladder_t's own
 // comment) but is stored at the identical (bw+1)*(bh+1)-per-rung stride, so
 // this reshape needs no special case for it. Every reader (_measure_box,
-// _box_block_percentiles, _spectrum_frame_wide*) indexes node (y, x)'s rung
+// _box_block_percentiles) indexes node (y, x)'s rung
 // r as 4*r + component and checks components == 4*nrungs before trusting
 // the buffer.
 static void _ladder_fill_cb(void *const user_data, float *const buf, const size_t nelems)
@@ -2422,11 +2410,11 @@ static double _ct_band_coverage(const double lambda, const float *const restrict
 // identity above is the check. Ignores scale_shift, exactly as
 // the nodes' own fixed screen positions do, so a rung/preset shape and the
 // node it nominally corresponds to line up regardless of where scale_shift
-// has since moved the *physical* meaning of that node. Shared by §3.2's
-// graph overlay and §3.4's analytic preset shapes -- and, unclamped, by
-// implementation-plan-3.md §4.2's axis (below), which is what needs to see
-// the projection grid's own overhang past the node ladder rather than have
-// it piled at a clamped edge.
+// has since moved the *physical* meaning of that node. Shared by the
+// graph's pick-window shading and §3.4's analytic preset shapes -- and,
+// unclamped, by implementation-plan-3.md §4.2's axis (below), which is
+// what needs to see the projection grid's own overhang past the node
+// ladder rather than have it piled at a clamped edge.
 static double _spectrum_lambda_to_raw_x(const double lambda, const double roi_long_edge)
 {
   const double d = -log2(lambda / fmax(roi_long_edge, 1.0)) + log2(CT_BAND_PEAK_FACTOR / 4.0);
@@ -2793,8 +2781,8 @@ static float _graph_lambda_to_x(const double lambda, const double roi_long_edge,
 }
 
 // a node's own fixed raw-x position, (k+0.5)/CT_BANDS, run through the same
-// axis -- keeps node placement, the curve and the spectrum overlay all on
-// the same map.
+// axis -- keeps node placement, the curve and the pick-window shading all
+// on the same map.
 static float _graph_node_x(const int k, const _ct_axis_t *const axis)
 {
   return _graph_raw_to_x(((double)k + 0.5) / (double)CT_BANDS, axis);
@@ -3355,8 +3343,7 @@ static gboolean _ct_percentile_shape(const _ct_box_stats_t *const stats,
                                      const double *const restrict p99,
                                      const int *const restrict nblocks, const int box_nrungs,
                                      const double *const restrict sigma_grid, const int m,
-                                     double *const restrict shape, double *const restrict q_out,
-                                     int *const nmeasured)
+                                     double *const restrict shape, int *const nmeasured)
 {
   // both queries walk the same live ladder this pick's own `stats` came
   // from and share its fine-to-coarse rung order, so index r here is index
@@ -3377,7 +3364,6 @@ static gboolean _ct_percentile_shape(const _ct_box_stats_t *const stats,
   for(int r = 0; r < nm; r++)
   {
     const double q = fmin(1.0, p90[r] / p99[r]);
-    q_out[r] = q;
     const double g_r = pow((1.0 - CT_PERCENTILE_EPS) * q + CT_PERCENTILE_EPS, CT_PERCENTILE_GAMMA - 1.0);
     s_r[r] = CLAMP((g_r - g_noise) / (g_struct - g_noise), 0.0, 1.0);
     if(s_r[r] > 0.0) any_nonzero = TRUE;
@@ -3549,22 +3535,9 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
       int box_nrungs = 0;
       if(!_box_block_percentiles(self, box, p90, p99, nblocks, &box_nrungs)) box_nrungs = 0;
 
-      double q_r[CT_MAX_BANDS];
       int nmeasured = 0;
       const gboolean ok = _ct_percentile_shape(stats, p90, p99, nblocks, box_nrungs, sigma_grid, m,
-                                               shape, q_r, &nmeasured);
-
-      // implementation-plan-8.md §4.4/§5.4 Phase 2.3/5.2: publish this
-      // pick's own q_r for the graph overlay, measured rungs only, whether
-      // or not there was anything to write -- the overlay's whole point is
-      // to make a pick legible, including one that landed on nothing.
-      {
-        dt_iop_contrast_gui_data_t *const g = self->gui_data;
-        dt_iop_gui_enter_critical_section(self);
-        if(nmeasured > 0) memcpy(g->mode_overlay, q_r, sizeof(double) * nmeasured);
-        g->mode_overlay_n = nmeasured;
-        dt_iop_gui_leave_critical_section(self);
-      }
+                                               shape, &nmeasured);
 
       if(!ok)
       {
@@ -3898,18 +3871,13 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
     return;
   }
 
-  // §3.2: publish this pick's own spectrum + fit for the graph's live
-  // overlay -- a record of the last measurement, independent of whether the
-  // picker itself is still "fresh" by the time it gets drawn.
+  // publish the rungs this pick measured, for the graph's window shading
+  // and its extrapolated-node marks (_area_draw) -- a record of the last
+  // measurement, independent of whether the picker itself is still "fresh"
+  // by the time it gets drawn.
   dt_iop_gui_enter_critical_section(self);
   memcpy(g->spectrum_lambda, stats.lambda, sizeof(double) * stats.nrungs);
-  memcpy(g->spectrum_energy, stats.energies, sizeof(double) * stats.nrungs);
   g->spectrum_nrungs = stats.nrungs;
-  g->spectrum_noise = fit.noise;
-  g->spectrum_self_similar = fit.self_similar;
-  g->spectrum_texture = fit.texture;
-  g->spectrum_tau = fit.tau;
-  g->spectrum_beta = fit.beta;
   g->spectrum_valid = TRUE;
   dt_iop_gui_leave_critical_section(self);
 
@@ -3983,25 +3951,6 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // a GUI preference with no cached copy to go stale (see its own comment
   // in gui_init).
   const _ct_picker_mode_t picker_mode = (_ct_picker_mode_t)dt_bauhaus_combobox_get(g->picker_mode);
-
-  // implementation-plan-8.md §4.4/§5.4 Phase 4.2: CT_PICK_STRUCTURE's own
-  // overlay diagnostic -- the box-wide kappa per rung, the same figure
-  // `_ct_structure_shape` builds the curve from. Published
-  // unconditionally, even if `_mode_shape` below finds nothing to write,
-  // since the overlay's whole point is to make a pick legible -- including
-  // a pick that landed on nothing.
-  dt_iop_gui_enter_critical_section(self);
-  if(picker_mode == CT_PICK_STRUCTURE)
-  {
-    for(int r = 0; r < stats.nrungs; r++)
-      g->mode_overlay[r] = (stats.s1_energy[r] > 0.0) ? sqrt(stats.energies[r]) / stats.s1_energy[r] : 0.0;
-    g->mode_overlay_n = stats.nrungs;
-  }
-  else
-  {
-    g->mode_overlay_n = 0;
-  }
-  dt_iop_gui_leave_critical_section(self);
 
   // §8.1: every mode's shape is an absolute target (§5's "the picker sets
   // shape, never strength"), used as-is rather than lerped between 1 and
@@ -4296,417 +4245,6 @@ static void _area_set_band(dt_iop_contrast_gui_data_t *g, const int k, const flo
   dt_bauhaus_slider_set(g->band[k], gain);
 }
 
-// ---------------------------------------------------------------------------
-// §3.2: the live spectrum overlay -- research.md's own suggestion (§5.6,
-// implementation-plan.md §1.4 step 4/toneequal's inset histogram) to draw
-// the frame-wide ladder as the graph's background at all times, and the
-// last picked box's own spectrum plus its fitted model on top of it once a
-// pick has landed. Makes the picker legible instead of magic: the data was
-// already being measured (§2.1/§3.1), this just puts it on screen.
-// ---------------------------------------------------------------------------
-
-// energies span orders of magnitude across ordinary images (phase0-band-
-// energy.md's own tables), so the y axis here is log, normalised to
-// whichever curve on screen has the higher peak -- purely relative shape,
-// no fixed absolute meaning.
-#define CT_SPECTRUM_LOG_RANGE 10.0  // stops of dynamic range shown below the on-screen peak
-
-static float _spectrum_energy_to_y(const double energy, const double peak)
-{
-  if(energy <= 0.0 || peak <= 0.0) return 0.0f;
-  return CLAMP((float)(1.0 + log2(energy / peak) / CT_SPECTRUM_LOG_RANGE), 0.0f, 1.0f);
-}
-
-// implementation-plan-8.md §4.4 Phase 4.2: kappa's own y-mapping, for
-// CT_PICK_STRUCTURE's overlay -- linear, not the log/peak-relative mapping
-// above: kappa is already a bounded O(1) ratio (>= 1.0 by the L2/L1
-// power-mean inequality), so a log-relative-to-peak scale would waste most
-// of the plot on values that never occur. The range is fixed, not
-// peak-relative, so the CT_KAPPA_GAUSSIAN/CT_KAPPA_STRUCT rails sit at the
-// same screen height on every pick rather than sliding around with
-// whatever kappa this box happened to reach.
-#define CT_KAPPA_PLOT_LO 1.0
-#define CT_KAPPA_PLOT_HI (CT_KAPPA_STRUCT + (CT_KAPPA_STRUCT - CT_KAPPA_GAUSSIAN) * 0.3)
-
-static float _kappa_to_y(const double kappa)
-{
-  return CLAMP((float)((kappa - CT_KAPPA_PLOT_LO) / (CT_KAPPA_PLOT_HI - CT_KAPPA_PLOT_LO)), 0.0f, 1.0f);
-}
-
-// the frame-wide ladder's own spectrum: one (lambda, energy) point per rung,
-// energy = S2/n over the *whole* ladder grid. Since a summed-area table is
-// zero-padded on its low side (§2.1's _ladder_build_sat), the frame total is
-// simply the table's own opposite corner -- no subtraction needed, unlike a
-// box query.
-static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
-                                     double *const restrict lambda,
-                                     double *const restrict energy,
-                                     int *const restrict nrungs)
-{
-  dt_iop_contrast_gui_data_t *const g = self->gui_data;
-  gboolean ok = FALSE;
-
-  dt_iop_gui_enter_critical_section(self);
-  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
-  const size_t comps = g->pd.components;
-  if(g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-     && comps == (size_t)(4 * g->ladder_nrungs))
-  {
-    const float *const restrict buf = g->pd.buf;
-    const size_t corner = (sat_h - 1) * sat_w + (sat_w - 1);
-    *nrungs = g->ladder_nrungs;
-    for(int r = 0; r < g->ladder_nrungs; r++)
-    {
-      // implementation-plan-4.md §8.2: n_eff is sat_n's own corner -- the
-      // real level-pixel count the ladder actually summed, not
-      // nblocks*(CT_BLOCK/step)^2's assumption that every block (including
-      // the grid's own clipped last column/row) was a full one. Measured to
-      // move a whole-frame reading 1-2% on real crops
-      // (dig_block_edge_norm.c).
-      const double n_eff = fmax((double)buf[corner * comps + 4 * r + 2], 1.0);
-      lambda[r] = g->ladder_lambda[r];
-      energy[r] = (double)buf[corner * comps + 4 * r] / n_eff;
-    }
-    ok = TRUE;
-  }
-  dt_iop_gui_leave_critical_section(self);
-  return ok;
-}
-
-// implementation-plan-8.md §5.4 last paragraph: the same p90/p99 read
-// _box_block_percentiles gives a picked box, but over every block in the
-// frame -- the baseline Phase 5's overlay draws the box's own reading
-// against. A separate function rather than a parameter added to
-// _spectrum_frame_wide above: that one is read on every graph redraw (it
-// backs the always-on frame spectrum curve) and is O(1) per rung by
-// construction (a single already-summed SAT corner); this one is a full
-// per-rung sort over up to bw*bh blocks (<= 21600 per §5.4) -- called only
-// from CT_PICK_PERCENTILE's own overlay case (Phase 5.2), not the hot path
-// every redraw takes regardless of mode.
-//
-// Stops at the first rung where the whole frame overlaps fewer than
-// CT_PERCENTILE_MIN_BLOCKS distinct super-blocks, for the same reason
-// _ct_percentile_shape does: past that the ratio is 1 by construction, and
-// drawing it would show the curve climbing to the top of the plot at the
-// coarse end as if the frame's contrast were even there.
-static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
-                                                 double *const restrict p90,
-                                                 double *const restrict p99,
-                                                 int *const restrict nrungs)
-{
-  dt_iop_contrast_gui_data_t *const g = self->gui_data;
-  gboolean ok = FALSE;
-
-  dt_iop_gui_enter_critical_section(self);
-  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
-  const size_t comps = g->pd.components;
-  const gboolean have_data =
-    g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
-    && comps == (size_t)(4 * g->ladder_nrungs);
-
-  if(have_data)
-  {
-    const size_t bw = sat_w - 1, bh = sat_h - 1;
-    double *const restrict scratch = dt_alloc_align_double(MAX(bw * bh, (size_t)1));
-    if(scratch)
-    {
-      const float *const restrict buf = g->pd.buf;
-      *nrungs = 0;
-      for(int r = 0; r < g->ladder_nrungs; r++)
-      {
-        const double step = exp2((double)(r / CT_SCALES_PER_OCTAVE));
-        const size_t grp = _ladder_superblock_side(step);
-        if(((bw + grp - 1) / grp) * ((bh + grp - 1) / grp) < CT_PERCENTILE_MIN_BLOCKS) break;
-
-        size_t n = 0;
-        for(size_t by = 0; by < bh; by++)
-          for(size_t bx = 0; bx < bw; bx++)
-            scratch[n++] = (double)buf[(by * sat_w + bx) * comps + 4 * r + 3];
-
-        qsort(scratch, n, sizeof(double), _ct_cmp_double);
-        p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
-        p99[r] = _ct_percentile_sorted(scratch, n, 0.99);
-        *nrungs = r + 1;
-      }
-      dt_free_align(scratch);
-      ok = TRUE;
-    }
-  }
-  dt_iop_gui_leave_critical_section(self);
-  return ok;
-}
-
-// draw one (lambda[], energy[]) polyline, in the current cairo source, over
-// the graph's plotting area.
-static void _draw_spectrum_curve(cairo_t *cr, const int width, const int height,
-                                 const double *const restrict lambda,
-                                 const double *const restrict energy,
-                                 const int n, const double roi_long_edge, const double peak,
-                                 const _ct_axis_t *const axis)
-{
-  if(n < 1) return;
-  gboolean started = FALSE;
-  for(int r = 0; r < n; r++)
-  {
-    const float x = _graph_lambda_to_x(lambda[r], roi_long_edge, axis) * width;
-    const float y = height * (1.0f - _spectrum_energy_to_y(energy[r], peak));
-    if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
-    else cairo_line_to(cr, x, y);
-  }
-  cairo_stroke(cr);
-}
-
-// implementation-plan-8.md §4.4/§5.4 Phase 5.2: percentile mode's own
-// overlay draws q_r (p90/p99, a ratio in (0, 1]) directly, not through
-// _spectrum_energy_to_y's log-energy mapping built for the always-on
-// energy curves above -- linear top-to-bottom over [0, 1] is the whole
-// range this quantity can ever take.
-static void _draw_ratio_curve(cairo_t *cr, const int width, const int height,
-                              const double *const restrict lambda,
-                              const double *const restrict ratio,
-                              const int n, const double roi_long_edge,
-                              const _ct_axis_t *const axis)
-{
-  if(n < 1) return;
-  gboolean started = FALSE;
-  for(int r = 0; r < n; r++)
-  {
-    const float x = _graph_lambda_to_x(lambda[r], roi_long_edge, axis) * width;
-    const float y = height * (1.0f - CLAMP((float)ratio[r], 0.0f, 1.0f));
-    if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
-    else cairo_line_to(cr, x, y);
-  }
-  cairo_stroke(cr);
-}
-
-static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
-                                   const int width, const int height,
-                                   const _ct_axis_t *const axis)
-{
-  dt_iop_contrast_gui_data_t *const g = self->gui_data;
-
-  double frame_lambda[CT_MAX_BANDS], frame_energy[CT_MAX_BANDS];
-  int frame_nrungs = 0;
-  const gboolean have_frame = _spectrum_frame_wide(self, frame_lambda, frame_energy, &frame_nrungs);
-
-  dt_iop_gui_enter_critical_section(self);
-  const gboolean have_pick = g->spectrum_valid;
-  const int pick_nrungs = g->spectrum_nrungs;
-  double pick_lambda[CT_MAX_BANDS], pick_energy[CT_MAX_BANDS];
-  double fit_noise = 0.0, fit_self_similar = 0.0, fit_texture = 0.0, fit_tau = 0.0, fit_beta = 2.0;
-  if(have_pick)
-  {
-    memcpy(pick_lambda, g->spectrum_lambda, sizeof(double) * pick_nrungs);
-    memcpy(pick_energy, g->spectrum_energy, sizeof(double) * pick_nrungs);
-    fit_noise = g->spectrum_noise;
-    fit_self_similar = g->spectrum_self_similar;
-    fit_texture = g->spectrum_texture;
-    fit_tau = g->spectrum_tau;
-    fit_beta = g->spectrum_beta;
-  }
-  // implementation-plan-8.md §4.4/§5.4 Phase 2.3: each adaptive mode's own
-  // diagnostic, guarded the same way spectrum_* above is. Empty this phase
-  // (nothing populates it before Phase 4/5) and for CT_PICK_FIXED forever --
-  // the switch below is scaffolding for Phase 4/5 to fill in one case each.
-  const int mode_overlay_n = g->mode_overlay_n;
-  double mode_overlay[CT_MAX_BANDS];
-  if(mode_overlay_n > 0) memcpy(mode_overlay, g->mode_overlay, sizeof(double) * mode_overlay_n);
-  const double roi_long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
-  dt_iop_gui_leave_critical_section(self);
-
-  if(!have_frame && !have_pick) return;
-
-  const _ct_fit_t fit = { .noise = fit_noise, .self_similar = fit_self_similar,
-                          .texture = fit_texture, .tau = fit_tau, .beta = fit_beta };
-
-  double peak = 0.0;
-  for(int r = 0; r < frame_nrungs; r++) peak = fmax(peak, frame_energy[r]);
-  for(int r = 0; r < pick_nrungs; r++) peak = fmax(peak, pick_energy[r]);
-  // implementation-plan-4.md §3.2: now that 3.1 evaluates the model in the
-  // right variable, it can genuinely sit above both measured polylines --
-  // sample it over the same range it is drawn across so peak reflects the
-  // model too, rather than clipping it flat against the top of the plot.
-  if(have_pick)
-  {
-    const double lo = pick_lambda[0], hi = pick_lambda[pick_nrungs - 1];
-    for(int j = 0; j <= CT_GRAPH_RES; j++)
-    {
-      const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
-      double S, N;
-      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA / fmax(roi_long_edge, 1.0), &S, &N);
-      peak = fmax(peak, S + N);
-    }
-  }
-  if(peak <= 0.0) return;
-
-  cairo_save(cr);
-  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
-
-  if(have_frame)
-  {
-    cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
-                             darktable.bauhaus->graph_border.green,
-                             darktable.bauhaus->graph_border.blue, 0.8);
-    _draw_spectrum_curve(cr, width, height, frame_lambda, frame_energy, frame_nrungs,
-                         roi_long_edge, peak, axis);
-  }
-
-  if(have_pick)
-  {
-    cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
-                             darktable.bauhaus->color_fill.green,
-                             darktable.bauhaus->color_fill.blue, 0.9);
-    _draw_spectrum_curve(cr, width, height, pick_lambda, pick_energy, pick_nrungs,
-                         roi_long_edge, peak, axis);
-
-    // the fitted S(lambda) + N(lambda) model, sampled densely across the
-    // picked box's own measured range, dashed to read as "model" rather
-    // than "measurement" next to the polyline above.
-    const double dashes[2] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(3.0) };
-    cairo_set_dash(cr, dashes, 2, 0.0);
-    gboolean started = FALSE;
-    const double lo = pick_lambda[0], hi = pick_lambda[pick_nrungs - 1];
-    for(int j = 0; j <= CT_GRAPH_RES; j++)
-    {
-      const double lambda = lo * exp2(log2(hi / fmax(lo, 1e-6)) * (double)j / (double)CT_GRAPH_RES);
-      double S, N;
-      // implementation-plan-4.md §3.1: fit->tau/self_similar/noise were solved
-      // against _fit_curve_from_box's frame-relative sigma
-      // (ladder_sigma[r]/long_edge); lambda here is in the ladder roi's own
-      // pixels. Without the /roi_long_edge the model is evaluated L times too
-      // far out: the self-similar term is scaled by L^(beta-2) -- +4.2 stops
-      // at beta 2.4, +10.5 at beta 3.0 on a 10-stop axis, exact only at
-      // beta = 2 -- and the noise and texture terms by 1/L^2, i.e. erased.
-      // implementation-plan-2.md §3.2's comment predicted this conversion;
-      // §4.2 made fit->tau frame-relative and never added it.
-      _ct_fit_eval(&fit, lambda / CT_SIGMA_TO_LAMBDA / fmax(roi_long_edge, 1.0), &S, &N);
-      const float x = _graph_lambda_to_x(lambda, roi_long_edge, axis) * width;
-      const float y = height * (1.0f - _spectrum_energy_to_y(S + N, peak));
-      if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
-      else cairo_line_to(cr, x, y);
-    }
-    cairo_stroke(cr);
-    cairo_set_dash(cr, NULL, 0, 0.0);
-  }
-
-  // implementation-plan-8.md §4.4/§5.4 Phase 2.3: each adaptive mode draws
-  // its own observable on top of the measured/fitted curves above, once
-  // Phase 4/5 populate mode_overlay[]/mode_overlay_n. CT_PICK_FIXED draws
-  // nothing extra -- the default curve needs no additional diagnostic.
-  if(mode_overlay_n > 0)
-  {
-    const _ct_picker_mode_t picker_mode = (_ct_picker_mode_t)dt_bauhaus_combobox_get(g->picker_mode);
-    switch(picker_mode)
-    {
-      case CT_PICK_STRUCTURE:
-      {
-        // implementation-plan-8.md §4.4 Phase 4.2: the two rails first --
-        // dashed, full width, graph_border like the other reference lines
-        // on this graph -- so the kappa curve drawn on top of them reads
-        // against a fixed scale rather than a floating one.
-        const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
-        cairo_set_dash(cr, dashes, 2, 0.0);
-        cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
-                                 darktable.bauhaus->graph_border.green,
-                                 darktable.bauhaus->graph_border.blue, 0.6);
-        const float y_gauss = height * (1.0f - _kappa_to_y(CT_KAPPA_GAUSSIAN));
-        dt_draw_line(cr, 0, y_gauss, width, y_gauss);
-        cairo_stroke(cr);
-        const float y_struct = height * (1.0f - _kappa_to_y(CT_KAPPA_STRUCT));
-        dt_draw_line(cr, 0, y_struct, width, y_struct);
-        cairo_stroke(cr);
-        cairo_set_dash(cr, NULL, 0, 0.0);
-
-        // the box-wide kappa itself, the figure the curve is built from --
-        // dotted, over `pick_lambda[]`'s same
-        // rungs mode_overlay[] was measured on, in color_fill so it reads
-        // as "this pick's own measurement" like the energy curve above,
-        // distinguished from it by the dotted stroke and the different
-        // (linear, fixed-range) y scale.
-        const double dots[2] = { DT_PIXEL_APPLY_DPI(1.0), DT_PIXEL_APPLY_DPI(2.0) };
-        cairo_set_dash(cr, dots, 2, 0.0);
-        cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
-                                 darktable.bauhaus->color_fill.green,
-                                 darktable.bauhaus->color_fill.blue, 0.9);
-        gboolean started = FALSE;
-        const int n = MIN(mode_overlay_n, pick_nrungs);
-        for(int r = 0; r < n; r++)
-        {
-          const float x = _graph_lambda_to_x(pick_lambda[r], roi_long_edge, axis) * width;
-          const float y = height * (1.0f - _kappa_to_y(mode_overlay[r]));
-          if(!started) { cairo_move_to(cr, x, y); started = TRUE; }
-          else cairo_line_to(cr, x, y);
-        }
-        cairo_stroke(cr);
-        cairo_set_dash(cr, NULL, 0, 0.0);
-        break;
-      }
-      case CT_PICK_PERCENTILE:
-      {
-        // Phase 5.2: q_r per rung against the frame-wide q_r, between the
-        // two rails the shape is read off -- all on the same linear [0,1]
-        // ratio axis _draw_ratio_curve above draws. mode_overlay[]/
-        // pick_lambda[] is this pick's own box q_r, published by
-        // _mode_shape's CT_PICK_PERCENTILE case; the frame-wide curve is
-        // cheap enough (O(blocks) per rung, no box clipping) to recompute
-        // on every redraw rather than caching, the same way the always-on
-        // frame spectrum curve above does.
-        //
-        // rails first, dashed and full width like structure mode's kappa
-        // rails above, so the curves drawn on top read against a fixed
-        // scale. Q_NOISE is the upper one on this axis (a ratio near 1 is
-        // even, near 0 is concentrated), Q_STRUCT the lower.
-        {
-          const double dashes[2] = { DT_PIXEL_APPLY_DPI(2.0), DT_PIXEL_APPLY_DPI(2.0) };
-          cairo_set_dash(cr, dashes, 2, 0.0);
-          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
-                                   darktable.bauhaus->graph_border.green,
-                                   darktable.bauhaus->graph_border.blue, 0.6);
-          const float y_noise = height * (1.0f - (float)CT_PERCENTILE_Q_NOISE);
-          dt_draw_line(cr, 0, y_noise, width, y_noise);
-          cairo_stroke(cr);
-          const float y_struct = height * (1.0f - (float)CT_PERCENTILE_Q_STRUCT);
-          dt_draw_line(cr, 0, y_struct, width, y_struct);
-          cairo_stroke(cr);
-          cairo_set_dash(cr, NULL, 0, 0.0);
-        }
-
-        double frame_p90[CT_MAX_BANDS], frame_p99[CT_MAX_BANDS];
-        int frame_q_nrungs = 0;
-        const gboolean have_frame_q =
-          _spectrum_frame_wide_percentiles(self, frame_p90, frame_p99, &frame_q_nrungs);
-
-        if(have_pick && mode_overlay_n > 0)
-        {
-          cairo_set_source_rgba(cr, darktable.bauhaus->color_fill.red,
-                                   darktable.bauhaus->color_fill.green,
-                                   darktable.bauhaus->color_fill.blue, 0.9);
-          _draw_ratio_curve(cr, width, height, pick_lambda, mode_overlay, mode_overlay_n,
-                            roi_long_edge, axis);
-        }
-
-        if(have_frame_q && frame_q_nrungs > 0)
-        {
-          double frame_q[CT_MAX_BANDS];
-          for(int r = 0; r < frame_q_nrungs; r++)
-            frame_q[r] = (frame_p99[r] > 0.0) ? frame_p90[r] / frame_p99[r] : 0.0;
-          cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
-                                   darktable.bauhaus->graph_border.green,
-                                   darktable.bauhaus->graph_border.blue, 0.8);
-          _draw_ratio_curve(cr, width, height, frame_lambda, frame_q, frame_q_nrungs,
-                            roi_long_edge, axis);
-        }
-        break;
-      }
-      case CT_PICK_FIXED:
-      default:
-        break;
-    }
-  }
-
-  cairo_restore(cr);
-}
-
 static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
 {
   dt_iop_contrast_gui_data_t *g = self->gui_data;
@@ -4858,10 +4396,6 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_set_dash(cr, NULL, 0, 0.0);
   }
 
-  // 4. the measured spectrum (§3.2): frame-wide ladder always in the
-  // background, the last pick's own spectrum + fitted model on top of it.
-  _draw_spectrum_overlay(cr, self, width, height, &axis);
-
   // 5. the curve: monotone cubic through the nine nodes -- this is the
   // *shape*, i.e. exactly what dragging a node edits (p->band[k]), not what
   // reaches the pixels once the master gain is applied (see 5b below).
@@ -4878,8 +4412,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   // 5b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
   // 1 + master*(shape-1) -- what §1's bug report actually judged. Dashed,
   // since it's derived from the shape curve rather than directly editable
-  // (this file's existing convention: solid = editable/measured, dashed =
-  // derived -- e.g. the spectrum overlay's fitted model below). Skipped at
+  // (this file's convention: solid = editable, dashed = derived). Skipped at
   // master == 1 exactly, where it would trace the shape curve on top of
   // itself and add nothing to look at. g->curve is scratch state private to
   // this draw call (nothing after this point reads it), so reusing it here
