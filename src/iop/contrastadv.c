@@ -232,8 +232,8 @@ typedef struct dt_iop_contrast_gui_data_t
   GtkWidget *noise_bias;
 
   // the graph (implementation-plan.md §1.4): a drawing area showing the nine
-  // nodes as a curve, and a GtkStack toggled by middle-click on the graph
-  // between that graph and the plain slider list.
+  // nodes as a curve, and a GtkStack toggled by middle-click on either
+  // child between that graph and the plain slider list.
   GtkDrawingArea *area;
   GtkStack *stack;
   dt_draw_curve_t *curve;
@@ -2267,7 +2267,7 @@ static void _area_set_tooltip(dt_iop_module_t *self)
      nbands < CT_BANDS
      ? _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
-         "middle-click for the plain slider list.\n"
+         "middle-click for the plain slider list, and again there to come back.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the thin dashed curve is the *effective* gain after the gain\n"
@@ -2280,7 +2280,7 @@ static void _area_set_tooltip(dt_iop_module_t *self)
          "current zoom level and have no effect until you zoom in.")
      : _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
-         "middle-click for the plain slider list.\n"
+         "middle-click for the plain slider list, and again there to come back.\n"
          "the graph's floor is 0.2, not 0 -- drag a slider directly to go lower.\n"
          "dashed nodes were extrapolated, not measured, by the last pick.\n"
          "the thin dashed curve is the *effective* gain after the gain\n"
@@ -4668,9 +4668,7 @@ static void _area_button_press(GtkGestureSingle *gesture,
 
   if(button == GDK_BUTTON_MIDDLE)
   {
-    const gchar *current = gtk_stack_get_visible_child_name(g->stack);
-    gtk_stack_set_visible_child_name(g->stack,
-                                     g_strcmp0(current, "graph") == 0 ? "sliders" : "graph");
+    gtk_stack_set_visible_child_name(g->stack, "sliders");
     return;
   }
 
@@ -4715,6 +4713,22 @@ static void _area_button_release(GtkGestureSingle *gesture,
   g->dragging = FALSE;
   g->drag_band = -1;
   gtk_widget_queue_draw(dt_gui_get_widget(gesture));
+}
+
+// the way back from the slider list: the graph is gone from the stack
+// while the list is shown, so its own middle-click cannot bring it back.
+// Runs in the capture phase (see gui_init) because bauhaus claims a
+// middle-click on a slider for its own zoom reset, which would otherwise
+// swallow it before this bubble-phase gesture on the enclosing box saw it.
+static void _sliders_button_press(GtkGestureSingle *gesture,
+                                  gint n_press,
+                                  gdouble x, gdouble y,
+                                  dt_iop_module_t *self)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_MIDDLE) return;
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  gtk_stack_set_visible_child_name(g->stack, "graph");
+  dt_gui_claim(gesture);
 }
 
 static void _area_scrolled(GtkEventControllerScroll *controller,
@@ -4826,9 +4840,9 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_box_add(self->widget, dt_ui_section_label_new(C_("section", "filter settings")));
 
   // the graph (§1.4): nine nodes, one per octave, drawn as a curve and
-  // draggable directly; a GtkStack toggled by middle-click on the graph
-  // swaps it for the plain slider list, which is what the shortcut system
-  // and anyone chasing an exact value still reach for.
+  // draggable directly; a GtkStack toggled by middle-click swaps it for the
+  // plain slider list, which is what the shortcut system and anyone chasing
+  // an exact value still reach for, and back again.
   g->nbands = CT_BANDS;  // until the first preview pass publishes the real count (§1.5)
   g->hover_band = -1;
   g->drag_band = -1;
@@ -4879,6 +4893,9 @@ void gui_init(dt_iop_module_t *self)
                                _("visualize this band's own detail texture\n"
                                  "(the same as ctrl+clicking its node in the graph)"));
   }
+
+  GtkGestureSingle *back = dt_gui_connect_click(sliders_box, _sliders_button_press, NULL, self);
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(back), GTK_PHASE_CAPTURE);
 
   g->stack = GTK_STACK(gtk_stack_new());
   gtk_stack_set_homogeneous(g->stack, FALSE);
