@@ -3263,6 +3263,105 @@ static gboolean _mode_shape(const _ct_picker_mode_t mode,
   }
 }
 
+// ascending comparator for the p90/p99 reads below.
+static int _ct_cmp_double(const void *a, const void *b)
+{
+  const double da = *(const double *)a, db = *(const double *)b;
+  return (da > db) - (da < db);
+}
+
+// nearest-rank percentile of a sorted (ascending) array of n doubles, frac
+// in [0, 1].
+static double _ct_percentile_sorted(const double *const restrict sorted, const size_t n,
+                                    const double frac)
+{
+  if(n == 0) return 0.0;
+  if(n == 1) return sorted[0];
+  const size_t idx = (size_t)(frac * (double)(n - 1) + 0.5);
+  return sorted[MIN(idx, n - 1)];
+}
+
+// implementation-plan-8.md §5.2/§5.4: percentile mode's own observable
+// (Phase 5, not built by this phase) needs p90/p99 of the per-block RMS a
+// box's blocks carry at each rung -- the *distribution* §5.4's 4th
+// component (Phase 3.1) publishes, not the sum _fit_curve_from_box's SAT
+// query reads. Pure infrastructure, shipped ahead of the picker mode that
+// will call it -- unused this phase, hence __attribute__((unused)) rather
+// than hiding it behind a dead #if.
+//
+// A super-block's one aggregated RMS value is repeated once per base block
+// it covers (the same repetition _ladder_build_blockrms wrote into the
+// buffer) rather than de-duplicated here: the percentile then comes out
+// implicitly weighted by how much of the box's own *area* each super-block
+// covers, which is the physically meaningful weighting for "how
+// concentrated is this box's own local contrast" -- a single fine-rung
+// super-block sitting in a corner of a large box should not outvote one
+// that covers most of it.
+//
+// The box-to-blocks clipping below is the same arithmetic
+// _fit_curve_from_box uses (see there); not factored into a shared helper
+// since the two loops that follow it diverge immediately (four-corner SAT
+// lookups there, a full block walk here) and there is no third caller yet
+// to justify the indirection.
+static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const box,
+                                       double *const restrict p90,
+                                       double *const restrict p99,
+                                       int *const restrict nrungs_out) __attribute__((unused));
+static gboolean _box_block_percentiles(dt_iop_module_t *self, const int *const box,
+                                       double *const restrict p90,
+                                       double *const restrict p99,
+                                       int *const restrict nrungs_out)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+
+  dt_iop_gui_enter_critical_section(self);
+
+  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
+  const size_t comps = g->pd.components;
+  const gboolean have_data =
+    g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
+    && comps == (size_t)(4 * g->ladder_nrungs);
+
+  gboolean ok = FALSE;
+  if(have_data)
+  {
+    const size_t bw = sat_w - 1, bh = sat_h - 1;
+    const size_t bx0 = MIN(bw, (size_t)MAX(box[0], 0) / CT_BLOCK);
+    size_t bx1 = MIN(bw, (size_t)(MAX(box[2], 0) + CT_BLOCK - 1) / CT_BLOCK);
+    if(bx1 <= bx0) bx1 = MIN(bw, bx0 + 1);
+    const size_t by0 = MIN(bh, (size_t)MAX(box[1], 0) / CT_BLOCK);
+    size_t by1 = MIN(bh, (size_t)(MAX(box[3], 0) + CT_BLOCK - 1) / CT_BLOCK);
+    if(by1 <= by0) by1 = MIN(bh, by0 + 1);
+
+    // implementation-plan-8.md §5.4: O(blocks) per rung, <= 21600 blocks for
+    // the whole frame at CT_BLOCK=8 on a 1440x960 preview -- this runs once
+    // per pick on the GUI thread, no need for anything past a plain qsort.
+    const size_t nblocks = (bx1 - bx0) * (by1 - by0);
+    double *const restrict scratch = dt_alloc_align_double(MAX(nblocks, (size_t)1));
+    if(scratch)
+    {
+      const float *const restrict buf = g->pd.buf;
+      *nrungs_out = g->ladder_nrungs;
+      for(int r = 0; r < g->ladder_nrungs; r++)
+      {
+        size_t n = 0;
+        for(size_t by = by0; by < by1; by++)
+          for(size_t bx = bx0; bx < bx1; bx++)
+            scratch[n++] = (double)buf[(by * sat_w + bx) * comps + 4 * r + 3];
+
+        qsort(scratch, n, sizeof(double), _ct_cmp_double);
+        p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
+        p99[r] = _ct_percentile_sorted(scratch, n, 0.99);
+      }
+      dt_free_align(scratch);
+      ok = TRUE;
+    }
+  }
+
+  dt_iop_gui_leave_critical_section(self);
+  return ok;
+}
+
 // ---------------------------------------------------------------------------
 // §3.4: presets, built the same way the picker projects a target curve onto
 // the nine bands (_project_to_bands) -- research.md §5.7's own "the same
@@ -3972,6 +4071,63 @@ static gboolean _spectrum_frame_wide(dt_iop_module_t *self,
       energy[r] = (double)buf[corner * comps + 4 * r] / n_eff;
     }
     ok = TRUE;
+  }
+  dt_iop_gui_leave_critical_section(self);
+  return ok;
+}
+
+// implementation-plan-8.md §5.4 last paragraph: the same p90/p99 read
+// _box_block_percentiles gives a picked box, but over every block in the
+// frame -- the baseline Phase 5's overlay draws the box's own reading
+// against. A separate function rather than a parameter added to
+// _spectrum_frame_wide above: that one is read on every graph redraw (it
+// backs the always-on frame spectrum curve) and is O(1) per rung by
+// construction (a single already-summed SAT corner); this one is a full
+// per-rung sort over up to bw*bh blocks (<= 21600 per §5.4) and has no
+// caller yet (Phase 5's), so it must not be forced onto that same hot path
+// before something actually needs it -- __attribute__((unused)) says so
+// rather than hiding it behind a dead #if.
+static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
+                                                 double *const restrict p90,
+                                                 double *const restrict p99,
+                                                 int *const restrict nrungs) __attribute__((unused));
+static gboolean _spectrum_frame_wide_percentiles(dt_iop_module_t *self,
+                                                 double *const restrict p90,
+                                                 double *const restrict p99,
+                                                 int *const restrict nrungs)
+{
+  dt_iop_contrast_gui_data_t *const g = self->gui_data;
+  gboolean ok = FALSE;
+
+  dt_iop_gui_enter_critical_section(self);
+  const size_t sat_w = g->pd.width, sat_h = g->pd.height;
+  const size_t comps = g->pd.components;
+  const gboolean have_data =
+    g->pd.buf && sat_w > 1 && sat_h > 1 && g->ladder_nrungs > 0
+    && comps == (size_t)(4 * g->ladder_nrungs);
+
+  if(have_data)
+  {
+    const size_t bw = sat_w - 1, bh = sat_h - 1;
+    double *const restrict scratch = dt_alloc_align_double(MAX(bw * bh, (size_t)1));
+    if(scratch)
+    {
+      const float *const restrict buf = g->pd.buf;
+      *nrungs = g->ladder_nrungs;
+      for(int r = 0; r < g->ladder_nrungs; r++)
+      {
+        size_t n = 0;
+        for(size_t by = 0; by < bh; by++)
+          for(size_t bx = 0; bx < bw; bx++)
+            scratch[n++] = (double)buf[(by * sat_w + bx) * comps + 4 * r + 3];
+
+        qsort(scratch, n, sizeof(double), _ct_cmp_double);
+        p90[r] = _ct_percentile_sorted(scratch, n, 0.90);
+        p99[r] = _ct_percentile_sorted(scratch, n, 0.99);
+      }
+      dt_free_align(scratch);
+      ok = TRUE;
+    }
   }
   dt_iop_gui_leave_critical_section(self);
   return ok;
