@@ -1020,8 +1020,9 @@ typedef enum _ct_picker_mode_t
 // per-rung weights the fit uses (§2.3's `_fit_spectrum`, above) matter more
 // here than they did before.
 //
-// `dt_gaussian_blur` (common/gaussian.c) is an IIR (van Vliet) approximation
-// whose cost is independent of sigma, unlike the explicit mirrored kernels
+// `dt_gaussian_blur` (common/gaussian.c) is Deriche's recursive
+// approximation (see CT_GAUSSIAN_SIGMA_FACTOR above) whose cost is
+// independent of sigma, unlike the explicit mirrored kernels
 // the picked-region ladder used to need to bound its own reach. That removes
 // the old ladder-length ceiling outright; what still bounds this ladder is
 // simply running out of pixels to decimate into, not the cost of a wide blur.
