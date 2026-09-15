@@ -1255,28 +1255,41 @@ static void _ladder_build_sat(const double *const restrict blk,
   }
 }
 
+// implementation-plan-8.md §5.2/§5.4: how many CT_BLOCK base blocks per side
+// a super-block groups on a rung whose level is `step` level-0 pixels per
+// pixel, so that the group holds at least CT_SUPERBLOCK_MIN_PIX *distinct*
+// level pixels. A base block spans CT_BLOCK/step level pixels per side --
+// several before the ladder has decimated past CT_BLOCK, a fraction of one
+// afterwards, where _ladder_accumulate_blocks' x1<=x0 rescue makes
+// neighbouring base blocks re-read the *same* level pixel rather than each
+// hold one of its own. So the count is not floored at one per block: past
+// step = CT_BLOCK the distinct-pixel count per side is grp * CT_BLOCK / step
+// for the whole group, and the group has to grow by another factor of two
+// per octave beyond what a one-per-block floor would say (step 16 wants
+// grp = 16, not 8; step 64 wants 64, not 8). plan-8 Phase 0 caught the
+// floored version: it left every rung from octave 4 up reading p90/p99 off
+// groups of 16, 4 and then a single distinct pixel, exactly the case §5.2's
+// 64-sample argument exists to rule out. Shared with the offline harness
+// (picker-regression/harness_v2/dig_phase0.c) so the two cannot drift.
+static size_t _ladder_superblock_side(const double step)
+{
+  const double per_side = (double)CT_BLOCK / step;  // distinct level pixels per base block side
+  size_t grp = 1;
+  while((double)(grp * grp) * per_side * per_side < CT_SUPERBLOCK_MIN_PIX && grp < 4096) grp *= 2;
+  return grp;
+}
+
 // implementation-plan-8.md §5.2/§5.4: aggregate this rung's own blk2/blkn
 // (already accumulated by _ladder_accumulate_blocks, same call the SATs
 // above are built from) into super-blocks of at least CT_SUPERBLOCK_MIN_PIX
-// real (decimated-level) pixels, and write each super-block's RMS
-// (sqrt(sum b^2 / sum n)) into every base block it covers -- so a later box
-// query can index this component by the same (by, bx) coordinates it
-// already uses for sat2/sat1/sat_n, with no per-rung resolution bookkeeping.
-//
-// Group side is derived from this rung's own *nominal* (edge-clipping-free)
-// pixel count per CT_BLOCK cell, (CT_BLOCK/step)^2, floored at 1 the same
-// way _ladder_accumulate_blocks' own x1<=x0 rescue floors a block at one
-// real pixel (a block can never hold less than one sample). That quantity
-// exactly quarters each octave (step doubles), so the smallest power-of-two
-// group reaching CT_SUPERBLOCK_MIN_PIX doubles right along with it, matching
-// §5.2's own "block side doubles per octave past the point where
-// CT_BLOCK/step < 8" -- derived here from the real per-block pixel count
-// rather than asserted, so it stays correct if CT_BLOCK or the octave
-// scheme ever change. Using each group's real summed blkn (not the nominal
-// figure used only to size the group) rather than a fixed group size also
-// makes a frame-edge group -- whose blocks hold fewer real pixels than an
-// interior one -- self-correcting: it still divides by what it actually
-// summed.
+// distinct (decimated-level) pixels, _ladder_superblock_side base blocks per
+// side, and write each super-block's RMS (sqrt(sum b^2 / sum n)) into every
+// base block it covers -- so a later box query can index this component by
+// the same (by, bx) coordinates it already uses for sat2/sat1/sat_n, with no
+// per-rung resolution bookkeeping. Using each group's real summed blkn
+// rather than a nominal figure makes a frame-edge group -- whose blocks hold
+// fewer real pixels than an interior one -- self-correcting: it still divides
+// by what it actually summed.
 static void _ladder_build_blockrms(const double *const restrict blk2,
                                    const double *const restrict blkn,
                                    const size_t bw, const size_t bh,
@@ -1284,11 +1297,7 @@ static void _ladder_build_blockrms(const double *const restrict blk2,
                                    double *const restrict dst)
 {
   const size_t sw = bw + 1;
-
-  const double per_block = (double)CT_BLOCK / step;
-  const double nominal = fmax(1.0, per_block * per_block);
-  size_t grp = 1;
-  while((double)(grp * grp) * nominal < CT_SUPERBLOCK_MIN_PIX && grp < 4096) grp *= 2;
+  const size_t grp = _ladder_superblock_side(step);
 
   for(size_t gy = 0; gy < bh; gy += grp)
   {
