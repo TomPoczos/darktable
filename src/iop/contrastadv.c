@@ -96,18 +96,17 @@ DT_MODULE_INTROSPECTION(4, dt_iop_contrast_params_t)
 // this setting.
 #define CT_FEATHERING_EXPONENT 0.3f
 
-// the graph: nodes run coarse (left) to fine (right), one per octave, so the
-// x axis is simply k/CT_BANDS (implementation-plan-3.md §4.2 replaces this
-// with the projection grid's own span -- see _spectrum_lambda_to_raw_x).
+// the graph: nodes run coarse (left) to fine (right), one per octave, at
+// (k + 0.5) / CT_BANDS in raw x; implementation-plan-3.md §4.2 makes the
+// drawn x axis the projection grid's own span rather than [0,1], so a
+// node's screen position is that raw x run through _graph_axis/_graph_node_x
+// (see _spectrum_lambda_to_raw_x for the wavelength side of the same map).
 //
 // implementation-plan-3.md §4.1: the y axis is log2 gain, symmetric about
 // the neutral 1.0, half-range log2(5.0) -- so the axis runs 0.2 .. 5.0 and
 // is exactly the band parameter's own hard range ($MAX 5.0 and its
-// reciprocal). The old linear CT_GRAPH_Y_MAX = 2.0 could not draw
-// CT_EQUALIZE_GAIN_HI at all (2.5 clamped to the top edge, pixel-identical
-// to 2.0) and split the envelope 35%/50% of the height between its
-// 1.737-octave cut half and its 1.0-octave boost half, on a quantity where
-// a factor is a factor either way.
+// reciprocal), which is what lets it draw CT_EQUALIZE_GAIN_HI and give a
+// factor the same height whether it cuts or boosts.
 #define CT_GRAPH_LOG_HALF 2.3219281   // log2(5.0)
 #define CT_GRAPH_RES 64      // curve points sampled between nodes, per implementation-plan.md §1.4
 
@@ -4403,9 +4402,9 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_set_dash(cr, NULL, 0, 0.0);
   }
 
-  // 5. the curve: monotone cubic through the nine nodes -- this is the
+  // 4. the curve: monotone cubic through the nine nodes -- this is the
   // *shape*, i.e. exactly what dragging a node edits (p->band[k]), not what
-  // reaches the pixels once the master gain is applied (see 5b below).
+  // reaches the pixels once the master gain is applied (see 4b below).
   _graph_curve_from_params(g->curve, p, &axis);
   float xs[CT_GRAPH_RES], ys[CT_GRAPH_RES];
   dt_draw_curve_calc_values(g->curve, 0.0f, 1.0f, CT_GRAPH_RES, xs, ys);
@@ -4416,7 +4415,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_line_to(cr, i * width / (float)(CT_GRAPH_RES - 1), height * (1.0f - ys[i]));
   cairo_stroke(cr);
 
-  // 5b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
+  // 4b. implementation-plan-6.md §6 Phase 4.1: the *effective* gain overlay,
   // 1 + band_master*(shape-1) -- what §1's bug report actually judged.
   // Dashed, since it's derived from the shape curve rather than directly
   // editable (this file's convention: solid = editable, dashed = derived).
@@ -4451,15 +4450,15 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_set_dash(cr, NULL, 0, 0.0);
   }
 
-  // 5c. implementation-plan-7.md §4.2: the ceiling itself, third curve --
+  // 4c. implementation-plan-7.md §4.2: the ceiling itself, third curve --
   // _ct_band_ceiling per band, purely frame-relative (needs only k and
-  // scale_shift, §4.4) -- like 5b just above, derived directly from
+  // scale_shift, §4.4) -- like 4b just above, derived directly from
   // self->params, not published from the pipe (see _ct_band_ceiling's own
   // comment). Drawn unconditionally, like the envelope rails (3b): with the
-  // per-band knee (§4.1(d)) this is where 5b's dashed line is headed once a
+  // per-band knee (§4.1(d)) this is where 4b's dashed line is headed once a
   // band's own R_k starts binding, and that is worth seeing before the
   // slider is ever touched, not only after. Dotted rather than dashed so it
-  // reads as a third, distinct line rather than a second copy of 5b's dash
+  // reads as a third, distinct line rather than a second copy of 4b's dash
   // style; graph_border rather than graph_fg keeps it visually behind the
   // two editable/derived curves.
   {
@@ -4479,7 +4478,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     cairo_set_dash(cr, NULL, 0, 0.0);
   }
 
-  // 6. node bars + bullets
+  // 5. node bars + bullets
   //
   // implementation-plan-3.md §4.4: which nodes the last pick's own window
   // (§1.1) actually measured, vs. which ones the fit's power law only
@@ -4511,7 +4510,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     // the envelope (e.g. the EQUALIZE floor at 0.30) can still have master
     // push its *effective* gain at or below zero, inverting that octave's
     // detail (§2.2) -- the node bullet itself is what a user actually looks
-    // at when judging a curve, so this is marked here, not only on the 5b
+    // at when judging a curve, so this is marked here, not only on the 4b
     // overlay curve, and it overrides the extrapolated color (not the dash,
     // which is a separate question per §4.5).
     const float effective_gain = effective[k];
