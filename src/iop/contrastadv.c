@@ -2453,31 +2453,26 @@ static double _ct_sigma_to_node(const double sigma)
 #define CT_DEFAULT_NODE 4.89
 // CT_DEFAULT_WIDTH = 1.65 nodes -- the fitted Gaussian's own sigma.
 #define CT_DEFAULT_WIDTH 1.65
-// CT_DEFAULT_PEAK = 0.20 -- gives an effective peak band gain of 1.30 at
-// CT_POST_PICK_MASTER (§5.5(a)/Phase 2's own convention below: the picker
-// writes 1 + CT_DEFAULT_PEAK*shape directly, master-independent, and
-// process() then multiplies the (band-1) deviation by master once).
-// Three independent lines of evidence land within 0.1 of 1.30: this
-// photographer's own median accepted peak band gain is 1.35 (§3.7); §4.4's
-// countershading ceiling at its preferred 0.65 fraction is 1.40 at the
-// fussiest band (band 3); §4.7's acutance saturation puts nothing worth
-// buying past roughly there. The shipped picker before this plan reached
-// 1.75 (DETAIL) to 3.25 (EQUALIZE's own top rail) -- about twice any of the
-// three.
-#define CT_DEFAULT_PEAK 0.20
-
-// implementation-plan-6.md §6 Phase 5.4: the master the picker raises
-// gain_local_contrast to the first time a pick finds it still at its
-// neutral default (§2.5/research.md §5.6: a shape with no strength behind
-// it would be invisible, so raise it first -- the same exception
-// blackwhite's picker uses). Named and derived rather than left as a bare
-// literal in that call site: 1 + CT_POST_PICK_MASTER*CT_DEFAULT_PEAK = 1.30
-// is the same effective peak band gain CT_DEFAULT_PEAK's own comment above
-// derives from the three independent lines of evidence there. If a later
-// phase (§6 Phase 6.4's own note) moves the preferred effective peak, this
-// is the constant to change -- CT_DEFAULT_PEAK is the shape's own fitted
-// amplitude and should stay fixed to what §3.7b measured.
-#define CT_POST_PICK_MASTER 1.5
+// implementation-plan-8.md §3.2: CT_DEFAULT_PEAK_EFF is what gets *written*
+// into band[] now, at gain_local_contrast's own neutral default of 1.0 --
+// there is no post-pick moment any more at which to bump the master
+// (init()/_target_curve write the same hump the picker itself writes,
+// nothing to distinguish "just picked" from "just enabled"), so the module's
+// baseline curve has to carry its own full effective strength directly
+// rather than splitting it across a shape amplitude and a raised master.
+// 0.30 = the old split's 0.20 * 1.5 (CT_DEFAULT_PEAK * the deleted
+// CT_POST_PICK_MASTER below) -- same effective peak band gain of 1.30, same
+// three lines of evidence (this photographer's own median accepted peak
+// band gain 1.35; §4.4's countershading ceiling at its preferred 0.65
+// fraction, 1.40 at the fussiest band; §4.7's acutance saturation, nothing
+// worth buying past roughly there). _ct_band_master's smooth knee is
+// homogeneous of degree 1 in (master, R_k) together (R_k = (ceiling-1)/
+// (band-1) scales by the same 2/3 factor band-1 scales by 1.5x), so
+// band_master(k)*(band-1) -- what process() actually applies -- comes out
+// identical under the 0.20x1.5 -> 0.30x1.0 split for every master the user
+// might already have set before a pick, not just at the neutral default;
+// verified algebraically (plan-8 Phase 1.4) rather than only by rendering.
+#define CT_DEFAULT_PEAK_EFF 0.30
 
 // implementation-plan-6.md §6 Phase 2.5, decided: the shape's own natural
 // skirt at nodes 7-8 (the two finest, which a preview-scale ladder never
@@ -2527,7 +2522,7 @@ static void _target_curve(const _ct_fit_t *const fit, const _ct_target_mode_t mo
       // under it and the written gains change with the slider.
       const double node = _ct_sigma_to_node(sigma_grid[j]) - (double)scale_shift;
       const double z = (node - CT_DEFAULT_NODE) / CT_DEFAULT_WIDTH;
-      shape[j] = 1.0 + CT_DEFAULT_PEAK * exp(-0.5 * z * z);
+      shape[j] = 1.0 + CT_DEFAULT_PEAK_EFF * exp(-0.5 * z * z);
       continue;
     }
 
@@ -3186,6 +3181,41 @@ static double _preset_bump(const double x, const double x0, const double w)
   return 0.5 * (1.0 + cos(M_PI * t));
 }
 
+// implementation-plan-8.md §3.1: the module's default curve is the fixed
+// hump (CT_TARGET_DEFAULT, §5B.1) projected onto band[] through the exact
+// same path init_presets' "default curve" preset (below) and a fixed-mode
+// pick (_color_picker_apply_now) use -- not nine hardcoded numbers of its
+// own, so all three can never disagree by rounding. scale_shift = 0, no
+// calibration, gain envelope [1, 1+CT_DEFAULT_PEAK_EFF] mirrors exactly
+// what _color_picker_apply_now computes for mode == CT_TARGET_DEFAULT.
+void init(dt_iop_module_t *self)
+{
+  dt_iop_default_init(self);
+
+  dt_iop_contrast_params_t *const d = self->default_params;
+
+  float sigma[CT_BANDS];
+  _ct_band_sigma(sigma, 0.0f);
+  double lo, hi;
+  _ct_grid_bounds(sigma, &lo, &hi);
+
+  double lambda_grid[CT_PROJECT_GRID], sigma_grid[CT_PROJECT_GRID], shape[CT_PROJECT_GRID];
+  for(int j = 0; j < CT_PROJECT_GRID; j++)
+  {
+    sigma_grid[j] = lo * exp2(log2(hi / lo) * (double)j / (double)(CT_PROJECT_GRID - 1));
+    lambda_grid[j] = sigma_grid[j] * CT_SIGMA_TO_LAMBDA;
+  }
+
+  // _target_curve's CT_TARGET_DEFAULT branch reads neither fit nor
+  // sigma_ref (only CT_TARGET_EQUALIZE does) -- a zeroed fit and a
+  // sigma_ref of 0 are safe here.
+  _ct_fit_t unused_fit;
+  memset(&unused_fit, 0, sizeof(unused_fit));
+  _target_curve(&unused_fit, CT_TARGET_DEFAULT, sigma_grid, CT_PROJECT_GRID, 0.0, 0.0f, shape);
+
+  _preset_apply_target(lambda_grid, shape, CT_PROJECT_GRID, sigma, 1.0f, 1.0f + CT_DEFAULT_PEAK_EFF, d);
+}
+
 void init_presets(dt_iop_module_so_t *self)
 {
   dt_iop_contrast_params_t p;
@@ -3429,7 +3459,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
   // target[] as-is, not lerped between 1 and master the way DETAIL's [0,1]
   // shape is. implementation-plan-6.md §5.5(a)/§6 Phase 2.1: CT_TARGET_DEFAULT
-  // is built the same absolute way (1 + CT_DEFAULT_PEAK*shape, §5B.1) --
+  // is built the same absolute way (1 + CT_DEFAULT_PEAK_EFF*shape, §5B.1) --
   // master-independent by design, so a pick lands at the same effective
   // strength regardless of what the master slider was set to beforehand, and
   // Phase 5 is what brings DETAIL onto this same convention.
@@ -3447,7 +3477,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own fixed clamp
   // (§8.1, same as the preset). No band should leave it.
   // implementation-plan-6.md §5.3/§6 Phase 2.3: CT_TARGET_DEFAULT's own
-  // envelope is [1, 1+CT_DEFAULT_PEAK] -- gain_lo pinned at 1.0 (not
+  // envelope is [1, 1+CT_DEFAULT_PEAK_EFF] -- gain_lo pinned at 1.0 (not
   // min(1,master) the way DETAIL's was) so R1 (never cut a band below
   // neutral on the autopick path) holds by construction, and gain_hi at the
   // shape's own known ceiling (the Gaussian never exceeds 1) rather than
@@ -3456,7 +3486,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
                        : (mode == CT_TARGET_DEFAULT)  ? 1.0f
                        : fminf(1.0f, p->gain_local_contrast);
   const float gain_hi = (mode == CT_TARGET_EQUALIZE) ? CT_EQUALIZE_GAIN_HI
-                       : (mode == CT_TARGET_DEFAULT)  ? (1.0f + CT_DEFAULT_PEAK)
+                       : (mode == CT_TARGET_DEFAULT)  ? (1.0f + CT_DEFAULT_PEAK_EFF)
                        : fmaxf(1.0f, p->gain_local_contrast);
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
