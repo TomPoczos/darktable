@@ -804,7 +804,13 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
     }
   }
 
-  if(best_residual == DBL_MAX) return FALSE;
+  // unreachable unless every residual came out NaN (NaN energies), but a
+  // refusal must still say why
+  if(best_residual == DBL_MAX)
+  {
+    *reason = CT_FIT_REFUSED_FLAT;
+    return FALSE;
+  }
   *fit = best;
   return TRUE;
 }
