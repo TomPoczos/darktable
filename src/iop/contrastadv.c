@@ -2905,44 +2905,50 @@ static void _compute_band_calibration(dt_iop_module_t *self, const int *const bo
   }
 }
 
+// implementation-plan-8.md §5: what a box query reads off the ladder's own
+// SAT tables, before any picker mode decides what to do with it -- the
+// shared skeleton's `_measure_box` output. Same fields the pre-plan-8
+// `_fit_curve_from_box` kept as locals (see its comment, preserved below on
+// `_measure_box`), gathered into one struct so `_fit_spectrum` and
+// `_mode_shape` can both take a single argument instead of the same eight
+// arrays threaded through by hand.
+typedef struct _ct_box_stats_t
+{
+  int nrungs;
+  double lambda[CT_MAX_BANDS];
+  double sigma[CT_MAX_BANDS];
+  double energies[CT_MAX_BANDS];
+  double weights[CT_MAX_BANDS];
+  double s1_energy[CT_MAX_BANDS];    // §2.4: Sum(|b|)/n_eff over the box, for its own sparseness
+  double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
+  double noise_prior;
+  double peak_e;
+  double ladder_lambda0;      // §6.1: finest rung's own wavelength
+  double window_lambda_max;   // §7: the window's own achievable span
+} _ct_box_stats_t;
+
 // §2.2: query the ladder's published SAT tables for the box the picker
-// selected, feed the resulting per-rung (wavelength, energy, weight) triples
-// to §2.3's `_fit_spectrum` -- primed, per §2.4, with a frame-wide noise
-// estimate rather than fitting N freely -- and (§2.4) read the box's own
-// sparseness back out of the same tables. box is in the pixels of
-// g->ladder_roi_in, i.e. of the preview the ladder was built from.
+// selected, into the per-rung (wavelength, energy, weight) triples every
+// picker mode's `_fit_spectrum` call (run separately by the caller, plan-8
+// §5's shared skeleton) and `_mode_shape` then share. box is in the pixels
+// of g->ladder_roi_in, i.e. of the preview the ladder was built from.
 //
 // research.md §5.2: any box query is 4 lookups per rung -- this is that
 // query, one held critical section covering every rung so the buffer can't
 // be resized out from under it mid-query.
 //
-// on success, *fit holds the model and *mode which of §2.5's target shapes
-// it earns (EQUALIZE normally, DETAIL when A came back negligible -- "a
-// self-similar area with no size"). returns FALSE only under the same
-// refusals `_fit_texture_scale` always used -- too few rungs, too narrow a
-// span, or nothing above the noise floor anywhere in the box; the two
-// dt_control_log calls below are advisory only and never cause a refusal.
-// spectrum_lambda/spectrum_energy/spectrum_nrungs (all optional, NULL to
-// skip) return this box's own raw per-rung measurement -- §3.2's graph
-// overlay wants it alongside the fit itself, to plot what was actually
-// measured next to what the model made of it. long_edge (§4.2) is the
-// ladder roi's own long edge, in the same pixels as the ladder's sigma --
-// dividing by it is what makes the returned fit->tau frame-relative.
-static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
-                                    const float long_edge,
-                                    _ct_fit_t *const fit, _ct_target_mode_t *const mode,
-                                    double *const restrict spectrum_lambda,
-                                    double *const restrict spectrum_energy,
-                                    int *const restrict spectrum_nrungs)
+// returns FALSE only when the ladder itself has nothing published yet (a
+// fresh module, or a preview pass still catching up) -- the "too small"/
+// "nothing to measure" refusals are `_fit_spectrum`'s own, once the caller
+// runs it against *stats. long_edge (§4.2) is the ladder roi's own long
+// edge, in the same pixels as the ladder's sigma -- dividing by it is what
+// makes the eventual fit->tau frame-relative.
+static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
+                             const float long_edge, _ct_box_stats_t *const stats)
 {
   dt_iop_contrast_gui_data_t *const g = self->gui_data;
 
-  double lambda[CT_MAX_BANDS], sigma[CT_MAX_BANDS], energies[CT_MAX_BANDS], weights[CT_MAX_BANDS];
-  double s1_energy[CT_MAX_BANDS];    // §2.4: Sum(|b|)/n_eff over the box, for its own sparseness
-  double noise_floor[CT_MAX_BANDS];  // §2.4: frame-wide, not the box's own
-  int nrungs = 0;
-  double ladder_lambda0 = 0.0;       // §6.1: finest rung's own wavelength, set below
-  double window_lambda_max = 0.0;    // §7: the window's own achievable span, set below
+  memset(stats, 0, sizeof(*stats));
 
   dt_iop_gui_enter_critical_section(self);
 
@@ -2970,14 +2976,14 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
     const double box_w = (double)(bx1 - bx0) * CT_BLOCK;
     const double box_h = (double)(by1 - by0) * CT_BLOCK;
     const double lambda_max = fmin(box_w, box_h);
-    window_lambda_max = lambda_max;
+    stats->window_lambda_max = lambda_max;
     // §6.1: the ladder's own finest rung, independent of the window above --
     // needed even when the box is too small to keep a single rung, to quote
     // the smallest box that would have worked.
-    ladder_lambda0 = g->ladder_lambda[0];
+    stats->ladder_lambda0 = g->ladder_lambda[0];
 
     const float *const restrict buf = g->pd.buf;
-    nrungs = 0;
+    int nrungs = 0;
     for(int r = 0; r < g->ladder_nrungs; r++)
     {
       if(g->ladder_lambda[r] > lambda_max) break;  // rungs run fine -> coarse
@@ -3012,153 +3018,143 @@ static gboolean _fit_curve_from_box(dt_iop_module_t *self, const int *const box,
       // (s2/n_eff is correct there) and use n_indep only for the weight.
       const double n_indep = fmax(box_w * box_h / (lam * lam), 0.25);
 
-      lambda[nrungs] = lam;
+      stats->lambda[nrungs] = lam;
       // §4.2: frame-relative, so it lines up with §4.1's band sigma
-      sigma[nrungs] = g->ladder_sigma[r] / (double)long_edge;
-      energies[nrungs] = s2 / n_eff;
-      s1_energy[nrungs] = s1 / n_eff;
-      weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
-      noise_floor[nrungs] = g->ladder_noise_floor[r];
+      stats->sigma[nrungs] = g->ladder_sigma[r] / (double)long_edge;
+      stats->energies[nrungs] = s2 / n_eff;
+      stats->s1_energy[nrungs] = s1 / n_eff;
+      stats->weights[nrungs] = 1.0 / (CT_MODEL_ERROR * CT_MODEL_ERROR + 2.0 / n_indep);
+      stats->noise_floor[nrungs] = g->ladder_noise_floor[r];
       nrungs++;
     }
+    stats->nrungs = nrungs;
   }
 
   dt_iop_gui_leave_critical_section(self);
 
-  if(!have_data)
-  {
-    dt_control_log(_("the preview isn't ready to measure yet -- try again in a moment"));
-    return FALSE;
-  }
+  if(!have_data) return FALSE;
 
-  double peak_e = 0.0;
-  for(int r = 0; r < nrungs; r++) peak_e = fmax(peak_e, energies[r]);
+  for(int r = 0; r < stats->nrungs; r++) stats->peak_e = fmax(stats->peak_e, stats->energies[r]);
 
   // §2.4: fix N from the frame-wide block-minimum estimate rather than
   // fitting it freely -- "stabilises everything else" (research.md §5.5) and
   // stops a genuinely fine texture from getting explained away as noise.
-  const double noise_prior = _ladder_estimate_noise(sigma, noise_floor, nrungs);
-
-  // §6.1: say *which* refusal this is instead of one message covering both
-  // -- "too small" and "flat" want different reactions from the user.
-  _ct_fit_refusal_t refusal = CT_FIT_REFUSED_FLAT;
-  if(!_fit_spectrum(sigma, energies, weights, nrungs, noise_prior, fit, &refusal))
-  {
-    if(refusal == CT_FIT_REFUSED_SPAN)
-    {
-      // the smallest box that would work at the current preview scale is
-      // computable: CT_MIN_SPAN octaves' worth of the finest rung's own
-      // wavelength -- the loosest lower bound §1.1's window allows.
-      const double min_side = CT_MIN_SPAN * ladder_lambda0;
-      dt_control_log(_("the picked area is too small to measure a detail size from -- "
-                        "try at least %.0f x %.0f px"), min_side, min_side);
-    }
-    else
-    {
-      dt_control_log(_("the picked area has nothing to measure a detail size from -- "
-                        "flat sky, a blown highlight and a black frame all look like this"));
-    }
-    return FALSE;
-  }
-
-  // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is no
-  // longer derived from what was measured here (§3.7b) -- both of DETAIL's
-  // and EQUALIZE's old outcomes now write the same fixed CT_TARGET_DEFAULT
-  // shape. What the fit still decides is whether a sized texture was found
-  // at all, kept as `found_texture` below purely to gate the size-sanity
-  // advisories a few lines down (fit->tau/fit->texture are meaningless
-  // without a texture to have measured); it no longer selects a shape.
-  // implementation-plan-2.md §8.2/target-shape.md's own EQUALIZE-over-TEXTURE
-  // decision, and DETAIL's flat S/(S+N) shape, both stay reachable in
-  // _target_curve for any caller that still wants them -- neither is wired
-  // to the picker any more.
-  const gboolean found_texture = fit->texture_peak > peak_e * 1e-2;
-  *mode = CT_TARGET_DEFAULT;
-
-  // §2.4/research.md §5.9: advisory only, neither warning below refuses the
-  // pick -- both just explain a result that might otherwise look like
-  // nothing happened, or like an untrustworthy size.
-  {
-    int peak_idx = 0;
-    for(int r = 1; r < nrungs; r++) if(energies[r] > energies[peak_idx]) peak_idx = r;
-    double S, N;
-    _ct_fit_eval(fit, sigma[peak_idx], &S, &N);
-    if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
-      dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
-  }
-
-  // §8.2: fit->tau/fit->texture feed _ct_fit_eval's S(sigma) the same way
-  // regardless of mode (EQUALIZE's wiener term and E_ref both depend on
-  // them, just not peak-normalised the way TEXTURE's shape once was) -- so
-  // the fitted size is still worth warning about whenever a texture was
-  // found at all, not only in the now-deleted TEXTURE case (plan-4 §7.2).
-  // implementation-plan-6.md §6 Phase 2.2: gated on `found_texture` now that
-  // `*mode` no longer varies with it.
-  if(found_texture)
-  {
-    const double target_sigma = sqrt(fit->tau);
-
-    // §6.2: the fitted size sits within half an octave of the window's own
-    // coarse edge (§1.1's lambda_max) -- there is no peak inside what the
-    // box could see, only a rising flank, so the reported size is read off
-    // the edge of the window rather than measured. Warn, don't refuse: this
-    // is the honest answer, not a bad one.
-    if(target_sigma >= sigma[nrungs - 1] / M_SQRT2)
-      dt_control_log(_("the measured size sits at the edge of what this box can see -- "
-                        "it may be larger than reported"));
-
-    // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure --
-    // the box is too small to *contain* the feature, so the fit can't place
-    // any peak inside what it measured and instead collapses tau toward the
-    // ladder's finest rung, railing beta high to explain the rest. Unlike
-    // §6.2 above this produces no complaint on its own: sqrt(fit->tau) reads
-    // as a small, confident number instead of an edge value.
-    //
-    // A plain half-octave mirror of §6.2's own margin (target_sigma <=
-    // sigma[0]*M_SQRT2) was measured first, on dig_window_sweep.c's known-
-    // truth cases (findings.md): it catches the W=100 row of the "bump at
-    // 45.7px" case (ratio to sigma[0] = 1.41) but misses W=150 (ratio 1.68),
-    // which also needs to warn. fit->texture_peak was measured as the other
-    // candidate and rejected -- on these same cases its ratio to peak_e
-    // (0.04-0.07 for the collapsed W=100/150 rows) sits in the same range as
-    // a pure power law with no bump at all fit through an equally small
-    // window (0.03-0.04), so no threshold on it separates a real collapsed
-    // feature from ordinary small-window noise; position does. A full-octave
-    // margin catches both W=100 and W=150 (ratios 1.41 and 1.68) while
-    // staying well clear of the legitimate fine-texture pick (sigma_t =
-    // 3.4px, ratio 2.4-2.8 across the same window sizes) -- see findings.md
-    // for the full sweep.
-    if(target_sigma <= sigma[0] * 2.0)
-    {
-      const double min_side = 2.0 * window_lambda_max;
-      dt_control_log(_("the box is too small to see how big this is -- "
-                        "try at least %.0f x %.0f px"), min_side, min_side);
-    }
-
-    int nearest = 0;
-    double best_d = DBL_MAX;
-    for(int r = 0; r < nrungs; r++)
-    {
-      const double dist = fabs(log(sigma[r] / target_sigma));
-      if(dist < best_d) { best_d = dist; nearest = r; }
-    }
-    if(s1_energy[nearest] > 0.0)
-    {
-      const double kappa = sqrt(energies[nearest]) / s1_energy[nearest];
-      if(kappa > CT_KAPPA_EDGE)
-        dt_control_log(_("the picked area looks more like a hard edge than dense texture -- "
-                          "the measured size may be unreliable"));
-    }
-  }
-
-  if(spectrum_lambda && spectrum_energy && spectrum_nrungs)
-  {
-    memcpy(spectrum_lambda, lambda, sizeof(double) * nrungs);
-    memcpy(spectrum_energy, energies, sizeof(double) * nrungs);
-    *spectrum_nrungs = nrungs;
-  }
+  stats->noise_prior = _ladder_estimate_noise(stats->sigma, stats->noise_floor, stats->nrungs);
 
   return TRUE;
+}
+
+// implementation-plan-8.md §5: given a `_measure_box` + `_fit_spectrum` that
+// already succeeded, decide what shape `mode` writes onto the projection
+// grid `sigma_grid`/`m`. `*absolute` reports whether `shape[]` is already
+// the module's own absolute target -- master-independent, the way
+// CT_TARGET_DEFAULT/EQUALIZE are in `_target_curve` -- rather than a [0,1]
+// shape meant to be lerped with gain_local_contrast; every mode built by
+// plan-8 is the former (§5's "the picker sets shape, never strength"), but
+// the caller still needs to be told which.
+//
+// CT_PICK_STRUCTURE/CT_PICK_PERCENTILE are plan-8 Phase 4/5's own work and
+// fall through to CT_PICK_FIXED's case until then (Phase 2's own intro:
+// "No behaviour change yet: every entry runs the fixed path"). Returns
+// FALSE only for a mode whose shape comes back all-zero (Phase 4/5's own
+// "nothing to do" case -- the default curve is already applied, so this is
+// a no-op, not a fallback write); CT_PICK_FIXED's Gaussian hump is never
+// all-zero and so never returns FALSE.
+//
+// CT_PICK_FIXED's body below is the pre-plan-8 `_fit_curve_from_box`'s own
+// post-`_fit_spectrum` code, moved verbatim (the found_texture advisories,
+// then the CT_TARGET_DEFAULT hump via `_target_curve`) -- implementation-
+// plan-8.md §6 Phase 2.2's own regression bar: "a fixed-mode pick writes
+// byte-identical band[] to before."
+static gboolean _mode_shape(const _ct_picker_mode_t mode,
+                            const _ct_box_stats_t *const stats,
+                            const _ct_fit_t *const fit,
+                            const double *const restrict sigma_grid, const int m,
+                            const double sigma_ref, const float scale_shift,
+                            double *const restrict shape,
+                            gboolean *const absolute)
+{
+  switch(mode)
+  {
+    case CT_PICK_STRUCTURE:
+    case CT_PICK_PERCENTILE:
+    case CT_PICK_FIXED:
+    default:
+    {
+      // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is
+      // not derived from what was measured here (§3.7b) -- every mode's
+      // "not implemented yet" fallback and CT_PICK_FIXED itself both write
+      // the same fixed CT_TARGET_DEFAULT shape. What the fit still decides
+      // is whether a sized texture was found at all, kept as
+      // `found_texture` below purely to gate the size-sanity advisories
+      // that follow (fit->tau/fit->texture are meaningless without a
+      // texture to have measured); it no longer selects a shape.
+      const gboolean found_texture = fit->texture_peak > stats->peak_e * 1e-2;
+
+      // §2.4/research.md §5.9: advisory only, neither warning below refuses
+      // the pick -- both just explain a result that might otherwise look
+      // like nothing happened, or like an untrustworthy size.
+      {
+        int peak_idx = 0;
+        for(int r = 1; r < stats->nrungs; r++)
+          if(stats->energies[r] > stats->energies[peak_idx]) peak_idx = r;
+        double S, N;
+        _ct_fit_eval(fit, stats->sigma[peak_idx], &S, &N);
+        if(S <= (S + N) * CT_NOISE_DOMINATED_FRAC)
+          dt_control_log(_("the picked area looks like noise -- try raising the noise bias"));
+      }
+
+      // §8.2: fit->tau/fit->texture feed _ct_fit_eval's S(sigma) the same
+      // way regardless of mode -- so the fitted size is still worth warning
+      // about whenever a texture was found at all.
+      if(found_texture)
+      {
+        const double target_sigma = sqrt(fit->tau);
+
+        // §6.2: the fitted size sits within half an octave of the window's
+        // own coarse edge (§1.1's lambda_max) -- there is no peak inside
+        // what the box could see, only a rising flank, so the reported size
+        // is read off the edge of the window rather than measured. Warn,
+        // don't refuse: this is the honest answer, not a bad one.
+        if(target_sigma >= stats->sigma[stats->nrungs - 1] / M_SQRT2)
+          dt_control_log(_("the measured size sits at the edge of what this box can see -- "
+                            "it may be larger than reported"));
+
+        // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure
+        // -- the box is too small to *contain* the feature, so the fit
+        // can't place any peak inside what it measured and instead
+        // collapses tau toward the ladder's finest rung, railing beta high
+        // to explain the rest. A full-octave margin catches this without
+        // false-positiving on a legitimate fine-texture pick -- see
+        // findings.md for the sweep this threshold came from.
+        if(target_sigma <= stats->sigma[0] * 2.0)
+        {
+          const double min_side = 2.0 * stats->window_lambda_max;
+          dt_control_log(_("the box is too small to see how big this is -- "
+                            "try at least %.0f x %.0f px"), min_side, min_side);
+        }
+
+        int nearest = 0;
+        double best_d = DBL_MAX;
+        for(int r = 0; r < stats->nrungs; r++)
+        {
+          const double dist = fabs(log(stats->sigma[r] / target_sigma));
+          if(dist < best_d) { best_d = dist; nearest = r; }
+        }
+        if(stats->s1_energy[nearest] > 0.0)
+        {
+          const double kappa = sqrt(stats->energies[nearest]) / stats->s1_energy[nearest];
+          if(kappa > CT_KAPPA_EDGE)
+            dt_control_log(_("the picked area looks more like a hard edge than dense texture -- "
+                              "the measured size may be unreliable"));
+        }
+      }
+
+      _target_curve(fit, CT_TARGET_DEFAULT, sigma_grid, m, sigma_ref, scale_shift, shape);
+      *absolute = TRUE;
+      return TRUE;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3407,23 +3403,50 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
       memcpy(box, picked, sizeof(box));
   }
 
-  _ct_fit_t fit;
-  _ct_target_mode_t mode;
-  double spectrum_lambda[CT_MAX_BANDS], spectrum_energy[CT_MAX_BANDS];
-  int spectrum_nrungs = 0;
-  // §6.1: _fit_curve_from_box already logs a specific reason on every
-  // refusal path -- nothing generic left to say here.
-  if(!_fit_curve_from_box(self, box, long_edge, &fit, &mode,
-                          spectrum_lambda, spectrum_energy, &spectrum_nrungs))
+  // implementation-plan-8.md §5's shared skeleton: _measure_box, then
+  // _fit_spectrum, then a mode-specific _mode_shape, then _project_to_bands
+  // (below). Every picker mode shares the first two steps and their
+  // refusal messages -- the refusals are properties of the box, not of the
+  // mode (§5's own "every mode still runs _fit_spectrum first").
+  _ct_box_stats_t stats;
+  if(!_measure_box(self, box, long_edge, &stats))
+  {
+    dt_control_log(_("the preview isn't ready to measure yet -- try again in a moment"));
     return;
+  }
+
+  _ct_fit_t fit;
+  _ct_fit_refusal_t refusal = CT_FIT_REFUSED_FLAT;
+  if(!_fit_spectrum(stats.sigma, stats.energies, stats.weights, stats.nrungs, stats.noise_prior,
+                    &fit, &refusal))
+  {
+    // §6.1: say *which* refusal this is instead of one message covering
+    // both -- "too small" and "flat" want different reactions from the
+    // user.
+    if(refusal == CT_FIT_REFUSED_SPAN)
+    {
+      // the smallest box that would work at the current preview scale is
+      // computable: CT_MIN_SPAN octaves' worth of the finest rung's own
+      // wavelength -- the loosest lower bound §1.1's window allows.
+      const double min_side = CT_MIN_SPAN * stats.ladder_lambda0;
+      dt_control_log(_("the picked area is too small to measure a detail size from -- "
+                        "try at least %.0f x %.0f px"), min_side, min_side);
+    }
+    else
+    {
+      dt_control_log(_("the picked area has nothing to measure a detail size from -- "
+                        "flat sky, a blown highlight and a black frame all look like this"));
+    }
+    return;
+  }
 
   // §3.2: publish this pick's own spectrum + fit for the graph's live
   // overlay -- a record of the last measurement, independent of whether the
   // picker itself is still "fresh" by the time it gets drawn.
   dt_iop_gui_enter_critical_section(self);
-  memcpy(g->spectrum_lambda, spectrum_lambda, sizeof(double) * spectrum_nrungs);
-  memcpy(g->spectrum_energy, spectrum_energy, sizeof(double) * spectrum_nrungs);
-  g->spectrum_nrungs = spectrum_nrungs;
+  memcpy(g->spectrum_lambda, stats.lambda, sizeof(double) * stats.nrungs);
+  memcpy(g->spectrum_energy, stats.energies, sizeof(double) * stats.nrungs);
+  g->spectrum_nrungs = stats.nrungs;
   g->spectrum_noise = fit.noise;
   g->spectrum_self_similar = fit.self_similar;
   g->spectrum_texture = fit.texture;
@@ -3498,16 +3521,21 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // implementation-plan-3.md §5.1: sigma_ref is the band ladder's own
   // geometric mean, not the grid's -- see _target_curve's comment.
   const double sigma_ref = sqrt((double)sigma[0] * (double)sigma[CT_BANDS - 1]);
-  _target_curve(&fit, mode, sigma_grid, CT_PROJECT_GRID, sigma_ref, p->scale_shift, shape);
-  // §8.1: CT_TARGET_EQUALIZE's shape[] is already the bounded absolute
-  // target curve (research.md §5.6/§3.4's "flatten spectrum") -- use it as
-  // target[] as-is, not lerped between 1 and master the way DETAIL's [0,1]
-  // shape is. implementation-plan-6.md §5.5(a)/§6 Phase 2.1: CT_TARGET_DEFAULT
-  // is built the same absolute way (1 + CT_DEFAULT_PEAK_EFF*shape, §5B.1) --
+  // implementation-plan-8.md §5/§4.2: which shape this pick writes is now
+  // the dropbox's own choice -- read straight off the combobox, since it's
+  // a GUI preference with no cached copy to go stale (see its own comment
+  // in gui_init).
+  const _ct_picker_mode_t picker_mode = (_ct_picker_mode_t)dt_bauhaus_combobox_get(g->picker_mode);
+  gboolean is_absolute_target = FALSE;
+  if(!_mode_shape(picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref, p->scale_shift,
+                  shape, &is_absolute_target))
+    return;  // Phase 4/5's all-zero case: the default curve is already applied, nothing to do
+
+  // §8.1: an absolute target (every mode plan-8 builds, §5's "the picker
+  // sets shape, never strength") is used as target[] as-is, not lerped
+  // between 1 and master the way a relative [0,1] shape would be --
   // master-independent by design, so a pick lands at the same effective
-  // strength regardless of what the master slider was set to beforehand, and
-  // Phase 5 is what brings DETAIL onto this same convention.
-  const gboolean is_absolute_target = (mode == CT_TARGET_EQUALIZE || mode == CT_TARGET_DEFAULT);
+  // strength regardless of what the master slider was set to beforehand.
   for(int j = 0; j < CT_PROJECT_GRID; j++)
     target[j] = is_absolute_target ? shape[j] : 1.0 + ((double)p->gain_local_contrast - 1.0) * shape[j];
 
@@ -3517,21 +3545,19 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   float calibration[CT_BANDS];
   _compute_band_calibration(self, box, long_edge, &fit, calibration);
 
-  // §4.4: the envelope the target curve itself was built to -- DETAIL's is
-  // 1 + (master-1)*shape, shape in [0,1]; EQUALIZE's is its own fixed clamp
-  // (§8.1, same as the preset). No band should leave it.
-  // implementation-plan-6.md §5.3/§6 Phase 2.3: CT_TARGET_DEFAULT's own
-  // envelope is [1, 1+CT_DEFAULT_PEAK_EFF] -- gain_lo pinned at 1.0 (not
-  // min(1,master) the way DETAIL's was) so R1 (never cut a band below
-  // neutral on the autopick path) holds by construction, and gain_hi at the
-  // shape's own known ceiling (the Gaussian never exceeds 1) rather than
-  // anything master-derived, since this target is master-independent.
-  const float gain_lo = (mode == CT_TARGET_EQUALIZE) ? CT_EQUALIZE_GAIN_LO
-                       : (mode == CT_TARGET_DEFAULT)  ? 1.0f
-                       : fminf(1.0f, p->gain_local_contrast);
-  const float gain_hi = (mode == CT_TARGET_EQUALIZE) ? CT_EQUALIZE_GAIN_HI
-                       : (mode == CT_TARGET_DEFAULT)  ? (1.0f + CT_DEFAULT_PEAK_EFF)
-                       : fmaxf(1.0f, p->gain_local_contrast);
+  // §4.4: the envelope the target curve itself was built to. No band should
+  // leave it. implementation-plan-6.md §5.3/§6 Phase 2.3/implementation-
+  // plan-8.md §5: every picker-reachable target is now absolute, so this is
+  // [1, 1+CT_DEFAULT_PEAK_EFF] unconditionally -- gain_lo pinned at 1.0 (not
+  // min(1,master)) so R1 (never cut a band below neutral on the autopick
+  // path) holds by construction, and gain_hi at the shape's own known
+  // ceiling (the Gaussian never exceeds 1) rather than anything
+  // master-derived, since this target is master-independent. The
+  // CT_TARGET_EQUALIZE bounds this ternary used to carry were already dead
+  // on the picker path -- _mode_shape never produces that mode -- and are
+  // dropped rather than threaded through as a case nothing can reach.
+  const float gain_lo = is_absolute_target ? 1.0f : fminf(1.0f, p->gain_local_contrast);
+  const float gain_hi = is_absolute_target ? (1.0f + CT_DEFAULT_PEAK_EFF) : fmaxf(1.0f, p->gain_local_contrast);
 
   float gains[CT_BANDS];  // finest-first, matching sigma[] above
   if(!_project_to_bands(lambda_grid, target, CT_PROJECT_GRID, sigma, CT_BANDS, calibration,
