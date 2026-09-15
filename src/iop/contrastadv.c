@@ -278,6 +278,16 @@ typedef struct dt_iop_contrast_gui_data_t
   double spectrum_energy[CT_MAX_BANDS];
   double spectrum_noise, spectrum_self_similar, spectrum_texture, spectrum_tau, spectrum_beta;
 
+  // implementation-plan-8.md §4.4/§5.4: each adaptive picker mode's own
+  // per-rung diagnostic overlay -- kappa with its Gaussian/structured rails
+  // for CT_PICK_STRUCTURE (§5.1, Phase 4), p90/p99 concentration with its
+  // noise baseline for CT_PICK_PERCENTILE (§5.2, Phase 5) -- drawn on the
+  // same rung axis as spectrum_energy above so a pick is legible instead of
+  // magic. Populated by Phase 4/5's own _mode_shape case; unused while
+  // picker_mode == CT_PICK_FIXED, which draws no extra overlay at all.
+  double mode_overlay[CT_MAX_BANDS];
+  int mode_overlay_n;
+
   // a pick that landed while g->pd was stale (DT_SIGNAL_CONTROL_PICKERDATA_READY
   // is dispatched async -- see color_picker_apply -- so the GUI thread can
   // observe g->pd a preview pass behind the pipe it just raced). Retried by
@@ -3916,6 +3926,13 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     fit_tau = g->spectrum_tau;
     fit_beta = g->spectrum_beta;
   }
+  // implementation-plan-8.md §4.4/§5.4 Phase 2.3: each adaptive mode's own
+  // diagnostic, guarded the same way spectrum_* above is. Empty this phase
+  // (nothing populates it before Phase 4/5) and for CT_PICK_FIXED forever --
+  // the switch below is scaffolding for Phase 4/5 to fill in one case each.
+  const int mode_overlay_n = g->mode_overlay_n;
+  double mode_overlay[CT_MAX_BANDS];
+  if(mode_overlay_n > 0) memcpy(mode_overlay, g->mode_overlay, sizeof(double) * mode_overlay_n);
   const double roi_long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
   dt_iop_gui_leave_critical_section(self);
 
@@ -3992,6 +4009,29 @@ static void _draw_spectrum_overlay(cairo_t *cr, dt_iop_module_t *self,
     }
     cairo_stroke(cr);
     cairo_set_dash(cr, NULL, 0, 0.0);
+  }
+
+  // implementation-plan-8.md §4.4/§5.4 Phase 2.3: each adaptive mode draws
+  // its own observable on top of the measured/fitted curves above, once
+  // Phase 4/5 populate mode_overlay[]/mode_overlay_n. CT_PICK_FIXED draws
+  // nothing extra -- the default curve needs no additional diagnostic.
+  if(mode_overlay_n > 0)
+  {
+    const _ct_picker_mode_t picker_mode = (_ct_picker_mode_t)dt_bauhaus_combobox_get(g->picker_mode);
+    switch(picker_mode)
+    {
+      case CT_PICK_STRUCTURE:
+        // Phase 4.2: kappa per rung, with the CT_KAPPA_GAUSSIAN and
+        // CT_KAPPA_STRUCT rails.
+        break;
+      case CT_PICK_PERCENTILE:
+        // Phase 5.2: q_r per rung against the frame-wide q_r and the noise
+        // baseline.
+        break;
+      case CT_PICK_FIXED:
+      default:
+        break;
+    }
   }
 
   cairo_restore(cr);
