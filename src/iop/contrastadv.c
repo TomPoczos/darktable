@@ -1098,9 +1098,9 @@ typedef enum _ct_target_mode_t
 // want to keep reaching for.
 typedef enum _ct_picker_mode_t
 {
-  CT_PICK_FIXED      = 0,   // writes the default curve, same as every picker_mode.c-era pick
-  CT_PICK_STRUCTURE  = 1,   // §5.1: not implemented until plan-8 Phase 4 -- falls back to CT_PICK_FIXED
-  CT_PICK_PERCENTILE = 2,   // §5.2: not implemented until plan-8 Phase 5 -- falls back to CT_PICK_FIXED
+  CT_PICK_FIXED      = 0,   // writes the default curve, same as every pre-plan-8 pick
+  CT_PICK_STRUCTURE  = 1,   // §5.1: box-wide L2/L1 sparseness per rung, _ct_structure_shape
+  CT_PICK_PERCENTILE = 2,   // §5.2: p90/p99 block-RMS concentration per rung, _ct_percentile_shape
 } _ct_picker_mode_t;
 
 #define CT_PICKER_MODE_CONF "plugins/darkroom/contrastadv/picker_mode"
@@ -5432,13 +5432,12 @@ void gui_init(dt_iop_module_t *self)
        "  that you might still want on its own.\n"
        "structured detail -- boosts the bands whose energy in the picked area\n"
        "  is concentrated in edges and lines rather than spread out like\n"
-       "  texture or noise. declines on a uniformly textured pick.\n"
+       "  texture or noise. declines only on a pick that reads as noise\n"
+       "  at every size.\n"
        "local contrast levels -- boosts the bands whose local contrast is\n"
        "  spatially uneven across the picked area, usually leaning toward\n"
        "  the finer end on real content. declines where local contrast is\n"
-       "  already even at every size.\n"
-       "(structured detail and local contrast levels are not implemented yet\n"
-       "and currently behave like fixed curve.)"));
+       "  as even as noise at every size."));
   g_signal_connect(G_OBJECT(g->picker_mode), "value-changed", G_CALLBACK(_picker_mode_callback), self);
 
   g->scale_shift = dt_color_picker_new(self, DT_COLOR_PICKER_AREA,
