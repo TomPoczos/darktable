@@ -2255,11 +2255,16 @@ void commit_params(dt_iop_module_t *self,
 // _area_draw expose, the one place in this file that used to set a tooltip
 // from inside a draw handler (atrous.c/colorequal.c/toneequal.c all set
 // theirs once in gui_init).
-static void _area_set_tooltip(dt_iop_contrast_gui_data_t *g)
+static void _area_set_tooltip(dt_iop_module_t *self)
 {
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
+  const int nbands = g->nbands;
+  dt_iop_gui_leave_critical_section(self);
+
   gtk_widget_set_tooltip_text
     (GTK_WIDGET(g->area),
-     g->nbands < CT_BANDS
+     nbands < CT_BANDS
      ? _("drag a node to set its band's gain; double-click to reset it;\n"
          "ctrl+click to visualize that band's own detail texture;\n"
          "middle-click for the plain slider list.\n"
@@ -2295,7 +2300,7 @@ static void _ui_pipe_done(gpointer instance, dt_iop_module_t *self)
   dt_iop_contrast_gui_data_t *g = self->gui_data;
   if(g && !DT_IN_GUI_UPDATE() && self->enabled && self->expanded)
   {
-    _area_set_tooltip(g);
+    _area_set_tooltip(self);
     gtk_widget_queue_draw(GTK_WIDGET(g->area));
   }
 }
@@ -4288,9 +4293,12 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
 
   // 2. unresolvable-band shading -- bands beyond g->nbands (§1.5) don't
   // survive the current pipe scale and have no effect
-  if(g->nbands < CT_BANDS)
+  dt_iop_gui_enter_critical_section(self);
+  const int nbands = g->nbands;
+  dt_iop_gui_leave_critical_section(self);
+  if(nbands < CT_BANDS)
   {
-    const float x0 = _graph_raw_to_x((double)g->nbands / (double)CT_BANDS, &axis) * width;
+    const float x0 = _graph_raw_to_x((double)nbands / (double)CT_BANDS, &axis) * width;
     cairo_set_source_rgba(cr, darktable.bauhaus->graph_border.red,
                              darktable.bauhaus->graph_border.green,
                              darktable.bauhaus->graph_border.blue, 0.4);
@@ -4836,7 +4844,7 @@ void gui_init(dt_iop_module_t *self)
   dt_gui_connect_motion(g->area, _area_motion, _area_motion, _area_leave, self);
   dt_gui_connect_scroll(g->area, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
                                | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE, _area_scrolled, self);
-  _area_set_tooltip(g);  // §6.3: initial state, until the first _ui_pipe_done updates it
+  _area_set_tooltip(self);  // §6.3: initial state, until the first _ui_pipe_done updates it
 
   // one slider per band, labeled by the node's nominal size -- computed
   // rather than nine near-identical translated strings, per
