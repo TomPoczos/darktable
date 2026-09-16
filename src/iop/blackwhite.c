@@ -1227,6 +1227,14 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
     gtk_widget_queue_draw(g->swatch);
 }
 
+// the bound widgets are synced by the framework before this is called; what
+// it has to do is bring the filter section's visibility and the swatch in
+// line with them, which nothing else does when params change under the GUI
+void gui_update(dt_iop_module_t *self)
+{
+  gui_changed(self, NULL, NULL);
+}
+
 void gui_init(dt_iop_module_t *self)
 {
   dt_iop_blackwhite_gui_data_t *g = IOP_GUI_ALLOC(blackwhite);
