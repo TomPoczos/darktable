@@ -150,9 +150,8 @@ const char **description(dt_iop_module_t *self)
      _("linear, RGB, scene-referred"));
 }
 
-// classic Wratten-style B&W lens filters, approximated as (hue, chroma) pairs in
-// our R=0°/G=120°/B=240° mixing model. not extracted from any LUT/spectral data --
-// just the well-known real-world color/strength of each filter.
+// classic Wratten B&W lens filters as (hue, chroma) pairs in our
+// R=0°/G=120°/B=240° mixing model
 typedef struct _bw_filter_preset_t
 {
   const char *name;
@@ -160,11 +159,9 @@ typedef struct _bw_filter_preset_t
   float chroma;
 } _bw_filter_preset_t;
 
-// hue/chroma fitted (least-squares harmonic projection of the real Kodak B-3
-// spectral transmission data through CIE1931/D65/sRGB, exactly as computed by
-// compute_channel_multipliers() in the reference generator at
-// ~/Pictures/LUTs/wratten filters/filters.py) onto our grey[c] = 1/3 +
-// chroma*cos(hue - hue_c) model -- not hand-guessed.
+// hue/chroma fitted by least-squares harmonic projection of the Kodak B-3
+// spectral transmission data, integrated through CIE 1931 / D65 / sRGB, onto
+// our grey[c] = 1/3 + chroma*cos(hue - hue_c) model: not hand-guessed.
 //
 // the fit was made in sRGB primaries, which is precisely what this module's
 // reference space is (see _work_to_reference()), so these numbers are always
