@@ -88,11 +88,14 @@ typedef struct dt_iop_blackwhite_gui_data_t
 
   // cross-thread hand-off for the area pickers: color_picker_apply() records
   // what the picked area is meant to drive and flips auto_state to 1;
-  // process() fills in auto_params and flips auto_state to 2 when it sees
-  // state 1 on the preview pipe; the preview-pipe-finished signal handler
-  // (GUI thread) then applies auto_params and resets state to 0. protected by
+  // process() measures on a copy when it sees state 1 on the preview pipe and
+  // writes the result back as state 2, but only if auto_request still names
+  // the pick it answered, so a drag made meanwhile is never overwritten by a
+  // stale result; the preview-pipe-finished signal handler (GUI thread) then
+  // applies auto_params and resets state to 0. every access is under
   // dt_iop_gui_enter/leave_critical_section.
   int auto_state; // 0: idle, 1: computation requested, 2: result ready to apply
+  unsigned auto_request; // bumped by every pick
   _bw_auto_mode_t auto_mode;
   dt_iop_blackwhite_params_t auto_params;
 } dt_iop_blackwhite_gui_data_t;
@@ -858,16 +861,15 @@ static void _auto_chroma_contrast(dt_iop_blackwhite_params_t *const dp,
   dp->detail_radius = (float)CLAMP(1.5 * 100.0 * len / diag, 0.05, 10.0);
 }
 
-// analyze the area one of the pickers was dragged over and hand the settings
-// it is responsible for back to the GUI thread.
+// analyze the area one of the pickers was dragged over and write the settings
+// it is responsible for into dp.
 //
 // mode decides what gets written: the picker on the color filter toggle sets
 // the filter alone, the one on the chroma contrast slider sets that pair
 // alone, and the combined picker at the top of the module sets everything.
-// whatever is not in mode keeps the value color_picker_apply() seeded
-// auto_params with, i.e. is left exactly as the user had it.
-static void _auto_compute(dt_iop_module_t *self,
-                          dt_iop_blackwhite_gui_data_t *g,
+// whatever is not in mode keeps the value color_picker_apply() seeded dp
+// with, i.e. is left exactly as the user had it.
+static void _auto_compute(dt_iop_blackwhite_params_t *const dp,
                           const _bw_region_t *const region,
                           const _bw_auto_mode_t mode,
                           const dt_iop_order_iccprofile_info_t *const work_profile)
@@ -881,8 +883,6 @@ static void _auto_compute(dt_iop_module_t *self,
   _bw_moments_t m;
   _region_moments(region, M, &m);
 
-  dt_iop_blackwhite_params_t *dp = &g->auto_params;
-
   // unlike the rest this isn't derived from image content -- there's no
   // per-image "optimal" amount of human vision weighting, it's simply never
   // worse than a flat R/G/B average, so the combined picker always turns it
@@ -892,10 +892,6 @@ static void _auto_compute(dt_iop_module_t *self,
   // filter, so a combined pick has to settle the filter first.
   if(mode & BW_AUTO_FILTER) _auto_filter(dp, &m);
   if(mode & BW_AUTO_CHROMA_CONTRAST) _auto_chroma_contrast(dp, &m, region, M);
-
-  dt_iop_gui_enter_critical_section(self);
-  g->auto_state = 2;
-  dt_iop_gui_leave_critical_section(self);
 }
 
 void process(dt_iop_module_t *self,
@@ -933,7 +929,9 @@ void process(dt_iop_module_t *self,
     {
       dt_iop_gui_enter_critical_section(self);
       const int auto_state = g->auto_state;
+      const unsigned auto_request = g->auto_request;
       const _bw_auto_mode_t auto_mode = g->auto_mode;
+      dt_iop_blackwhite_params_t auto_params = g->auto_params;
       dt_iop_gui_leave_critical_section(self);
 
       if(auto_state == 1)
@@ -962,7 +960,18 @@ void process(dt_iop_module_t *self,
           region.height = box[3] - box[1];
         }
 
-        _auto_compute(self, g, &region, auto_mode, work_profile);
+        _auto_compute(&auto_params, &region, auto_mode, work_profile);
+
+        // a newer pick has re-seeded auto_params and asked for a preview run
+        // of its own, and losing focus withdraws the request altogether; in
+        // both cases this result is for nobody
+        dt_iop_gui_enter_critical_section(self);
+        if(g->auto_state == 1 && g->auto_request == auto_request)
+        {
+          g->auto_params = auto_params;
+          g->auto_state = 2;
+        }
+        dt_iop_gui_leave_critical_section(self);
       }
     }
   }
@@ -1200,6 +1209,7 @@ void color_picker_apply(dt_iop_module_t *self,
   // what this particular picker derives, and leaves the rest untouched
   g->auto_params = *(const dt_iop_blackwhite_params_t *)self->params;
   g->auto_mode = mode;
+  g->auto_request++;
   g->auto_state = 1;
   dt_iop_gui_leave_critical_section(self);
 
@@ -1208,7 +1218,16 @@ void color_picker_apply(dt_iop_module_t *self,
 
 void gui_focus(dt_iop_module_t *self, gboolean in)
 {
-  if(!in) dt_iop_color_picker_reset(self, TRUE);
+  if(in) return;
+
+  dt_iop_color_picker_reset(self, TRUE);
+
+  // the picker that asked for a measurement has just been switched off, and
+  // on an image switch the result would land in the wrong image's history
+  dt_iop_blackwhite_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
+  g->auto_state = 0;
+  dt_iop_gui_leave_critical_section(self);
 }
 
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
@@ -1240,6 +1259,7 @@ void gui_init(dt_iop_module_t *self)
   dt_iop_blackwhite_gui_data_t *g = IOP_GUI_ALLOC(blackwhite);
 
   g->auto_state = 0;
+  g->auto_request = 0;
   g->auto_mode = BW_AUTO_NONE;
 
   // self->widget is lazily created as a vbox by the first dt_bauhaus_*_from_params
