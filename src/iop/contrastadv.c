@@ -704,6 +704,66 @@ static void _fit_spectrum_at_beta(const double beta,
   }
 }
 
+// the grid search itself: every beta on the coarse grid, then the
+// refinement pass below, over the texture sizes [lo, lo * 2^octaves]. Both
+// `_fit_spectrum` and `_fit_beyond_window` run exactly this, on different
+// tau ranges, so the two residuals they hand `_mode_shape` are comparable.
+// Returns the winning residual, DBL_MAX if every one came out NaN.
+static double _fit_spectrum_search(const double *const restrict s,
+                                   const double *const restrict energy,
+                                   const double *const restrict weight,
+                                   const int n,
+                                   const double peak_e,
+                                   const double lo,
+                                   const double octaves,
+                                   const gboolean fix_noise,
+                                   const double noise_prior,
+                                   const gboolean *const restrict init_active,
+                                   _ct_fit_t *const restrict best)
+{
+  const int tau_steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * octaves), 1);
+
+  double best_residual = DBL_MAX;
+
+  const double beta_step = (CT_FIT_BETA_MAX - CT_FIT_BETA_MIN) / (double)CT_FIT_BETA_STEPS;
+
+  for(int bi = 0; bi <= CT_FIT_BETA_STEPS; bi++)
+  {
+    const double beta = CT_FIT_BETA_MIN + (double)bi * beta_step;
+    _fit_spectrum_at_beta(beta, s, energy, weight, n, peak_e, lo, tau_steps, fix_noise, noise_prior,
+                           init_active, &best_residual, best);
+  }
+
+  // implementation-plan-3.md §2: the coarse grid's own step is 0.2167 --
+  // wider than implementation-plan.md §2's 0.2 acceptance tolerance on beta,
+  // and wide enough that the fit cannot land on a real slope and buys the
+  // shortfall with a texture term that isn't there: on an exact power law at
+  // beta = 2.4 the coarse grid returns 2.483 plus an A large enough to push
+  // texture_peak past the 1% of peak_e that decides whether a pick reports
+  // a sized texture (_mode_shape's found_texture).
+  // One refinement pass over the winner's +-1 coarse step, at 8 sub-steps,
+  // takes beta to 0.027 resolution: it recovers 2.402 with texture_peak
+  // an order of magnitude *below* the threshold, at every box size, and
+  // changes nothing where a real bump exists (sigma_t and A unchanged to
+  // three digits). implementation-plan-4.md §7.5: the refinement loop below
+  // is -8..8, 17 evaluations, so 30 beta evaluations against 13, about 2.3x
+  // the search; a flat dense grid would be 4x for the same answer. (The
+  // *resolution* claim above, beta_step/8 = 0.027, is unchanged.)
+  if(best_residual < DBL_MAX)
+  {
+    const double coarse_beta = best->beta;
+    for(int ri = -8; ri <= 8; ri++)
+    {
+      const double beta = coarse_beta + beta_step * (double)ri / 8.0;
+      if(beta < CT_FIT_BETA_MIN || beta > CT_FIT_BETA_MAX) continue;
+      _fit_spectrum_at_beta(beta, s, energy, weight, n, peak_e, lo, tau_steps, fix_noise, noise_prior,
+                             init_active, &best_residual, best);
+    }
+  }
+
+  return best_residual;
+}
+
 // fit the model to one box's per-rung (sigma, energy, weight) triples.
 // noise_prior >= 0 fixes N to that value instead of fitting it (research.md
 // §5.5: "prefer fixing N from the block-minimum noise estimate... stabilizes
@@ -754,46 +814,10 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   // far as the rising flank alone can honestly be pushed.
   const double lo = sigma[0] * 0.5;
   const double hi = sigma[n - 1];
-  const int tau_steps = MAX((int)(CT_FIT_STEPS_PER_OCTAVE * log2(hi / lo)), 1);
 
-  double best_residual = DBL_MAX;
   _ct_fit_t best = { 0 };
-
-  const double beta_step = (CT_FIT_BETA_MAX - CT_FIT_BETA_MIN) / (double)CT_FIT_BETA_STEPS;
-
-  for(int bi = 0; bi <= CT_FIT_BETA_STEPS; bi++)
-  {
-    const double beta = CT_FIT_BETA_MIN + (double)bi * beta_step;
-    _fit_spectrum_at_beta(beta, s, energy, weight, n, peak_e, lo, tau_steps, fix_noise, noise_prior,
-                           init_active, &best_residual, &best);
-  }
-
-  // implementation-plan-3.md §2: the coarse grid's own step is 0.2167 --
-  // wider than implementation-plan.md §2's 0.2 acceptance tolerance on beta,
-  // and wide enough that the fit cannot land on a real slope and buys the
-  // shortfall with a texture term that isn't there: on an exact power law at
-  // beta = 2.4 the coarse grid returns 2.483 plus an A large enough to push
-  // texture_peak past the 1% of peak_e that decides whether a pick reports
-  // a sized texture (_mode_shape's found_texture).
-  // One refinement pass over the winner's +-1 coarse step, at 8 sub-steps,
-  // takes beta to 0.027 resolution: it recovers 2.402 with texture_peak
-  // an order of magnitude *below* the threshold, at every box size, and
-  // changes nothing where a real bump exists (sigma_t and A unchanged to
-  // three digits). implementation-plan-4.md §7.5: the refinement loop below
-  // is -8..8, 17 evaluations, so 30 beta evaluations against 13, about 2.3x
-  // the search; a flat dense grid would be 4x for the same answer. (The
-  // *resolution* claim above, beta_step/8 = 0.027, is unchanged.)
-  if(best_residual < DBL_MAX)
-  {
-    const double coarse_beta = best.beta;
-    for(int ri = -8; ri <= 8; ri++)
-    {
-      const double beta = coarse_beta + beta_step * (double)ri / 8.0;
-      if(beta < CT_FIT_BETA_MIN || beta > CT_FIT_BETA_MAX) continue;
-      _fit_spectrum_at_beta(beta, s, energy, weight, n, peak_e, lo, tau_steps, fix_noise, noise_prior,
-                             init_active, &best_residual, &best);
-    }
-  }
+  const double best_residual = _fit_spectrum_search(s, energy, weight, n, peak_e, lo, log2(hi / lo),
+                                                    fix_noise, noise_prior, init_active, &best);
 
   // unreachable unless every residual came out NaN (NaN energies), but a
   // refusal must still say why
@@ -804,6 +828,52 @@ static gboolean _fit_spectrum(const double *const restrict sigma,
   }
   *fit = best;
   return TRUE;
+}
+
+// how far past the window's coarse edge `_fit_beyond_window` looks. Inside
+// the window a hump that far out is indistinguishable from its own s^2
+// flank, so more octaves would only re-fit the same curve.
+#define CT_BEYOND_OCTAVES 3.0
+// implementation-plan-3.md §7's advisory, as a model comparison: the fit's
+// residual is sum(w * dlogE^2) with w the inverse variance the fit's own
+// error model assigns each rung (CT_MODEL_ERROR plus sampling), so the
+// difference between two members of the same model family is a chi-square
+// distance. Under 1.0 the size beyond the window sits inside the 1-sigma
+// profile-likelihood interval of the fitted one: the box's rungs do not
+// tell the two apart, and the reported size is the grid's choice, not a
+// measurement. plan-8-evidence/02-fine-edge-advisory.txt: the synthetic
+// collapse the advisory was written for (a 45.7 px hump seen through a
+// 100/150 px box) lands at or below 0 here, a fur pick anywhere on the dog
+// frame at 1.3 or more, and the rate it fires at falls with box size
+// (23% of 150 px boxes, 8% of whole frames) the way a "too small" test
+// should, where the position test it replaces fired on over 40% of every
+// size.
+#define CT_BEYOND_DCHI2 1.0
+
+// the same search as `_fit_spectrum`, restricted to textures larger than
+// the box could contain: tau from the coarsest rung out to CT_BEYOND_OCTAVES
+// past it. Returns that alternative's residual, in the same units as
+// fit->residual, so the caller can ask whether the box distinguished the
+// two -- see CT_BEYOND_DCHI2. The refusals `_fit_spectrum` applies were
+// already applied to the same rungs, so none are repeated here.
+static double _fit_beyond_window(const double *const restrict sigma,
+                                 const double *const restrict energy,
+                                 const double *const restrict weight,
+                                 const int n,
+                                 const double noise_prior)
+{
+  double peak_e = 0.0;
+  for(int i = 0; i < n; i++) peak_e = fmax(peak_e, energy[i]);
+
+  double s[CT_MAX_BANDS];
+  for(int i = 0; i < n; i++) s[i] = sigma[i] * sigma[i];
+
+  const gboolean fix_noise = noise_prior >= 0.0;
+  const gboolean init_active[3] = { !fix_noise, TRUE, TRUE };
+
+  _ct_fit_t beyond = { 0 };
+  return _fit_spectrum_search(s, energy, weight, n, peak_e, sigma[n - 1], CT_BEYOND_OCTAVES,
+                              fix_noise, noise_prior, init_active, &beyond);
 }
 
 // §2.5/research.md §5.6: S(sigma) = A*G(sigma;tau) + C*sigma^(beta-2) (real
@@ -2969,7 +3039,6 @@ typedef struct _ct_box_stats_t
   double noise_prior;
   double peak_e;
   double ladder_lambda0;      // §6.1: finest rung's own wavelength
-  double window_lambda_max;   // §7: the window's own achievable span
 } _ct_box_stats_t;
 
 // §2.2: query the ladder's published SAT tables for the box the picker
@@ -3021,7 +3090,6 @@ static gboolean _measure_box(dt_iop_module_t *self, const int *const box,
     const double box_w = (double)(bx1 - bx0) * CT_BLOCK;
     const double box_h = (double)(by1 - by0) * CT_BLOCK;
     const double lambda_max = fmin(box_w, box_h);
-    stats->window_lambda_max = lambda_max;
     // §6.1: the ladder's own finest rung, independent of the window above --
     // needed even when the box is too small to keep a single rung, to quote
     // the smallest box that would have worked.
@@ -3512,17 +3580,19 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
 
     // implementation-plan-3.md §7 (Issue 2d): the mirror-image failure --
     // the box is too small to *contain* the feature, so the fit can't place
-    // any peak inside what it measured and instead collapses tau toward the
-    // ladder's finest rung, railing beta high to explain the rest. A
-    // full-octave margin catches this without false-positiving on a
-    // legitimate fine-texture pick -- see findings.md for the sweep this
-    // threshold came from.
-    if(target_sigma <= stats->sigma[0] * 2.0)
-    {
-      const double min_side = 2.0 * stats->window_lambda_max;
-      dt_control_log(_("the box is too small to see how big this is -- "
-                        "try at least %.0f x %.0f px"), min_side, min_side);
-    }
+    // any peak inside what it measured and instead explains the rising
+    // flank with a steep beta plus a small hump at the fine end. That
+    // shipped as a test on where the hump landed (within an octave of the
+    // finest rung), which is also where every genuinely fine texture lands
+    // at preview scale: fur, grass and skin all put tau at the fine rail
+    // whatever the box size, so the test fired on over 40% of picks of
+    // every size, whole frames included. Ask the question directly instead --
+    // would a texture larger than the box explain these rungs just as well?
+    // -- and only when §6.2 above has not already said so.
+    else if(_fit_beyond_window(stats->sigma, stats->energies, stats->weights, stats->nrungs,
+                               stats->noise_prior) - fit->residual <= CT_BEYOND_DCHI2)
+      dt_control_log(_("the box is too small to tell how big this is -- "
+                        "try one about twice as wide and tall"));
 
     int nearest = 0;
     double best_d = DBL_MAX;
