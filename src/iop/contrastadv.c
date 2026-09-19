@@ -4154,15 +4154,36 @@ static void show_details_callback(GtkWidget *togglebutton, dt_iop_module_t *self
   _apply_details_display(self, mode);
 }
 
-// implementation-plan-8.md §4.1: writes the picker-mode preference to conf
-// -- a GUI setting, not a param, so this is the combobox's only side
-// effect: no dt_dev_add_history_item, no dirty flag, no pipe reprocess. The
-// next pick (color_picker_apply) reads the combobox itself when it needs
-// the mode, so there is nothing else to keep in sync here.
+// implementation-plan-8.md §4.1: writes the picker-mode preference to conf,
+// a GUI setting rather than a param. If the picker is currently armed on
+// this module's own box (g->scale_shift) and already has a measurement to
+// show for it, re-fit against that same box right away instead of leaving
+// the curve at the old mode's shape until the user drags a new one --
+// _color_picker_apply_now re-reads both the box (off the color picker's own
+// sample) and the mode (off this combobox) fresh each time, so re-running it
+// is the whole fix; there is no separate "area" to carry over by hand.
 static void _picker_mode_callback(GtkWidget *combo, dt_iop_module_t *self)
 {
   DT_GUARD_GUI_UPDATE();
   dt_conf_set_int(CT_PICKER_MODE_CONF, dt_bauhaus_combobox_get(combo));
+
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(!g || !g->spectrum_valid) return;
+
+  const dt_iop_color_picker_t *const picker = darktable.lib->proxy.colorpicker.picker_proxy;
+  if(!picker || picker->module != self || picker->colorpick != g->scale_shift) return;
+
+  if(!dt_preview_data_is_fresh(&g->pd))
+  {
+    // same race as color_picker_apply's own wait -- see its comment. The
+    // pending flag is enough: _preview_pipe_finished_retry_pick will pick
+    // this up off the next finished preview pass.
+    g->pick_pending = TRUE;
+    dt_dev_reprocess_preview(self->dev, self->iop_order);
+    return;
+  }
+
+  _color_picker_apply_now(self, self->dev->preview_pipe);
 }
 
 // ---------------------------------------------------------------------------
