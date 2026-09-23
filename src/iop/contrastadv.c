@@ -3536,12 +3536,16 @@ static gboolean _ct_structure_shape(const _ct_box_stats_t *const stats,
 // percentile query reads `self->gui_data` directly and needs the original
 // pixel box, not anything `_ct_box_stats_t` keeps) -- CT_PICK_FIXED and
 // CT_PICK_STRUCTURE (kappa is already in `stats`) have no use for either.
+// `image_px_per_roi_px` is likewise CT_PICK_PERCENTILE-only, to report its
+// own too-small-box refusal in full image pixels rather than this preview
+// roi's own.
 static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
                             const _ct_picker_mode_t mode,
                             const _ct_box_stats_t *const stats,
                             const _ct_fit_t *const fit,
                             const double *const restrict sigma_grid, const int m,
                             const double sigma_ref, const float scale_shift,
+                            const double image_px_per_roi_px,
                             double *const restrict shape)
 {
   // implementation-plan-6.md §5B.2/§6 Phase 2.2: the picker's shape is not
@@ -3638,7 +3642,8 @@ static gboolean _mode_shape(dt_iop_module_t *self, const int *const box,
         // the fit's own refusal does.
         if(nmeasured == 0)
         {
-          const double min_side = CT_BLOCK * ceil(sqrt((double)CT_PERCENTILE_MIN_BLOCKS));
+          const double min_side =
+            ceil(CT_BLOCK * ceil(sqrt((double)CT_PERCENTILE_MIN_BLOCKS)) * image_px_per_roi_px);
           dt_control_log(_("the picked area is too small to measure local contrast levels from -- "
                             "try at least %.0f x %.0f px"), min_side, min_side);
         }
@@ -3909,6 +3914,14 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // band sigma below.
   const float long_edge = (float)(MAX(pipe->iwidth, pipe->iheight)) * (float)roi_in.scale;
 
+  // the refusal messages below quote a minimum box size in full-resolution
+  // image pixels, not this preview roi's own -- a preview-roi pixel is a
+  // mipmap pixel scaled by roi_in.scale, and a mipmap pixel is
+  // pipe->iscale of a full image pixel (pixelpipe_hb.h:72's "iscale*iwidth
+  // = actual width"), so going the other way multiplies by their ratio.
+  const double image_px_per_roi_px =
+    roi_in.scale > 0.0f ? (double)pipe->iscale / (double)roi_in.scale : 1.0;
+
   // region defaults to the whole frame; a box pick narrows it, same
   // fallback picked-region measurement always used.
   int box[4] = { 0, 0, (int)roi_in.width, (int)roi_in.height };
@@ -3943,10 +3956,11 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
     // user.
     if(refusal == CT_FIT_REFUSED_SPAN)
     {
-      // the smallest box that would work at the current preview scale is
-      // computable: CT_MIN_SPAN octaves' worth of the finest rung's own
-      // wavelength -- the loosest lower bound §1.1's window allows.
-      const double min_side = CT_MIN_SPAN * stats.ladder_lambda0;
+      // the smallest box that would work is computable: CT_MIN_SPAN octaves'
+      // worth of the finest rung's own wavelength -- the loosest lower bound
+      // §1.1's window allows, converted from this preview roi's pixels to
+      // the full image's own since that is the size the user can see.
+      const double min_side = ceil(CT_MIN_SPAN * stats.ladder_lambda0 * image_px_per_roi_px);
       dt_control_log(_("the picked area is too small to measure a detail size from -- "
                         "try at least %.0f x %.0f px"), min_side, min_side);
     }
@@ -4046,7 +4060,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   // effective strength regardless of what the master slider was set to
   // beforehand.
   if(!_mode_shape(self, box, picker_mode, &stats, &fit, sigma_grid, CT_PROJECT_GRID, sigma_ref,
-                  p->scale_shift, target))
+                  p->scale_shift, image_px_per_roi_px, target))
     return;  // Phase 4/5's all-zero case: the default curve is already applied, nothing to do
 
   // §3.1: how much of its own linear H_k each band actually delivered over
