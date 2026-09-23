@@ -290,6 +290,7 @@ typedef struct dt_iop_contrast_gui_data_t
   gboolean spectrum_valid;
   int spectrum_nrungs;
   double spectrum_lambda[CT_MAX_BANDS];
+  double spectrum_long_edge;  // the long_edge the rungs above were normalized to
 
   // a pick that landed while g->pd was stale (DT_SIGNAL_CONTROL_PICKERDATA_READY
   // is dispatched async -- see color_picker_apply -- so the GUI thread can
@@ -3964,6 +3965,7 @@ static void _color_picker_apply_now(dt_iop_module_t *self,
   dt_iop_gui_enter_critical_section(self);
   memcpy(g->spectrum_lambda, stats.lambda, sizeof(double) * stats.nrungs);
   g->spectrum_nrungs = stats.nrungs;
+  g->spectrum_long_edge = long_edge;
   g->spectrum_valid = TRUE;
   dt_iop_gui_leave_critical_section(self);
 
@@ -4416,7 +4418,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
     const gboolean have_pick_window = g->spectrum_valid && g->spectrum_nrungs > 0;
     const double pick_coarsest_lambda =
       have_pick_window ? g->spectrum_lambda[g->spectrum_nrungs - 1] : 0.0;
-    const double window_roi_long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
+    const double window_roi_long_edge = g->spectrum_long_edge;
     dt_iop_gui_leave_critical_section(self);
 
     if(have_pick_window)
@@ -4591,7 +4593,7 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   double window_lo_raw = 0.0, window_hi_raw = 0.0;  // coarsest .. finest measured, raw x
   if(have_pick_window)
   {
-    const double long_edge = MAX(g->ladder_roi_in.width, g->ladder_roi_in.height);
+    const double long_edge = g->spectrum_long_edge;
     window_lo_raw = _spectrum_lambda_to_raw_x(g->spectrum_lambda[g->spectrum_nrungs - 1], long_edge);
     window_hi_raw = _spectrum_lambda_to_raw_x(g->spectrum_lambda[0], long_edge);
   }
