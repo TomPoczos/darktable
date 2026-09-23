@@ -3438,6 +3438,20 @@
     <longdescription>height of contrast equalizer</longdescription>
   </dtconfig>
   <dtconfig>
+    <name>plugins/darkroom/contrastadv/graphheight</name>
+    <type min="100" max="300">int</type>
+    <default>200</default>
+    <shortdescription>height of the advanced contrast graph</shortdescription>
+    <longdescription>height of the advanced contrast graph</longdescription>
+  </dtconfig>
+  <dtconfig>
+    <name>plugins/darkroom/contrastadv/picker_mode</name>
+    <type min="0" max="2">int</type>
+    <default>0</default>
+    <shortdescription>advanced contrast area picker mode</shortdescription>
+    <longdescription>mode of the area picker in the advanced contrast module: fixed curve, structured detail or local contrast levels</longdescription>
+  </dtconfig>
+  <dtconfig>
     <name>plugins/darkroom/denoiseprofile/graphheight</name>
     <type min="100" max="300">int</type>
     <default>200</default>
