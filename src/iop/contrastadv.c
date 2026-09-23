@@ -4145,6 +4145,27 @@ static void _preview_pipe_finished_retry_pick(gpointer instance, dt_iop_module_t
   _color_picker_apply_now(self, self->dev->preview_pipe);
 }
 
+// the base instance's gui_data survives a darkroom image change (see
+// src/views/darkroom.c's own reload-defaults path), so without this the
+// graph would keep showing the previous image's pick-window shading and
+// extrapolated-node marks, and _picker_mode_callback would treat that
+// stale record as a measurement to re-fit. Connected to
+// DT_SIGNAL_DEVELOP_IMAGE_CHANGED in gui_init.
+static void _image_changed(gpointer instance, dt_iop_module_t *self)
+{
+  if(!self) return;
+  dt_iop_contrast_gui_data_t *g = self->gui_data;
+  if(!g) return;
+
+  dt_iop_gui_enter_critical_section(self);
+  g->spectrum_valid = FALSE;
+  g->spectrum_nrungs = 0;
+  dt_iop_gui_leave_critical_section(self);
+
+  g->pick_pending = FALSE;
+  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+}
+
 void gui_focus(dt_iop_module_t *self, gboolean in)
 {
   if(in) return;
@@ -4913,6 +4934,7 @@ void gui_init(dt_iop_module_t *self)
 
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_UI_PIPE_FINISHED, _ui_pipe_done);
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED, _preview_pipe_finished_retry_pick);
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_IMAGE_CHANGED, _image_changed);
 
   // Main container
   self->widget = dt_gui_vbox();
