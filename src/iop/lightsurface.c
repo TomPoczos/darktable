@@ -68,6 +68,8 @@ DT_MODULE_INTROSPECTION(1, dt_iop_lightsurface_params_t)
 #define LS_SAT_FULL 0.6f
 // light level, in EV above the key light, that the warning overlay flags
 #define LS_WARN_LAMBDA 1.0f
+// the total gain is clamped to this many EV, both directions (epic §M5)
+#define LS_MAX_GAIN_EV 8.0f
 // the log guide's floor, in EV below the median luminance (epic §M1.7)
 #define LS_GUIDE_FLOOR_EV 10.0f
 // percentile of log shading that defines the key light (epic §M1.3)
@@ -807,6 +809,171 @@ static void _light_full(const _ls_layer_t *const L, const float *const guide,
   _sample_lr(L, L->lambda_f, roi_in, piece, lambda_f);
 }
 
+/* --- the edits, epic §M3-§M5 --- */
+
+// every edit below is a delta built from terms that are each an exact zero at
+// default params (a product with a zero param, or a curve correction with zero
+// coefficients). a "new minus old" difference would not be: in float32,
+// lc + (lambda - lc) != lambda for about 2 % of inputs, so the module would
+// stop being an identity at defaults (epic §5)
+
+// secants and tangents of the node curve F, epic §M3.3. v must be sanitized
+// (_sanitize_nodes(), which commit_params() applies): only then are all the
+// secants at least LS_NODE_MIN_STEP and the curve defined
+static void _curve_tangents(const float v[LS_LIGHT_NODES],
+                            float m[LS_LIGHT_NODES])
+{
+  float sec[LS_LIGHT_NODES - 1];
+  for(int k = 0; k < LS_LIGHT_NODES - 1; k++)
+    sec[k] = 1.0f + v[k + 1] - v[k];
+
+  // the ends: slope 1, to meet the straight continuation, unless the end
+  // segment is too steep for that to stay monotone
+  m[0] = fminf(1.0f, 2.0f * sec[0]);
+  for(int k = 1; k < LS_LIGHT_NODES - 1; k++)
+    m[k] = 2.0f / (1.0f / sec[k - 1] + 1.0f / sec[k]);
+  m[LS_LIGHT_NODES - 1] = fminf(1.0f, 2.0f * sec[LS_LIGHT_NODES - 2]);
+}
+
+// C(x) = F(x) - x of epic §M3.3, computed directly rather than as F(x) - x:
+// the Hermite basis reproduces straight lines, so the line's share cancels
+// in the coefficients. nodes at x_i = -7 + i, m from _curve_tangents()
+static inline float _light_correction(const float x,
+                                      const float v[LS_LIGHT_NODES],
+                                      const float m[LS_LIGHT_NODES])
+{
+  // the segment, clamped to the node range; fmaxf() also sends NaN to 0
+  const float kf = fminf(fmaxf(floorf(x + 7.0f), 0.0f), (float)(LS_LIGHT_NODES - 2));
+  const int k = (int)kf;
+  const float t = x - (kf - 7.0f);
+  const float t2 = t * t;
+  const float t3 = t2 * t;
+  const float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+  const float h10 = t3 - 2.0f * t2 + t;
+  const float h01 = -2.0f * t3 + 3.0f * t2;
+  const float h11 = t3 - t2;
+  const float C = h00 * v[k] + h10 * (m[k] - 1.0f) + h01 * v[k + 1] + h11 * (m[k + 1] - 1.0f);
+
+  // outside the nodes F continues with slope 1
+  return x < -7.0f ? v[0] : (x > 1.0f ? v[LS_LIGHT_NODES - 1] : C);
+}
+
+// dL = a_1 + a_2 + a_3 of epic §M3. d is the committed data, so its nodes are
+// already sanitized, and m holds their tangents
+static inline float _light_delta(const float lambda,
+                                 const float lambda_c,
+                                 const float lambda_f,
+                                 const dt_iop_lightsurface_data_t *const d,
+                                 const float m[LS_LIGHT_NODES])
+{
+  // form and relief
+  const float a1 = d->form * lambda_c + d->relief * lambda_f;
+  const float lambda1 = lambda + a1;
+  // the node curve
+  const float a2 = _light_correction(lambda1, d->light_node, m);
+  const float lambda2 = lambda1 + a2;
+  // fill: log2((2^lambda2 + phi) / (1 + phi)) - lambda2, written so that it is
+  // exactly 0 at phi = 0. the fminf() only keeps exp2f() finite
+  const float phi = d->fill;
+  const float a3 = log2f(1.0f + phi * exp2f(fminf(-lambda2, 100.0f))) - log2f(1.0f + phi);
+  return a1 + a2 + a3;
+}
+
+// H(h) of epic §M4.3: the periodic Catmull-Rom spline through (45 j, q_j)
+static inline float _hue_curve(const float h_deg, const float q[LS_HUE_NODES])
+{
+  float hw = fmodf(h_deg, 360.0f);
+  if(hw < 0.0f) hw += 360.0f;
+  // a tiny negative h wraps to exactly 360
+  if(hw >= 360.0f) hw -= 360.0f;
+  // fmaxf() sends NaN to segment 0
+  const float jf = fminf(fmaxf(floorf(hw / 45.0f), 0.0f), (float)(LS_HUE_NODES - 1));
+  const int j = (int)jf;
+  const float t = (hw - 45.0f * jf) / 45.0f;
+
+  const float p0 = q[(j + LS_HUE_NODES - 1) % LS_HUE_NODES];
+  const float p1 = q[j];
+  const float p2 = q[(j + 1) % LS_HUE_NODES];
+  const float p3 = q[(j + 2) % LS_HUE_NODES];
+  const float t2 = t * t;
+  const float t3 = t2 * t;
+  return 0.5f * (2.0f * p1 + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2
+                 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
+// dS_lr of epic §M4.4 for one low-res pixel: sc (rho - rho_ref) is a product
+// with the param, not an edited rho minus the old one
+static inline float _surface_delta(const float Y,
+                                   const float rho,
+                                   const float rho_ref,
+                                   const float sc,
+                                   const float h_deg,
+                                   const float s,
+                                   const float q[LS_HUE_NODES])
+{
+  if(Y <= LS_EPS) return 0.0f;
+  const float w_c = fminf(1.0f, s / LS_SAT_FULL);
+  return sc * (rho - rho_ref) + w_c * _hue_curve(h_deg, q);
+}
+
+// the total gain in EV, epic §M5: clamped first, so an infinite delta keeps
+// its sign at the clamp, and only a NaN is rejected
+static inline float _gain(const float dL, const float dS)
+{
+  const float x = dL + dS;
+  // comparisons rather than fminf()/fmaxf(), which would turn a NaN into a bound
+  const float g = x > LS_MAX_GAIN_EV ? LS_MAX_GAIN_EV : (x < -LS_MAX_GAIN_EV ? -LS_MAX_GAIN_EV : x);
+  return dt_isfinite(g) ? g : 0.0f;
+}
+
+// all 21 float params zero (-0.0f included): the edits are an identity
+static gboolean _params_are_zero(const dt_iop_lightsurface_data_t *const d)
+{
+  if(d->form != 0.0f || d->relief != 0.0f || d->fill != 0.0f || d->surface_contrast != 0.0f)
+    return FALSE;
+  for(int i = 0; i < LS_LIGHT_NODES; i++)
+    if(d->light_node[i] != 0.0f) return FALSE;
+  for(int j = 0; j < LS_HUE_NODES; j++)
+    if(d->surface_hue[j] != 0.0f) return FALSE;
+  return TRUE;
+}
+
+// some surface param is non-zero, so dS has to be computed (epic §M2.5)
+static gboolean _surface_active(const dt_iop_lightsurface_data_t *const d)
+{
+  if(d->surface_contrast != 0.0f) return TRUE;
+  for(int j = 0; j < LS_HUE_NODES; j++)
+    if(d->surface_hue[j] != 0.0f) return TRUE;
+  return FALSE;
+}
+
+// out = in * 2^g per pixel, epic §M5; alpha passes through. dS may be NULL,
+// meaning 0 everywhere. at default data every term is an exact zero, so this
+// returns the input bit for bit
+static void _apply_gain(const float *const restrict in,
+                        float *const restrict out,
+                        const float *const restrict lambda,
+                        const float *const restrict lambda_f,
+                        const float *const restrict dS,
+                        const size_t npix,
+                        const dt_iop_lightsurface_data_t *const d,
+                        const float m[LS_LIGHT_NODES])
+{
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npix; k++)
+  {
+    const float lam = lambda[k];
+    const float lf = lambda_f[k];
+    // §M2.4; lambda_c only meets form, which zeroes it at form = 0
+    const float lc = lam - lf;
+    const float dL = _light_delta(lam, lc, lf, d, m);
+    const float e = exp2f(_gain(dL, dS ? dS[k] : 0.0f));
+    for_three_channels(c)
+      out[4 * k + c] = in[4 * k + c] * e;
+    out[4 * k + 3] = in[4 * k + 3];
+  }
+}
+
 /* --- which pipe does what (LS-07 Part C) --- */
 
 // the ROI covers the whole image: this pipe can compute a layer itself.
@@ -1036,29 +1203,61 @@ void process(dt_iop_module_t *self,
   const float *const in = (const float *)ivoid;
   float *const out = (float *)ovoid;
 
-  // the output is an identity until the light and surface math lands (LS-08)
-  dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
-
 #ifdef HAVE_AI
   // the module does not change the ROI, so in, out and the §M2 buffers share it
   assert(roi_in->width == roi_out->width && roi_in->height == roi_out->height);
 
-  _ls_layer_t *L = _layer_for_pipe(self, piece, in, roi_in);
-  if(!L) return;
+  const dt_iop_lightsurface_data_t *const d = piece->data;
+
+  // fast path, for speed only: at zero params the math below is an exact
+  // identity as well (epic §M5). the gui preview still computes the layer,
+  // which the light graph needs as soon as the module is enabled
+  const gboolean zero = _params_are_zero(d);
+  const gboolean gui_preview = self->dev->gui_attached && self->gui_data
+    && dt_pipe_is_preview(piece->pipe);
+  _ls_layer_t *L = zero && !gui_preview ? NULL : _layer_for_pipe(self, piece, in, roi_in);
+  if(!L || zero)
+  {
+    dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
+    _layer_unref(L);
+    return;
+  }
 
   const size_t npix = (size_t)roi_in->width * roi_in->height;
+  const size_t nlr = (size_t)L->w * L->h;
+  const gboolean surface = _surface_active(d);
   float *const guide = dt_alloc_align_float(npix * 4);
   float *const lambda = dt_alloc_align_float(npix);
   float *const lambda_f = dt_alloc_align_float(npix);
-  if(guide && lambda && lambda_f)
+  // the layer is immutable and shared, so dS_lr belongs to this call
+  float *const dS_lr = surface ? dt_alloc_align_float(nlr) : NULL;
+  float *const dS = surface ? dt_alloc_align_float(npix) : NULL;
+  if(guide && lambda && lambda_f && (!surface || (dS_lr && dS)))
   {
     _log_guide(in, npix, L->y_floor, guide);
     _light_full(L, guide, roi_in, piece, lambda, lambda_f);
+
+    // surface edits are resolved at the layer's resolution, then brought to
+    // the ROI like lambda (epic §M4, §M2.5)
+    if(surface)
+    {
+      DT_OMP_FOR()
+      for(size_t i = 0; i < nlr; i++)
+        dS_lr[i] = _surface_delta(L->Y[i], L->rho[i], L->rho_ref, d->surface_contrast,
+                                  L->hue[i], L->sat[i], d->surface_hue);
+      _sample_refine(L, dS_lr, guide, roi_in, piece, dS);
+    }
+
+    // once per call, not per pixel
+    float m[LS_LIGHT_NODES];
+    _curve_tangents(d->light_node, m);
+    _apply_gain(in, out, lambda, lambda_f, dS, npix, d, m);
 
     gchar *dump = _dump_prefix(piece->pipe, L->model_id);
     if(dump)
     {
       _dump(dump, "lambda_full", lambda, roi_in->width, roi_in->height, 1);
+      if(dS) _dump(dump, "dS_full", dS, roi_in->width, roi_in->height, 1);
       gchar *fn = g_strdup_printf("%s_full.txt", dump);
       FILE *f = g_fopen(fn, "w");
       if(f)
@@ -1073,11 +1272,18 @@ void process(dt_iop_module_t *self,
       g_free(dump);
     }
   }
+  else
+    dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
 
   dt_free_align(guide);
   dt_free_align(lambda);
   dt_free_align(lambda_f);
+  dt_free_align(dS_lr);
+  dt_free_align(dS);
   _layer_unref(L);
+#else
+  // no AI, no light layer: the output stays an identity
+  dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
 #endif
 }
 
