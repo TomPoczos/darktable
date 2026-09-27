@@ -40,6 +40,7 @@ typedef struct dt_intrinsic_model_t
 {
   char *id;       // e.g. "intrinsic-ordinal"
   char *name;     // display name from config.json, for the combobox
+  char *description; // config.json "description", its tradeoff line; may be NULL
   uint32_t hash;  // dt_intrinsic_hash(id)
 } dt_intrinsic_model_t;
 

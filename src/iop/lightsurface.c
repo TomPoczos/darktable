@@ -23,14 +23,18 @@
 // src/develop/pixelpipe_hb.c)
 
 #include "bauhaus/bauhaus.h"
+#include "common/colorspaces.h"
 #include "common/imagebuf.h"
 #include "develop/imageop.h"
 #include "develop/imageop_gui.h"
+#include "dtgtk/paint.h"
+#include "gui/accelerators.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
 
 #ifdef HAVE_AI
 #include "common/ai/intrinsic.h"
+#include "common/ai_models.h"
 #include "common/box_filters.h"
 #include "common/chromatic_adaptation.h"
 #include "common/colorspaces_inline_conversions.h"
@@ -148,19 +152,41 @@ typedef struct dt_iop_lightsurface_global_data_t
 } dt_iop_lightsurface_global_data_t;
 #endif
 
+// what the center view shows; epic §M7
+typedef enum dt_iop_lightsurface_display_t
+{
+  LS_DISPLAY_NORMAL = 0,
+  LS_DISPLAY_LIGHT,
+  LS_DISPLAY_SURFACE,
+  LS_DISPLAY_CHANGES
+} dt_iop_lightsurface_display_t;
+
 typedef struct dt_iop_lightsurface_gui_data_t
 {
+  GtkNotebook *notebook;
+  GtkWidget *graph_box, *ratio_label;
   GtkWidget *form, *relief, *fill;
+  dt_gui_collapsible_section_t nodes_section;
   GtkWidget *light_node[LS_LIGHT_NODES];
   GtkWidget *surface_contrast;
   GtkWidget *surface_hue[LS_HUE_NODES];
+  GtkWidget *model, *display, *warn_toggle, *status_label, *map_box;
+  uint32_t *model_hashes;  // index-aligned with the first n_models entries of `model`
+  int n_models;            // an entry past these is the "not installed" one, not a choice
+  // what is shown, not what is edited: never in the params, so never in the
+  // history. under the gui lock, since the full pipe reads them
+  dt_iop_lightsurface_display_t display_mode;
+  gboolean show_warn;
 #ifdef HAVE_AI
   // shared with the pipe threads, under the gui lock
   _ls_layer_t *layer;          // published by the preview pipe
   gboolean full_needs_refresh; // a canvas pipe rendered a placeholder
   _ls_key_t wanted;            // the key that placeholder was waiting for
+  gboolean analyzing;          // the preview is computing a layer
 #endif
 } dt_iop_lightsurface_gui_data_t;
+
+static void _update_status(dt_iop_module_t *self);
 
 const char *name()
 {
@@ -1025,6 +1051,16 @@ static dt_hash_t _upstream_hash(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe)
   return hash;
 }
 
+// the status line, redrawn from a pipe thread. the source recomputes it from
+// the module's current state rather than carrying a value, so one that fires
+// after an image switch on the kept base instance shows the new image's state
+static gboolean _status_idle(gpointer user_data)
+{
+  dt_iop_module_t *self = user_data;
+  if(self->gui_data) _update_status(self);
+  return G_SOURCE_REMOVE;
+}
+
 // a ref of the published layer if its key is `key`, else NULL
 static _ls_layer_t *_take_published(dt_iop_module_t *self, const _ls_key_t *key)
 {
@@ -1089,18 +1125,31 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
     L = _take_published(self, &key);
     if(!L)
     {
+      // the status line reads "analyzing" while this runs, which can take
+      // minutes; no pipe-finished signal arrives before it ends
+      dt_iop_gui_enter_critical_section(self);
+      g->analyzing = TRUE;
+      dt_iop_gui_leave_critical_section(self);
+      g_idle_add(_status_idle, self);
+
       dt_intrinsic_ctx_t *ctx = _get_ctx(self, model_id);
       if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in);
       if(L)
       {
         L->key = key;
         L->fell_back = fell_back;
-        dt_iop_gui_enter_critical_section(self);
-        _ls_layer_t *old = g->layer;
-        g->layer = _layer_ref(L);
-        dt_iop_gui_leave_critical_section(self);
-        _layer_unref(old);
       }
+      dt_iop_gui_enter_critical_section(self);
+      _ls_layer_t *old = NULL;
+      if(L)
+      {
+        old = g->layer;
+        g->layer = _layer_ref(L);
+      }
+      g->analyzing = FALSE;
+      dt_iop_gui_leave_critical_section(self);
+      _layer_unref(old);
+      g_idle_add(_status_idle, self);
     }
   }
   else if(gui && dt_pipe_is_canvas(pipe))
@@ -1161,12 +1210,14 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
   return L;
 }
 
-// the preview published a layer: redraw the canvases that rendered a
-// placeholder for it. runs in the GUI thread
+// the preview may have published a layer: update the status line, and redraw
+// the canvases that rendered a placeholder for it. runs in the GUI thread
 static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *self)
 {
   dt_iop_lightsurface_gui_data_t *g = self->gui_data;
   if(!g) return;
+
+  _update_status(self);
 
   // only when the layer is the one the placeholder waited for: otherwise a
   // canvas whose key never matches would reprocess after every preview run,
@@ -1287,46 +1338,427 @@ void process(dt_iop_module_t *self,
 #endif
 }
 
+/* --- GUI --- */
+
+#ifdef HAVE_AI
+// the display name of a model id, or the id itself if the list lacks it
+static const char *_model_name(GList *models, const char *id)
+{
+  for(const GList *l = models; l; l = g_list_next(l))
+  {
+    const dt_intrinsic_model_t *m = l->data;
+    if(!g_strcmp0(m->id, id)) return m->name;
+  }
+  return id;
+}
+#endif
+
+// the model entries, one per installed model, plus one for an edit whose
+// model is not installed
+static void _rebuild_models(dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  GtkWidget *combo = g->model;
+
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_clear(combo);
+  g_free(g->model_hashes);
+  g->model_hashes = NULL;
+  g->n_models = 0;
+
+  GString *tip = g_string_new
+    (_("the AI model that separates light from surfaces.\n"
+       "the choice is stored with the edit, so the edit always renders the same way.\n"
+       "models differ in speed and in how they handle faces, fine shadows and textures"));
+
+#ifdef HAVE_AI
+  const dt_iop_lightsurface_params_t *p = self->params;
+  const dt_iop_lightsurface_params_t *d = self->default_params;
+  GList *models = dt_ai_registry_is_enabled() ? dt_intrinsic_list_models() : NULL;
+  if(models)
+  {
+    g->n_models = g_list_length(models);
+    g->model_hashes = g_new(uint32_t, g->n_models);
+    g_string_append(tip, "\n");
+    int selected = -1, def = 0, k = 0;
+    for(const GList *l = models; l; l = g_list_next(l), k++)
+    {
+      const dt_intrinsic_model_t *m = l->data;
+      dt_bauhaus_combobox_add(combo, m->name);
+      g->model_hashes[k] = m->hash;
+      if(m->hash == p->model_hash) selected = k;
+      if(m->hash == d->model_hash) def = k;
+      if(m->description && m->description[0])
+        g_string_append_printf(tip, "\n%s: %s", m->name, m->description);
+    }
+
+    if(selected < 0)
+    {
+      gboolean fell_back = FALSE;
+      char *id = _resolve_model_id(p->model_hash, &fell_back);
+      gchar *label = g_strdup_printf(_("not installed, using %s"),
+                                     id ? _model_name(models, id) : _("none"));
+      dt_bauhaus_combobox_add(combo, label);
+      g_free(label);
+      g_free(id);
+      selected = g->n_models;
+    }
+    dt_bauhaus_combobox_set_default(combo, def);
+    dt_bauhaus_combobox_set(combo, selected);
+  }
+  dt_intrinsic_models_free(models);
+#endif
+
+  if(!g->n_models)
+  {
+    dt_bauhaus_combobox_add(combo, _("none"));
+    dt_bauhaus_combobox_set_default(combo, 0);
+    dt_bauhaus_combobox_set(combo, 0);
+  }
+  gtk_widget_set_sensitive(combo, g->n_models > 0);
+  gtk_widget_set_tooltip_text(combo, tip->str);
+  g_string_free(tip, TRUE);
+  DT_LEAVE_GUI_UPDATE();
+}
+
+// the status line under the model, and the relief slider, which only models
+// that separate fine shading from the broad light use
+static void _update_status(dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  const dt_iop_lightsurface_params_t *p = self->params;
+  gboolean relief_shown = gtk_widget_get_visible(g->relief);
+  // only a layer of the current model tells whether it uses relief; until
+  // one arrives the visibility is the previous model's, so no note
+  gboolean relief_known = FALSE;
+  gchar *text = NULL;
+
+#ifdef HAVE_AI
+  const gboolean enabled = dt_ai_registry_is_enabled();
+  GList *models = enabled ? dt_intrinsic_list_models() : NULL;
+  gboolean fell_back = FALSE;
+  char *id = models ? _resolve_model_id(p->model_hash, &fell_back) : NULL;
+
+  if(!enabled)
+    text = g_strdup(_("AI is disabled in preferences > AI: this module has no effect"));
+  else if(!id)
+    text = g_strdup(_("no intrinsic decomposition model installed: this module has no effect"));
+  else if(_ctx_failed(self, id))
+    text = g_strdup_printf(_("model %s failed to load, see the log (-d ai)"),
+                           _model_name(models, id));
+  else
+  {
+    // the layer's upstream hash is not compared: the preview flags a
+    // recomputation for a changed upstream itself (g->analyzing)
+    const uint32_t hash = dt_intrinsic_hash(id);
+    dt_iop_gui_enter_critical_section(self);
+    const _ls_layer_t *L = g->layer;
+    const gboolean analyzing = g->analyzing;
+    const gboolean ready = L && !analyzing
+      && L->key.imgid == self->dev->image_storage.id
+      && L->key.model_hash == hash;
+    const double ms = ready ? L->ms : 0.0;
+    const gboolean relief = ready ? L->mp.relief : TRUE;
+    dt_iop_gui_leave_critical_section(self);
+
+    if(ready)
+    {
+      relief_shown = relief;
+      relief_known = TRUE;
+      // the edit's own model_hash decides, not the layer's flag: a layer
+      // computed as a fallback is reused once the edit chooses that model
+      if(fell_back)
+        text = g_strdup_printf(_("this edit's model is not installed, using %s"),
+                               _model_name(models, id));
+      else
+        text = g_strdup_printf(_("analysis %.1f s"), ms / 1000.0);
+    }
+    else if(analyzing || self->enabled)
+      text = g_strdup(_("analyzing the image..."));
+    else
+      text = g_strdup(""); // a disabled module analyzes nothing
+  }
+  g_free(id);
+  dt_intrinsic_models_free(models);
+#else
+  text = g_strdup(_("built without AI support: this module has no effect"));
+#endif
+
+  gtk_widget_set_visible(g->relief, relief_shown);
+  // a value set under another model stays: hiding the slider must not reset it
+  if(relief_known && !relief_shown && p->relief != 0.0f)
+  {
+    gchar *t = g_strconcat(text, _(" (relief is not used by this model)"), NULL);
+    g_free(text);
+    text = t;
+  }
+  gtk_label_set_text(GTK_LABEL(g->status_label), text);
+  g_free(text);
+}
+
+static void _model_changed(GtkWidget *widget, dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_lightsurface_params_t *p = self->params;
+  const int pos = dt_bauhaus_combobox_get(widget);
+  // the "not installed" entry is the edit's current state, not a choice
+  if(pos < 0 || pos >= g->n_models || p->model_hash == g->model_hashes[pos]) return;
+
+  p->model_hash = g->model_hashes[pos];
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  _rebuild_models(self);
+  _update_status(self);
+}
+
+static void _display_changed(GtkWidget *widget, dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  const int mode = CLAMP(dt_bauhaus_combobox_get(widget), LS_DISPLAY_NORMAL, LS_DISPLAY_CHANGES);
+  dt_iop_gui_enter_critical_section(self);
+  g->display_mode = mode;
+  dt_iop_gui_leave_critical_section(self);
+  dt_iop_refresh_center(self);
+}
+
+static void _warn_toggled(GtkGestureSingle *gesture,
+                          int n_press,
+                          double x,
+                          double y,
+                          dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+  dt_iop_request_focus(self);
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean show = g->show_warn = !g->show_warn;
+  dt_iop_gui_leave_critical_section(self);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->warn_toggle), show);
+  dt_iop_refresh_center(self);
+}
+
+// epic §M3.2 applied from the node the user moved outwards, in both
+// directions, so that no slider shows a value commit_params() would change.
+// it only pushes: moving the node back leaves its neighbors where they are
+static void _push_nodes(dt_iop_module_t *self, const int i)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  float *const v = ((dt_iop_lightsurface_params_t *)self->params)->light_node;
+  const float step = 1.0f - LS_NODE_MIN_STEP;
+
+  DT_ENTER_GUI_UPDATE();
+  for(int k = i + 1; k < LS_LIGHT_NODES; k++)
+    if(v[k] < v[k - 1] - step)
+    {
+      v[k] = v[k - 1] - step;
+      dt_bauhaus_slider_set(g->light_node[k], v[k]);
+    }
+  for(int k = i - 1; k >= 0; k--)
+    if(v[k] > v[k + 1] + step)
+    {
+      v[k] = v[k + 1] + step;
+      dt_bauhaus_slider_set(g->light_node[k], v[k]);
+    }
+  DT_LEAVE_GUI_UPDATE();
+}
+
+void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+
+  for(int i = 0; i < LS_LIGHT_NODES; i++)
+    if(w == g->light_node[i])
+    {
+      _push_nodes(self, i);
+      return;
+    }
+
+  if(!w || w == g->relief) _update_status(self);
+}
+
+void gui_update(dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  _rebuild_models(self);
+  dt_gui_update_collapsible_section(&g->nodes_section);
+  gui_changed(self, NULL, NULL);
+}
+
+void gui_focus(dt_iop_module_t *self, gboolean in)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(in || !g) return;
+
+  // as toneequal.c does with its mask: leaving the module shows the image again
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean was_shown = g->display_mode != LS_DISPLAY_NORMAL || g->show_warn;
+  g->display_mode = LS_DISPLAY_NORMAL;
+  g->show_warn = FALSE;
+  dt_iop_gui_leave_critical_section(self);
+
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_combobox_set(g->display, LS_DISPLAY_NORMAL);
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g->warn_toggle), FALSE);
+  DT_LEAVE_GUI_UPDATE();
+
+  if(was_shown) dt_iop_refresh_center(self);
+}
+
+// sliders.md case 2, in its order: the digits come last
+static void _slider_percent(GtkWidget *w)
+{
+  dt_bauhaus_slider_set_factor(w, 100.0f);
+  dt_bauhaus_slider_set_format(w, "%");
+  dt_bauhaus_slider_set_digits(w, 1);
+}
+
 void gui_init(dt_iop_module_t *self)
 {
-  static const char *const node_labels[LS_LIGHT_NODES] =
-    { N_("-7 EV"), N_("-6 EV"), N_("-5 EV"), N_("-4 EV"), N_("-3 EV"),
-      N_("-2 EV"), N_("-1 EV"), N_("+0 EV"), N_("+1 EV") };
   static const char *const hue_labels[LS_HUE_NODES] =
     { N_("red"), N_("orange"), N_("yellow"), N_("green"),
       N_("cyan"), N_("blue"), N_("lavender"), N_("magenta") };
 
   dt_iop_lightsurface_gui_data_t *g = IOP_GUI_ALLOC(lightsurface);
 
-  self->widget = dt_gui_vbox();
+  static dt_action_def_t notebook_def = { };
+  g->notebook = dt_ui_notebook_new(&notebook_def);
+  dt_action_define_iop(self, NULL, N_("page"), GTK_WIDGET(g->notebook), &notebook_def);
+
+  /* light */
+  GtkWidget *page = self->widget = dt_ui_notebook_page(g->notebook, N_("light"), NULL);
+
+  // the light graph goes here (LS-10)
+  g->graph_box = dt_gui_vbox();
+  dt_gui_box_add(page, g->graph_box);
+
+  g->ratio_label = dt_ui_label_new("");
+  dt_gui_box_add(page, g->ratio_label);
 
   g->form = dt_bauhaus_slider_from_params(self, "form");
-  g->relief = dt_bauhaus_slider_from_params(self, "relief");
-  g->fill = dt_bauhaus_slider_from_params(self, "fill");
+  _slider_percent(g->form);
+  dt_bauhaus_slider_set_soft_range(g->form, -0.9f, 2.0f);
+  gtk_widget_set_tooltip_text
+    (g->form,
+     _("strength of the modeling light: how much the light changes across shapes"
+       " and between sun and shade.\n"
+       "positive: harder, more dramatic light. negative: softer light.\n"
+       "surfaces (materials) are not affected"));
 
+  g->relief = dt_bauhaus_slider_from_params(self, "relief");
+  _slider_percent(g->relief);
+  gtk_widget_set_tooltip_text
+    (g->relief,
+     _("contrast of the fine shading inside textures such as bark, stone or fabric,"
+       " without changing the materials' own tones"));
+  // _update_status() hides it for models without a relief layer
+  gtk_widget_set_no_show_all(g->relief, TRUE);
+  gtk_widget_set_visible(g->relief, TRUE);
+
+  g->fill = dt_bauhaus_slider_from_params(self, "fill");
+  _slider_percent(g->fill);
+  dt_bauhaus_slider_set_soft_range(g->fill, 0.0f, 0.5f);
+  gtk_widget_set_tooltip_text
+    (g->fill,
+     /* xgettext:no-c-format */
+     _("adds light like a fill light would: in proportion to the key light,"
+       " so deep shade is lifted a lot and sunlit areas barely change.\n"
+       "25 % is a fill light 2 EV below the key light"));
+
+  dt_gui_new_collapsible_section(&g->nodes_section, "plugins/darkroom/lightsurface/expand_nodes",
+                                 _("light curve nodes"), GTK_BOX(page), DT_ACTION(self));
+  self->widget = GTK_WIDGET(g->nodes_section.container);
   for(int i = 0; i < LS_LIGHT_NODES; i++)
   {
     gchar *field = g_strdup_printf("light_node[%d]", i);
     g->light_node[i] = dt_bauhaus_slider_from_params(self, field);
     g_free(field);
-    dt_bauhaus_widget_set_label(g->light_node[i], N_("light curve"), node_labels[i]);
+    // the node's EV offset from the key light, as in "-7 EV", "0 EV", "+1 EV"
+    const int ev = i - (LS_LIGHT_NODES - 2);
+    gchar *label = g_strdup_printf(ev ? "%+d EV" : "%d EV", ev);
+    dt_bauhaus_widget_set_label(g->light_node[i], NULL, label);
+    g_free(label);
     dt_bauhaus_slider_set_format(g->light_node[i], _(" EV"));
+    dt_bauhaus_slider_set_digits(g->light_node[i], 2);
+    gtk_widget_set_tooltip_text(g->light_node[i],
+                                _("correction applied to areas lit at this level,"
+                                  " relative to the key light (0 EV)"));
   }
 
-  g->surface_contrast = dt_bauhaus_slider_from_params(self, "surface_contrast");
+  /* surface */
+  page = self->widget = dt_ui_notebook_page(g->notebook, N_("surface"), NULL);
 
+  g->surface_contrast = dt_bauhaus_slider_from_params(self, "surface_contrast");
+  _slider_percent(g->surface_contrast);
+  gtk_widget_set_tooltip_text
+    (g->surface_contrast,
+     _("contrast between materials, e.g. calms a patchy wall or blotchy skin,"
+       " without changing the light on them"));
+
+  dt_gui_box_add(page, dt_ui_section_label_new(_("lightness by hue")));
   for(int j = 0; j < LS_HUE_NODES; j++)
   {
     gchar *field = g_strdup_printf("surface_hue[%d]", j);
     g->surface_hue[j] = dt_bauhaus_slider_from_params(self, field);
     g_free(field);
-    dt_bauhaus_widget_set_label(g->surface_hue[j], N_("surface lightness"), hue_labels[j]);
+    dt_bauhaus_widget_set_label(g->surface_hue[j], NULL, hue_labels[j]);
     dt_bauhaus_slider_set_format(g->surface_hue[j], _(" EV"));
+    dt_bauhaus_slider_set_digits(g->surface_hue[j], 2);
+    gtk_widget_set_tooltip_text(g->surface_hue[j],
+                                _("lightens or darkens materials of this color, weighted"
+                                  " by how saturated they are.\n"
+                                  "shadows on them are not deepened"));
+
+    // a dark to light ramp of the node's hue. the tint is only a cue: it
+    // uses the conventional HSL hue at j * 45 degrees, while the module
+    // places its nodes on the UCS hue angle of _hue_sat(), which differs a
+    // little
+    for(int s = 0; s < 16; s++)
+    {
+      const float stop = s / 15.0f;
+      dt_aligned_pixel_t rgb;
+      hsl2rgb(rgb, j / (float)LS_HUE_NODES, 0.6f, 0.15f + 0.7f * stop);
+      dt_bauhaus_slider_set_stop(g->surface_hue[j], stop, rgb[0], rgb[1], rgb[2]);
+    }
   }
 
+  /* view */
+  page = self->widget = dt_ui_notebook_page(g->notebook, N_("view"), NULL);
+
+  // built by hand: its entries are the installed models (_rebuild_models())
+  g->model = dt_bauhaus_combobox_new_full(DT_ACTION(self), NULL, N_("model"), NULL, 0,
+                                          (GtkCallback)_model_changed, self, NULL);
+  dt_gui_box_add(page, g->model);
+
+  DT_BAUHAUS_COMBOBOX_NEW_FULL(g->display, self, NULL, N_("display"), NULL,
+                               LS_DISPLAY_NORMAL, _display_changed, self,
+                               N_("normal"), N_("light layer"), N_("surface layer"),
+                               N_("changes"));
+  dt_gui_box_add(page, g->display);
+
+  g->warn_toggle = dt_iop_togglebutton_new(self, NULL, N_("show unreliable areas"), NULL,
+                                           G_CALLBACK(_warn_toggled), FALSE, 0, 0,
+                                           dtgtk_cairo_paint_showmask, NULL);
+  dt_gui_add_class(g->warn_toggle, "dt_transparent_background");
+  dt_gui_add_class(g->warn_toggle, "dt_bauhaus_alignment");
+  dt_gui_box_add(page, dt_gui_hbox(dt_gui_expand(dt_ui_label_new(_("show unreliable areas"))),
+                                   g->warn_toggle));
+
+  g->status_label = dt_ui_label_new("");
+  gtk_label_set_ellipsize(GTK_LABEL(g->status_label), PANGO_ELLIPSIZE_NONE);
+  gtk_label_set_line_wrap(GTK_LABEL(g->status_label), TRUE);
+  dt_gui_box_add(page, g->status_label);
+
+  // the light x surface map goes here (LS-13)
+  g->map_box = dt_gui_vbox();
+  dt_gui_box_add(page, g->map_box);
+
+  self->widget = GTK_WIDGET(g->notebook);
+
 #ifdef HAVE_AI
-  g->layer = NULL;
-  g->full_needs_refresh = FALSE;
   DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED,
                            _preview_pipe_finished_callback);
 #endif
@@ -1336,8 +1768,14 @@ void gui_init(dt_iop_module_t *self)
 // (DT_CONTROL_SIGNAL_DISCONNECT_ALL, src/develop/imageop.c:2470)
 void gui_cleanup(dt_iop_module_t *self)
 {
-#ifdef HAVE_AI
   dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  g_free(g->model_hashes);
+  g->model_hashes = NULL;
+#ifdef HAVE_AI
+  // teardown holds the screen pipes' locks, so nothing queues a new one
+  // after this drain (dev-doc/GUI_Threading.md)
+  while(g_idle_remove_by_data(self)) ;
+
   dt_iop_gui_enter_critical_section(self);
   _ls_layer_t *L = g->layer;
   g->layer = NULL;

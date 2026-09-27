@@ -106,6 +106,7 @@ GList *dt_intrinsic_list_models(void)
     dt_intrinsic_model_t *m = g_new0(dt_intrinsic_model_t, 1);
     m->id = g_strdup(info->id);
     m->name = g_strdup(info->name ? info->name : info->id);
+    m->description = g_strdup(info->description);
     m->hash = dt_intrinsic_hash(info->id);
     models = g_list_prepend(models, m);
   }
@@ -117,6 +118,7 @@ static void _model_free(gpointer data)
   dt_intrinsic_model_t *m = data;
   g_free(m->id);
   g_free(m->name);
+  g_free(m->description);
   g_free(m);
 }
 

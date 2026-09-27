@@ -4354,6 +4354,13 @@
     <longdescription>this is just for remembering whether to show values or not</longdescription>
   </dtconfig>
   <dtconfig>
+    <name>plugins/darkroom/lightsurface/expand_nodes</name>
+    <type>bool</type>
+    <default>false</default>
+    <shortdescription>whether to show the light curve nodes</shortdescription>
+    <longdescription>this is just for remembering whether to show the light curve nodes of the light and surface module or not</longdescription>
+  </dtconfig>
+  <dtconfig>
     <name>plugins/darkroom/ashift/autocrop_value</name>
     <type>int</type>
     <default>1</default>
