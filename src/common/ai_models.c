@@ -76,6 +76,7 @@ static const struct
   { "rawdenoise", N_("raw denoise") },
   { "upscale",    N_("upscale")     },
   { "mask",       N_("mask")        },
+  { "intrinsic",  N_("intrinsic decomposition") },
 };
 
 // compare version strings "X.Y", returns -1 if a<b, 0 if a==b, 1 if a>b
