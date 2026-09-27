@@ -34,12 +34,18 @@
 #include "common/box_filters.h"
 #include "common/chromatic_adaptation.h"
 #include "common/colorspaces_inline_conversions.h"
+#include "common/guided_filter.h"
 #include "common/iop_profile.h"
 #include "common/math.h"
 #include "common/pfm.h"
+#include "control/control.h"
+#include "control/signal.h"
 #include "develop/develop.h"
+#include "develop/pixelpipe_cache.h"
 #include "develop/pixelpipe_hb.h"
 
+#include <float.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,6 +150,12 @@ typedef struct dt_iop_lightsurface_gui_data_t
   GtkWidget *light_node[LS_LIGHT_NODES];
   GtkWidget *surface_contrast;
   GtkWidget *surface_hue[LS_HUE_NODES];
+#ifdef HAVE_AI
+  // shared with the pipe threads, under the gui lock
+  _ls_layer_t *layer;          // published by the preview pipe
+  gboolean full_needs_refresh; // a canvas pipe rendered a placeholder
+  _ls_key_t wanted;            // the key that placeholder was waiting for
+#endif
 } dt_iop_lightsurface_gui_data_t;
 
 const char *name()
@@ -301,7 +313,31 @@ static dt_intrinsic_ctx_t *_get_ctx(dt_iop_module_t *self, const char *model_id)
   return value == LS_CTX_FAILED ? NULL : value;
 }
 
+// TRUE once a load of this model has failed. does not wait for a load in
+// progress, so a canvas pipe can ask without stalling
+static gboolean _ctx_failed(dt_iop_module_t *self, const char *model_id)
+{
+  dt_iop_lightsurface_global_data_t *gd = self->global_data;
+  dt_pthread_mutex_lock(&gd->lock);
+  const gboolean failed = g_hash_table_lookup(gd->ctx_by_id, model_id) == LS_CTX_FAILED;
+  dt_pthread_mutex_unlock(&gd->lock);
+  return failed;
+}
+
 /* --- the layer object --- */
+
+static inline gboolean _key_equal(const _ls_key_t *a, const _ls_key_t *b)
+{
+  return a->imgid == b->imgid
+    && a->upstream == b->upstream
+    && a->model_hash == b->model_hash;
+}
+
+static _ls_layer_t *_layer_ref(_ls_layer_t *L)
+{
+  if(L) g_atomic_int_inc(&L->refcount);
+  return L;
+}
 
 static void _layer_unref(_ls_layer_t *L)
 {
@@ -666,7 +702,102 @@ fail:
   return NULL;
 }
 
-/* --- which pipe does what --- */
+/* --- full resolution, epic §M2 --- */
+
+// G(I) of epic §M0: 4 channels, log2(max(I_c, y_floor)), G_3 = 0
+static void _log_guide(const float *const in, const size_t npix,
+                       const float y_floor, float *const guide)
+{
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npix; k++)
+  {
+    for(int c = 0; c < 3; c++)
+      guide[4 * k + c] = log2f(fmaxf(in[4 * k + c], y_floor));
+    guide[4 * k + 3] = 0.0f;
+  }
+}
+
+// bilinear samples of a low-res field (lw x lh) at the ROI's pixel centers
+// (epic §M2.1-2); buf_in is the module's full input at scale 1
+static void _sample_lr(const float *const lr, const int lw, const int lh,
+                       const dt_iop_roi_t *const roi_in,
+                       const dt_dev_pixelpipe_iop_t *const piece,
+                       float *const out)
+{
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const float sx = roi_in->scale * piece->buf_in.width;
+  const float sy = roi_in->scale * piece->buf_in.height;
+  const float ox = roi_in->x;
+  const float oy = roi_in->y;
+
+  DT_OMP_FOR()
+  for(int y = 0; y < height; y++)
+  {
+    const float v = (oy + y + 0.5f) / sy;
+    const float Yc = CLAMP(v * lh - 0.5f, 0.0f, (float)(lh - 1));
+    const int y0 = (int)floorf(Yc);
+    const int y1 = MIN(y0 + 1, lh - 1);
+    const float fy = Yc - y0;
+    for(int x = 0; x < width; x++)
+    {
+      const float u = (ox + x + 0.5f) / sx;
+      const float Xc = CLAMP(u * lw - 0.5f, 0.0f, (float)(lw - 1));
+      const int x0 = (int)floorf(Xc);
+      const int x1 = MIN(x0 + 1, lw - 1);
+      const float fx = Xc - x0;
+      const float top = lr[(size_t)y0 * lw + x0] * (1.0f - fx) + lr[(size_t)y0 * lw + x1] * fx;
+      const float bot = lr[(size_t)y1 * lw + x0] * (1.0f - fx) + lr[(size_t)y1 * lw + x1] * fx;
+      out[(size_t)y * width + x] = top * (1.0f - fy) + bot * fy;
+    }
+  }
+}
+
+// a low-res field of layer L brought to the ROI (epic §M2.3, and §M2.5 for
+// dS_lr in LS-08): bilinear samples, then, where the ROI is finer than the
+// layer, the guided filter with the log guide snaps them to image edges
+static void _sample_refine(const _ls_layer_t *const L, const float *const lr,
+                           const float *const guide,
+                           const dt_iop_roi_t *const roi_in,
+                           const dt_dev_pixelpipe_iop_t *const piece,
+                           float *const out)
+{
+  const int width = roi_in->width;
+  const int height = roi_in->height;
+  const float f = roi_in->scale * piece->buf_in.width / L->w;
+
+  if(f <= 1.0f)
+  {
+    _sample_lr(lr, L->w, L->h, roi_in, piece, out);
+    return;
+  }
+
+  float *const up = dt_alloc_align_float((size_t)width * height);
+  if(!up)
+  {
+    _sample_lr(lr, L->w, L->h, roi_in, piece, out);
+    return;
+  }
+  _sample_lr(lr, L->w, L->h, roi_in, piece, up);
+  const int r = MAX(1, (int)ceilf(L->mp.guide_radius_factor * f));
+  guided_filter(guide, up, out, width, height, 4, r, L->mp.guide_sqrt_eps,
+                1.0f, -FLT_MAX, FLT_MAX);
+  dt_free_align(up);
+}
+
+// lambda (refined) and lambda_f (sampled only: it holds low-amplitude shading
+// by construction, so its misregistration is small) for the ROI, epic
+// §M2.1-4; lambda_c = lambda - lambda_f is formed where it is used
+static void _light_full(const _ls_layer_t *const L, const float *const guide,
+                        const dt_iop_roi_t *const roi_in,
+                        const dt_dev_pixelpipe_iop_t *const piece,
+                        float *const lambda, float *const lambda_f)
+{
+  _sample_refine(L, L->lambda, guide, roi_in, piece, lambda);
+  _sample_lr(L->lambda_f, L->w, L->h, roi_in, piece, lambda_f);
+}
+
+/* --- which pipe does what (LS-07 Part C) --- */
 
 // the ROI covers the whole image: this pipe can compute a layer itself
 static gboolean _roi_is_whole(const dt_iop_roi_t *const roi_in,
@@ -677,14 +808,55 @@ static gboolean _roi_is_whole(const dt_iop_roi_t *const roi_in,
     && fabsf(roi_in->height - roi_in->scale * piece->buf_in.height) <= 2.0f;
 }
 
-// the light layer this process() call uses (the caller releases it), or NULL
-// when the output stays an identity. every pipe that sees the whole image
-// computes its own layer for now
+// the upstream part of the layer key: dt_dev_hash_plus(..., BACK_EXCL) without
+// the hidden modules. those are enabled per pipe, not per history:
+// demosaicscale only resamples, on canvas pipes of raw files
+// (src/iop/demosaicscale.c:151-160), and rawoverexposed is the full pipe's
+// clipping indicator (src/iop/rawoverexposed.c:392). counting them gives the
+// preview and the full pipe different hashes for the same history, and the
+// full pipe would never find the preview's layer. rotatepixels (fixed per
+// camera, and the image id is in the key) and mask_manager are skipped too
+static dt_hash_t _upstream_hash(dt_iop_module_t *self, dt_dev_pixelpipe_t *pipe)
+{
+  dt_develop_t *dev = self->dev;
+  dt_hash_t hash = DT_INITHASH;
+  dt_pthread_mutex_lock(&dev->history_mutex);
+  GList *modules = g_list_last(pipe->iop);
+  GList *pieces = g_list_last(pipe->nodes);
+  while(modules && pieces)
+  {
+    const dt_iop_module_t *module = modules->data;
+    const dt_dev_pixelpipe_iop_t *piece = pieces->data;
+    if(piece->enabled
+       && module->iop_order < self->iop_order
+       && !(module->flags() & IOP_FLAGS_HIDDEN))
+      hash = dt_hash(hash, &piece->hash, sizeof(piece->hash));
+    modules = g_list_previous(modules);
+    pieces = g_list_previous(pieces);
+  }
+  dt_pthread_mutex_unlock(&dev->history_mutex);
+  return hash;
+}
+
+// a ref of the published layer if its key is `key`, else NULL
+static _ls_layer_t *_take_published(dt_iop_module_t *self, const _ls_key_t *key)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
+  _ls_layer_t *L = g->layer && _key_equal(&g->layer->key, key) ? _layer_ref(g->layer) : NULL;
+  dt_iop_gui_leave_critical_section(self);
+  return L;
+}
+
+// the light layer this process() call uses (a ref the caller releases), or
+// NULL when the output stays an identity
 static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
                                     dt_dev_pixelpipe_iop_t *piece,
                                     const float *const in,
                                     const dt_iop_roi_t *const roi_in)
 {
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  const gboolean gui = self->dev->gui_attached && g;
   const dt_iop_lightsurface_data_t *const d = piece->data;
   dt_dev_pixelpipe_t *const pipe = piece->pipe;
   const char *pname = _pipe_name(pipe);
@@ -699,29 +871,94 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
   char *model_id = _resolve_model_id(d->model_hash, &fell_back);
   if(!model_id)
   {
-    dt_print(DT_DEBUG_ALWAYS,
-             "[lightsurface] no intrinsic decomposition model is available"
-             " (AI disabled or none installed), output unchanged");
+    if(!gui)
+      dt_print(DT_DEBUG_ALWAYS,
+               "[lightsurface] no intrinsic decomposition model is available"
+               " (AI disabled or none installed), output unchanged");
     return NULL;
   }
-  if(fell_back)
+  if(fell_back && !gui)
     dt_print(DT_DEBUG_ALWAYS,
              "[lightsurface] model of this edit is not installed, using %s", model_id);
 
+  // the model hash of a ctx is dt_intrinsic_hash() of its id, so a pipe can
+  // form its key without loading the model
+  _ls_key_t key = { .imgid = pipe->image.id,
+                    .upstream = DT_INVALID_HASH,
+                    .model_hash = dt_intrinsic_hash(model_id) };
   _ls_layer_t *L = NULL;
-  if(!whole)
+
+  if(gui && (dt_pipe_is_preview(pipe) || dt_pipe_is_canvas(pipe)))
+  {
+    key.upstream = _upstream_hash(self, pipe);
+    dt_print(DT_DEBUG_PIPE,
+             "[lightsurface] %s: key image %d, upstream %016" PRIx64 ", model %08x (%s)",
+             pname, key.imgid, key.upstream, key.model_hash, model_id);
+  }
+
+  if(gui && dt_pipe_is_preview(pipe))
+  {
+    // the preview sees the whole image: it computes the layer and publishes it
+    L = _take_published(self, &key);
+    if(!L)
+    {
+      dt_intrinsic_ctx_t *ctx = _get_ctx(self, model_id);
+      if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in->width, roi_in->height);
+      if(L)
+      {
+        L->key = key;
+        L->fell_back = fell_back;
+        dt_iop_gui_enter_critical_section(self);
+        _ls_layer_t *old = g->layer;
+        g->layer = _layer_ref(L);
+        dt_iop_gui_leave_critical_section(self);
+        _layer_unref(old);
+      }
+    }
+  }
+  else if(gui && dt_pipe_is_canvas(pipe))
+  {
+    // the full pipe and the second window's never run inference, not even in
+    // late-scaling mode where they see the whole image (unlike
+    // hazeremoval.c:598): that would be a second inference per change, queued
+    // behind the preview's on the same model. they take the preview's layer
+    // when its key matches their own, and render a placeholder until it does.
+    // there is no dt_dev_sync_pixelpipe_hash() wait: it compares against
+    // dt_dev_hash_plus(), not this key, and inference takes far longer than
+    // its timeout anyway
+    L = _take_published(self, &key);
+    if(!L && !_ctx_failed(self, model_id))
+    {
+      // placeholder: the identity output is cached under this module's
+      // params hash, which will not change when the layer arrives, so the
+      // cache lines from here on are dropped and the preview-finished
+      // handler reprocesses the center once the layer is there
+      dt_dev_pixelpipe_cache_invalidate_later(pipe, self->iop_order,
+                                              "lightsurface: waiting for the light layer ");
+      dt_iop_gui_enter_critical_section(self);
+      g->full_needs_refresh = TRUE;
+      g->wanted = key;
+      dt_iop_gui_leave_critical_section(self);
+      dt_print(DT_DEBUG_PIPE, "[lightsurface] %s: no light layer yet, placeholder", pname);
+    }
+  }
+  else if(!whole)
+  {
+    // export, thumbnails and cli always see the whole image; this is a
+    // dt_dev_image() pipe (a snapshot or the slideshow) rendering a zoomed view
     dt_print(DT_DEBUG_ALWAYS,
              "[lightsurface] %s pipe sees only part of the image, so there is no"
              " light layer; output unchanged", pname);
+  }
   else
   {
+    // export, thumbnails, darktable-cli and dt_dev_image() pipes: no gui
+    // data to share through, so compute a local layer
     dt_intrinsic_ctx_t *ctx = _get_ctx(self, model_id);
     if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in->width, roi_in->height);
     if(L)
     {
-      L->key = (_ls_key_t){ .imgid = pipe->image.id,
-                            .upstream = DT_INVALID_HASH,
-                            .model_hash = dt_intrinsic_model_hash(ctx) };
+      L->key = key;
       L->fell_back = fell_back;
     }
     else
@@ -729,8 +966,38 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
                "[lightsurface] no light layer with %s, output unchanged", model_id);
   }
 
+  if(L)
+    dt_print(DT_DEBUG_PIPE, "[lightsurface] %s: using the light layer %dx%d of %s",
+             pname, L->w, L->h, model_id);
+
   g_free(model_id);
   return L;
+}
+
+// the preview published a layer: redraw the canvases that rendered a
+// placeholder for it. runs in the GUI thread
+static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(!g) return;
+
+  // only when the layer is the one the placeholder waited for: otherwise a
+  // canvas whose key never matches would reprocess after every preview run,
+  // and each reprocess reruns the preview
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean refresh = g->full_needs_refresh && g->layer
+    && _key_equal(&g->layer->key, &g->wanted);
+  if(refresh) g->full_needs_refresh = FALSE;
+  dt_iop_gui_leave_critical_section(self);
+  if(!refresh) return;
+
+  dt_develop_t *dev = self->dev;
+  dt_print(DT_DEBUG_PIPE, "[lightsurface] light layer arrived, reprocessing the center");
+  // dt_dev_reprocess_center() obsoletes only the full pipe's cache; the second
+  // window's placeholder lines go the same way
+  if(dev->preview2.pipe)
+    dev->preview2.pipe->cache_obsolete_order = self->iop_order;
+  dt_dev_reprocess_center(dev, self->iop_order);
 }
 
 #endif // HAVE_AI
@@ -753,7 +1020,43 @@ void process(dt_iop_module_t *self,
   dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
 
 #ifdef HAVE_AI
+  // the module does not change the ROI, so in, out and the §M2 buffers share it
+  assert(roi_in->width == roi_out->width && roi_in->height == roi_out->height);
+
   _ls_layer_t *L = _layer_for_pipe(self, piece, in, roi_in);
+  if(!L) return;
+
+  const size_t npix = (size_t)roi_in->width * roi_in->height;
+  float *const guide = dt_alloc_align_float(npix * 4);
+  float *const lambda = dt_alloc_align_float(npix);
+  float *const lambda_f = dt_alloc_align_float(npix);
+  if(guide && lambda && lambda_f)
+  {
+    _log_guide(in, npix, L->y_floor, guide);
+    _light_full(L, guide, roi_in, piece, lambda, lambda_f);
+
+    gchar *dump = _dump_prefix(piece->pipe, L->model_id);
+    if(dump)
+    {
+      _dump(dump, "lambda_full", lambda, roi_in->width, roi_in->height, 1);
+      gchar *fn = g_strdup_printf("%s_full.txt", dump);
+      FILE *f = g_fopen(fn, "w");
+      if(f)
+      {
+        fprintf(f, "roi_x %d\nroi_y %d\nroi_w %d\nroi_h %d\nroi_scale %.9g\n"
+                "buf_in_w %d\nbuf_in_h %d\nlayer_w %d\nlayer_h %d\ny_floor %.9g\n",
+                roi_in->x, roi_in->y, roi_in->width, roi_in->height, roi_in->scale,
+                piece->buf_in.width, piece->buf_in.height, L->w, L->h, L->y_floor);
+        fclose(f);
+      }
+      g_free(fn);
+      g_free(dump);
+    }
+  }
+
+  dt_free_align(guide);
+  dt_free_align(lambda);
+  dt_free_align(lambda_f);
   _layer_unref(L);
 #endif
 }
@@ -794,6 +1097,27 @@ void gui_init(dt_iop_module_t *self)
     dt_bauhaus_widget_set_label(g->surface_hue[j], N_("surface lightness"), hue_labels[j]);
     dt_bauhaus_slider_set_format(g->surface_hue[j], _(" EV"));
   }
+
+#ifdef HAVE_AI
+  g->layer = NULL;
+  g->full_needs_refresh = FALSE;
+  DT_CONTROL_SIGNAL_HANDLE(DT_SIGNAL_DEVELOP_PREVIEW_PIPE_FINISHED,
+                           _preview_pipe_finished_callback);
+#endif
+}
+
+// the signal is disconnected by dt_iop_gui_cleanup_module() before this runs
+// (DT_CONTROL_SIGNAL_DISCONNECT_ALL, src/develop/imageop.c:2470)
+void gui_cleanup(dt_iop_module_t *self)
+{
+#ifdef HAVE_AI
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_gui_enter_critical_section(self);
+  _ls_layer_t *L = g->layer;
+  g->layer = NULL;
+  dt_iop_gui_leave_critical_section(self);
+  _layer_unref(L);
+#endif
 }
 
 // clang-format off
