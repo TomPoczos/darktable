@@ -124,6 +124,8 @@ typedef struct _ls_layer_t
   _ls_key_t key;             // DT_INVALID_HASH as upstream for local (non-shared) layers
   int w, h;                  // low-res size
   int src_w, src_h;          // size of the whole-image input it was computed from
+  float cov_x, cov_y;        // fraction of the image that input spans, per axis:
+                             // below 1 for a high-quality export (_roi_is_whole())
   float K, rho_ref, y_floor; // epic §M1
   float *lambda, *lambda_c, *lambda_f;  // w*h each
   float *rho, *Y, *hue, *sat;           // w*h each; for §M4 and the GUI
@@ -552,15 +554,16 @@ static inline void _hue_sat(const dt_aligned_pixel_t rgb,
   *s = (dmax > NORM_MIN && delta > NORM_MIN) ? delta / dmax : 0.0f;
 }
 
-// epic §M1 on the whole-image input `in` (W_in x H_in, 4 channels, working
+// epic §M1 on the whole-image input `in` (the ROI's size, 4 channels, working
 // RGB). runs the model, so it takes seconds to minutes; NULL on failure
 static _ls_layer_t *_layer_compute(dt_iop_module_t *self,
                                    dt_dev_pixelpipe_iop_t *piece,
                                    dt_intrinsic_ctx_t *ctx,
                                    const float *const in,
-                                   const int W_in,
-                                   const int H_in)
+                                   const dt_iop_roi_t *const roi_in)
 {
+  const int W_in = roi_in->width;
+  const int H_in = roi_in->height;
   const dt_iop_order_iccprofile_info_t *const wp
     = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
   if(!wp) return NULL;
@@ -656,6 +659,8 @@ static _ls_layer_t *_layer_compute(dt_iop_module_t *self,
   L->h = h;
   L->src_w = W_in;
   L->src_h = H_in;
+  L->cov_x = W_in / (roi_in->scale * piece->buf_in.width);
+  L->cov_y = H_in / (roi_in->scale * piece->buf_in.height);
   L->mp = *mp;
   L->model_id = g_strdup(model_id);
 
@@ -676,10 +681,12 @@ static _ls_layer_t *_layer_compute(dt_iop_module_t *self,
     FILE *f = g_fopen(fn, "w");
     if(f)
     {
-      fprintf(f, "w %d\nh %d\nsrc_w %d\nsrc_h %d\nK %.9g\nrho_ref %.9g\ny_floor %.9g\n"
+      fprintf(f, "w %d\nh %d\nsrc_w %d\nsrc_h %d\ncov_x %.9g\ncov_y %.9g\n"
+              "K %.9g\nrho_ref %.9g\ny_floor %.9g\n"
               "ms %.1f\nworking_size %d\nsplit_radius_rel %.9g\nsplit_sqrt_eps %.9g\n"
               "guide_radius_factor %.9g\nguide_sqrt_eps %.9g\nr_s %d\n",
-              w, h, W_in, H_in, L->K, L->rho_ref, L->y_floor, L->ms, mp->working_size,
+              w, h, W_in, H_in, L->cov_x, L->cov_y,
+              L->K, L->rho_ref, L->y_floor, L->ms, mp->working_size,
               mp->split_radius_rel, mp->split_sqrt_eps, mp->guide_radius_factor,
               mp->guide_sqrt_eps, r_s);
       fclose(f);
@@ -717,17 +724,20 @@ static void _log_guide(const float *const in, const size_t npix,
   }
 }
 
-// bilinear samples of a low-res field (lw x lh) at the ROI's pixel centers
-// (epic §M2.1-2); buf_in is the module's full input at scale 1
-static void _sample_lr(const float *const lr, const int lw, const int lh,
+// bilinear samples of a low-res field of layer L (L->w x L->h) at the ROI's
+// pixel centers (epic §M2.1-2); buf_in is the module's full input at scale 1.
+// the field spans only L's coverage of the image, so that is what maps to it
+static void _sample_lr(const _ls_layer_t *const L, const float *const lr,
                        const dt_iop_roi_t *const roi_in,
                        const dt_dev_pixelpipe_iop_t *const piece,
                        float *const out)
 {
   const int width = roi_in->width;
   const int height = roi_in->height;
-  const float sx = roi_in->scale * piece->buf_in.width;
-  const float sy = roi_in->scale * piece->buf_in.height;
+  const int lw = L->w;
+  const int lh = L->h;
+  const float sx = roi_in->scale * piece->buf_in.width * L->cov_x;
+  const float sy = roi_in->scale * piece->buf_in.height * L->cov_y;
   const float ox = roi_in->x;
   const float oy = roi_in->y;
 
@@ -764,21 +774,21 @@ static void _sample_refine(const _ls_layer_t *const L, const float *const lr,
 {
   const int width = roi_in->width;
   const int height = roi_in->height;
-  const float f = roi_in->scale * piece->buf_in.width / L->w;
+  const float f = roi_in->scale * piece->buf_in.width * L->cov_x / L->w;
 
   if(f <= 1.0f)
   {
-    _sample_lr(lr, L->w, L->h, roi_in, piece, out);
+    _sample_lr(L, lr, roi_in, piece, out);
     return;
   }
 
   float *const up = dt_alloc_align_float((size_t)width * height);
   if(!up)
   {
-    _sample_lr(lr, L->w, L->h, roi_in, piece, out);
+    _sample_lr(L, lr, roi_in, piece, out);
     return;
   }
-  _sample_lr(lr, L->w, L->h, roi_in, piece, up);
+  _sample_lr(L, lr, roi_in, piece, up);
   const int r = MAX(1, (int)ceilf(L->mp.guide_radius_factor * f));
   guided_filter(guide, up, out, width, height, 4, r, L->mp.guide_sqrt_eps,
                 1.0f, -FLT_MAX, FLT_MAX);
@@ -794,18 +804,28 @@ static void _light_full(const _ls_layer_t *const L, const float *const guide,
                         float *const lambda, float *const lambda_f)
 {
   _sample_refine(L, L->lambda, guide, roi_in, piece, lambda);
-  _sample_lr(L->lambda_f, L->w, L->h, roi_in, piece, lambda_f);
+  _sample_lr(L, L->lambda_f, roi_in, piece, lambda_f);
 }
 
 /* --- which pipe does what (LS-07 Part C) --- */
 
-// the ROI covers the whole image: this pipe can compute a layer itself
+// the ROI covers the whole image: this pipe can compute a layer itself.
+// a downscaled high-quality export runs here at scale 1 and ends short at the
+// right and bottom: imageio.c:1317 floors the output size and finalscale.c:94
+// maps it back with ceil(), which drops up to about 1/s + 1 input pixels at
+// output scale s. that shortfall is allowed on top of the rounding slack
 static gboolean _roi_is_whole(const dt_iop_roi_t *const roi_in,
                               const dt_dev_pixelpipe_iop_t *const piece)
 {
+  const dt_dev_pixelpipe_t *const pipe = piece->pipe;
+  const float s = pipe->processed_width > 0 && pipe->processed_height > 0
+    ? fminf((float)pipe->final_width / pipe->processed_width,
+            (float)pipe->final_height / pipe->processed_height)
+    : 0.0f;
+  const float slack = 2.0f + (s > 0.0f ? roi_in->scale / s + 1.0f : 0.0f);
   return roi_in->x == 0 && roi_in->y == 0
-    && fabsf(roi_in->width - roi_in->scale * piece->buf_in.width) <= 2.0f
-    && fabsf(roi_in->height - roi_in->scale * piece->buf_in.height) <= 2.0f;
+    && fabsf(roi_in->width - roi_in->scale * piece->buf_in.width) <= slack
+    && fabsf(roi_in->height - roi_in->scale * piece->buf_in.height) <= slack;
 }
 
 // the upstream part of the layer key: dt_dev_hash_plus(..., BACK_EXCL) without
@@ -903,7 +923,7 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
     if(!L)
     {
       dt_intrinsic_ctx_t *ctx = _get_ctx(self, model_id);
-      if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in->width, roi_in->height);
+      if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in);
       if(L)
       {
         L->key = key;
@@ -955,7 +975,7 @@ static _ls_layer_t *_layer_for_pipe(dt_iop_module_t *self,
     // export, thumbnails, darktable-cli and dt_dev_image() pipes: no gui
     // data to share through, so compute a local layer
     dt_intrinsic_ctx_t *ctx = _get_ctx(self, model_id);
-    if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in->width, roi_in->height);
+    if(ctx) L = _layer_compute(self, piece, ctx, in, roi_in);
     if(L)
     {
       L->key = key;
