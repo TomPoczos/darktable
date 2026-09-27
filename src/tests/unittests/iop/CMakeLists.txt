@@ -14,10 +14,20 @@ add_cmocka_test(test_rawdenoise
                 SOURCES test_rawdenoise.c
                 LINK_LIBRARIES lib_darktable cmocka)
 
+# the light and surface math is compiled only with HAVE_AI
+if(USE_AI)
+  add_cmocka_mock_test(test_lightsurface
+                       SOURCES test_lightsurface.c
+                       LINK_LIBRARIES lib_darktable cmocka)
+endif(USE_AI)
+
 # Windows: libs have to be copied next to the executable
 if(WIN32)
     _copy_required_library(test_filmicrgb lib_darktable)
     _copy_required_library(test_lut3d_bounds lib_darktable)
     _copy_required_library(test_colorin_hsm lib_darktable)
     _copy_required_library(test_rawdenoise lib_darktable)
+    if(USE_AI)
+      _copy_required_library(test_lightsurface lib_darktable)
+    endif(USE_AI)
 endif(WIN32)
