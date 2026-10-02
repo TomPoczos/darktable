@@ -187,6 +187,140 @@ static void test_gain(void **state)
   assert_true(_gain(0.0f, 0.0f) == 0.0f);
 }
 
+static void test_view_modes(void **state)
+{
+  const float in[4] = { 0.2f, 0.4f, 0.1f, 1.0f };
+  const float warm[3] = { 2.0f, 0.9f, 0.2f };
+  const float cool[3] = { 0.2f, 0.7f, 2.0f };
+  float o[4] = { 0.0f };
+
+  // light: gray at 0.1845 * 2^(lambda + dL)
+  _view_rgb(LS_DISPLAY_LIGHT, in, 0.3f, -1.0f, 0.5f, 9.0f, 9.0f, 9.0f, warm, cool, o);
+  const float light = 0.1845f * exp2f(-0.5f);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], light, 1e-6f);
+
+  // surface: the input scaled by 0.1845 * 2^(dS - lambda - rho_ref)
+  _view_rgb(LS_DISPLAY_SURFACE, in, 0.3f, -1.0f, 9.0f, 0.5f, 9.0f, 0.25f, warm, cool, o);
+  const float e = 0.1845f * exp2f(0.5f + 1.0f - 0.25f);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], in[c] * e, 1e-6f);
+
+  // changes: |g| = 1 gives t = 0.5; g > 0 is warm, g < 0 cool, g = 0 gray
+  _view_rgb(LS_DISPLAY_CHANGES, in, 0.3f, 0.0f, 9.0f, 9.0f, 1.0f, 0.0f, warm, cool, o);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], 0.3f * (0.5f + 0.5f * warm[c]), 1e-6f);
+  _view_rgb(LS_DISPLAY_CHANGES, in, 0.3f, 0.0f, 9.0f, 9.0f, -1.0f, 0.0f, warm, cool, o);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], 0.3f * (0.5f + 0.5f * cool[c]), 1e-6f);
+  _view_rgb(LS_DISPLAY_CHANGES, in, 0.3f, 0.0f, 9.0f, 9.0f, 0.0f, 0.0f, warm, cool, o);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], 0.3f, 1e-6f);
+  // t saturates at |g| = 2
+  _view_rgb(LS_DISPLAY_CHANGES, in, 0.3f, 0.0f, 9.0f, 9.0f, 5.0f, 0.0f, warm, cool, o);
+  for(int c = 0; c < 3; c++) assert_float_equal(o[c], 0.3f * warm[c], 1e-6f);
+
+  // stripes: 8 px bands along the diagonal, integer division
+  assert_true(_warn_stripe(0, 0));
+  assert_true(_warn_stripe(7, 0));
+  assert_false(_warn_stripe(8, 0));
+  assert_false(_warn_stripe(4, 4));
+  assert_true(_warn_stripe(8, 8));
+  assert_true(_warn_stripe(1000, 3) == _warn_stripe(3, 1000));
+
+  // overlay: half magenta at the pixel's luminance
+  float w[3] = { 0.2f, 0.4f, 0.6f };
+  _warn_mix(w, 0.5f);
+  assert_float_equal(w[0], 0.35f, 1e-6f);
+  assert_float_equal(w[1], 0.2f, 1e-6f);
+  assert_float_equal(w[2], 0.55f, 1e-6f);
+}
+
+// the whole view loop: tint normalization, overlay placement in image
+// coordinates, and the normal-mode gain under the overlay
+static void test_apply_view(void **state)
+{
+  // a linear work profile with the Rec.2020 luminance row
+  dt_iop_order_iccprofile_info_t wp;
+  memset(&wp, 0, sizeof(wp));
+  wp.matrix_in[1][0] = 0.2627f;
+  wp.matrix_in[1][1] = 0.6780f;
+  wp.matrix_in[1][2] = 0.0593f;
+
+  // relief = 1 and lambda_c = 0 make dL = lambda_f, so g = lambda_f
+  dt_iop_lightsurface_data_t d;
+  _data_init(&d);
+  d.relief = 1.0f;
+  float m[LS_LIGHT_NODES];
+  _curve_tangents(d.light_node, m);
+
+  enum { W = 24, H = 3, N = W * H };
+  const dt_iop_roi_t roi = { .x = 5, .y = 2, .width = W, .height = H, .scale = 1.0f };
+  float *const in = dt_alloc_align_float(4 * N);
+  float *const out = dt_alloc_align_float(4 * N);
+  float *const lambda = dt_alloc_align_float(N);
+  float *const lambda_f = dt_alloc_align_float(N);
+  assert_non_null(in);
+  assert_non_null(out);
+  assert_non_null(lambda);
+  assert_non_null(lambda_f);
+  for(int k = 0; k < N; k++)
+  {
+    in[4 * k + 0] = _rand_uniform(0.01f, 1.0f);
+    in[4 * k + 1] = _rand_uniform(0.01f, 1.0f);
+    in[4 * k + 2] = _rand_uniform(0.01f, 1.0f);
+    in[4 * k + 3] = 0.75f;
+    lambda_f[k] = _rand_uniform(-3.0f, 3.0f);
+    // every other pixel above the warning level
+    lambda[k] = lambda_f[k] + (k % 2 ? LS_WARN_LAMBDA + 0.5f : LS_WARN_LAMBDA - 0.5f);
+  }
+
+  // changes: the tints have unit luminance, so the luminance of the input is
+  // kept whatever the gain, and a brightened pixel is warm, a darkened one cool
+  _apply_view(in, out, lambda, lambda_f, NULL, &roi, &d, m, 0.0f, LS_DISPLAY_CHANGES, FALSE,
+              &wp);
+  for(int k = 0; k < N; k++)
+  {
+    const float Yin = dt_ioppr_get_rgb_matrix_luminance(in + 4 * k, wp.matrix_in, wp.lut_in,
+                                                        wp.unbounded_coeffs_in, wp.lutsize,
+                                                        wp.nonlinearlut);
+    const float Yout = dt_ioppr_get_rgb_matrix_luminance(out + 4 * k, wp.matrix_in, wp.lut_in,
+                                                         wp.unbounded_coeffs_in, wp.lutsize,
+                                                         wp.nonlinearlut);
+    assert_float_equal(Yout, Yin, 1e-5f);
+    if(fabsf(lambda_f[k]) > 0.1f)
+      assert_true(lambda_f[k] > 0.0f ? out[4 * k] > out[4 * k + 2] : out[4 * k] < out[4 * k + 2]);
+    assert_true(out[4 * k + 3] == in[4 * k + 3]);
+  }
+
+  // normal with the overlay: in * 2^g, with stripes in image coordinates only
+  // over the pixels above the warning level
+  _apply_view(in, out, lambda, lambda_f, NULL, &roi, &d, m, 0.0f, LS_DISPLAY_NORMAL, TRUE, &wp);
+  int striped = 0;
+  for(int k = 0; k < N; k++)
+  {
+    dt_aligned_pixel_t rgb = { 0.0f };
+    const float e = exp2f(lambda_f[k]);
+    for(int c = 0; c < 3; c++) rgb[c] = in[4 * k + c] * e;
+    const int px = roi.x + k % W;
+    const int py = roi.y + k / W;
+    if(lambda[k] > LS_WARN_LAMBDA && ((px + py) / 8) % 2 == 0)
+    {
+      const float Y = dt_ioppr_get_rgb_matrix_luminance(rgb, wp.matrix_in, wp.lut_in,
+                                                        wp.unbounded_coeffs_in, wp.lutsize,
+                                                        wp.nonlinearlut);
+      rgb[0] = 0.5f * rgb[0] + 0.5f * Y;
+      rgb[1] = 0.5f * rgb[1];
+      rgb[2] = 0.5f * rgb[2] + 0.5f * Y;
+      striped++;
+    }
+    for(int c = 0; c < 3; c++) assert_float_equal(out[4 * k + c], rgb[c], 1e-5f * rgb[c] + 1e-7f);
+    assert_true(out[4 * k + 3] == in[4 * k + 3]);
+  }
+  // both cases occur
+  assert_true(striped > 0 && striped < N / 2);
+
+  dt_free_align(in);
+  dt_free_align(out);
+  dt_free_align(lambda);
+  dt_free_align(lambda_f);
+}
+
 static void test_hue_sat(void **state)
 {
   // the golden hues use a plain Rec.2020 to XYZ D65 matrix, so the hue code
@@ -364,6 +498,8 @@ int main(int argc, char *argv[])
     cmocka_unit_test(test_hue_curve),
     cmocka_unit_test(test_surface_delta),
     cmocka_unit_test(test_gain),
+    cmocka_unit_test(test_view_modes),
+    cmocka_unit_test(test_apply_view),
     cmocka_unit_test(test_hue_sat),
     cmocka_unit_test(test_box_mean),
     cmocka_unit_test(test_gray_guided),

@@ -1042,6 +1042,146 @@ static void _apply_gain(const float *const restrict in,
   }
 }
 
+// the view modes of epic §M7. these are a darkroom aid only: the loop below
+// runs in the full pipe with a GUI attached, and every other pipe (preview,
+// export, thumbnail, cli) renders the edit normally
+
+// the tint of a brightened region, and of a darkened one (epic §M7)
+static const float _ls_tint_warm[3] = { 1.0f, 0.45f, 0.1f };
+static const float _ls_tint_cool[3] = { 0.1f, 0.35f, 1.0f };
+// the middle gray that the key light and the median surface are shown as
+#define LS_VIEW_GRAY 0.1845f
+
+// one pixel of the light, surface and changes views. Yin is the luminance of
+// the input, only read by LS_DISPLAY_CHANGES, whose two tints must already be
+// normalized to unit luminance
+static inline void _view_rgb(const dt_iop_lightsurface_display_t mode,
+                             const float *const restrict in,
+                             const float Yin,
+                             const float lambda,
+                             const float dL,
+                             const float dS,
+                             const float g,
+                             const float rho_ref,
+                             const float warm[3],
+                             const float cool[3],
+                             float *const restrict o)
+{
+  switch(mode)
+  {
+    case LS_DISPLAY_LIGHT:
+    {
+      const float v = LS_VIEW_GRAY * exp2f(lambda + dL);
+      for_three_channels(c) o[c] = v;
+      break;
+    }
+    case LS_DISPLAY_SURFACE:
+    {
+      const float e = LS_VIEW_GRAY * exp2f(dS - lambda - rho_ref);
+      for_three_channels(c) o[c] = in[c] * e;
+      break;
+    }
+    case LS_DISPLAY_CHANGES:
+    {
+      const float t = fminf(1.0f, fabsf(g) * 0.5f);
+      const float *const tint = g > 0.0f ? warm : cool;
+      for_three_channels(c) o[c] = Yin * ((1.0f - t) + t * tint[c]);
+      break;
+    }
+    default:
+      for_three_channels(c) o[c] = in[c];
+      break;
+  }
+}
+
+// the stripes of the warning overlay (epic §M7): 8 px bands along the
+// diagonal, in the image's coordinates so that they stay put while panning
+static inline gboolean _warn_stripe(const int px, const int py)
+{
+  return ((px + py) / 8) % 2 == 0;
+}
+
+// 50 % magenta at the luminance of the pixel, for a stripe over a light level
+// above the warning threshold
+static inline void _warn_mix(float *const restrict o, const float Yout)
+{
+  o[0] = 0.5f * o[0] + 0.5f * Yout;
+  o[1] = 0.5f * o[1];
+  o[2] = 0.5f * o[2] + 0.5f * Yout;
+}
+
+// the view modes and the overlay over the whole ROI, in place of _apply_gain().
+// the mode switch is loop invariant and this runs only in the darkroom
+static void _apply_view(const float *const restrict in,
+                        float *const restrict out,
+                        const float *const restrict lambda,
+                        const float *const restrict lambda_f,
+                        const float *const restrict dS,
+                        const dt_iop_roi_t *const roi_out,
+                        const dt_iop_lightsurface_data_t *const d,
+                        const float m[LS_LIGHT_NODES],
+                        const float rho_ref,
+                        const dt_iop_lightsurface_display_t mode,
+                        const gboolean warn,
+                        const dt_iop_order_iccprofile_info_t *const wp)
+{
+  // the tints at unit luminance, once
+  dt_aligned_pixel_t warm = { _ls_tint_warm[0], _ls_tint_warm[1], _ls_tint_warm[2], 0.0f };
+  dt_aligned_pixel_t cool = { _ls_tint_cool[0], _ls_tint_cool[1], _ls_tint_cool[2], 0.0f };
+  const float Yw = dt_ioppr_get_rgb_matrix_luminance(warm, wp->matrix_in, wp->lut_in,
+                                                     wp->unbounded_coeffs_in, wp->lutsize,
+                                                     wp->nonlinearlut);
+  const float Yc = dt_ioppr_get_rgb_matrix_luminance(cool, wp->matrix_in, wp->lut_in,
+                                                     wp->unbounded_coeffs_in, wp->lutsize,
+                                                     wp->nonlinearlut);
+  for_three_channels(c)
+  {
+    warm[c] /= Yw;
+    cool[c] /= Yc;
+  }
+
+  const int width = roi_out->width;
+  const size_t npix = (size_t)width * roi_out->height;
+  DT_OMP_FOR()
+  for(size_t k = 0; k < npix; k++)
+  {
+    const float *const px_in = in + 4 * k;
+    float *const px_out = out + 4 * k;
+    const float lam = lambda[k];
+    const float dL = _light_delta(lam, lam - lambda_f[k], lambda_f[k], d, m);
+    const float ds = dS ? dS[k] : 0.0f;
+    const float g = _gain(dL, ds);
+    dt_aligned_pixel_t rgb = { px_in[0], px_in[1], px_in[2], 0.0f };
+
+    if(mode == LS_DISPLAY_NORMAL)
+    {
+      const float e = exp2f(g);
+      for_three_channels(c) rgb[c] *= e;
+    }
+    else
+    {
+      const float Yin = mode == LS_DISPLAY_CHANGES
+        ? dt_ioppr_get_rgb_matrix_luminance(px_in, wp->matrix_in, wp->lut_in,
+                                            wp->unbounded_coeffs_in, wp->lutsize,
+                                            wp->nonlinearlut)
+        : 0.0f;
+      _view_rgb(mode, px_in, Yin, lam, dL, ds, g, rho_ref, warm, cool, rgb);
+    }
+
+    if(warn && lam > LS_WARN_LAMBDA
+       && _warn_stripe(roi_out->x + (int)(k % width), roi_out->y + (int)(k / width)))
+    {
+      const float Yout = dt_ioppr_get_rgb_matrix_luminance(rgb, wp->matrix_in, wp->lut_in,
+                                                           wp->unbounded_coeffs_in, wp->lutsize,
+                                                           wp->nonlinearlut);
+      _warn_mix(rgb, Yout);
+    }
+
+    for_three_channels(c) px_out[c] = rgb[c];
+    px_out[3] = px_in[3];
+  }
+}
+
 /* --- which pipe does what (LS-07 Part C) --- */
 
 // the ROI covers the whole image: this pipe can compute a layer itself.
@@ -1303,14 +1443,31 @@ void process(dt_iop_module_t *self,
 
   const dt_iop_lightsurface_data_t *const d = piece->data;
 
+  // the view modes and the overlay are a darkroom aid: only the full pipe with
+  // a GUI renders them. the fields are read once, here, not per pixel
+  dt_iop_lightsurface_gui_data_t *const g = self->gui_data;
+  dt_iop_lightsurface_display_t mode = LS_DISPLAY_NORMAL;
+  gboolean warn = FALSE;
+  if(self->dev->gui_attached && g && dt_pipe_is_full(piece->pipe))
+  {
+    dt_iop_gui_enter_critical_section(self);
+    mode = g->display_mode;
+    warn = g->show_warn;
+    dt_iop_gui_leave_critical_section(self);
+  }
+  const gboolean viewing = mode != LS_DISPLAY_NORMAL || warn;
+
   // fast path, for speed only: at zero params the math below is an exact
   // identity as well (epic §M5). the gui preview still computes the layer,
-  // which the light graph needs as soon as the module is enabled
+  // which the light graph needs as soon as the module is enabled, and the
+  // views need it at zero params too
   const gboolean zero = _params_are_zero(d);
   const gboolean gui_preview = self->dev->gui_attached && self->gui_data
     && dt_pipe_is_preview(piece->pipe);
-  _ls_layer_t *L = zero && !gui_preview ? NULL : _layer_for_pipe(self, piece, in, roi_in);
-  if(!L || zero)
+  _ls_layer_t *L = zero && !gui_preview && !viewing
+    ? NULL
+    : _layer_for_pipe(self, piece, in, roi_in);
+  if(!L || (zero && !viewing))
   {
     dt_iop_image_copy_by_size(out, in, roi_out->width, roi_out->height, 4);
     _layer_unref(L);
@@ -1345,7 +1502,16 @@ void process(dt_iop_module_t *self,
     // once per call, not per pixel
     float m[LS_LIGHT_NODES];
     _curve_tangents(d->light_node, m);
-    _apply_gain(in, out, lambda, lambda_f, dS, npix, d, m);
+    const dt_iop_order_iccprofile_info_t *const wp
+      = dt_ioppr_get_pipe_work_profile_info(piece->pipe);
+    if(viewing && wp)
+    {
+      _apply_view(in, out, lambda, lambda_f, dS, roi_out, d, m, L->rho_ref, mode, warn, wp);
+      // later modules would alter what is shown
+      piece->pipe->mask_display = DT_DEV_PIXELPIPE_DISPLAY_PASSTHRU;
+    }
+    else
+      _apply_gain(in, out, lambda, lambda_f, dS, npix, d, m);
 
     gchar *dump = _dump_prefix(piece->pipe, L->model_id);
     if(dump)
