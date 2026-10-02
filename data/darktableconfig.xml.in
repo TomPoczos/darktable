@@ -3463,6 +3463,13 @@
     <longdescription>height of color zones graph in per cent</longdescription>
   </dtconfig>
   <dtconfig>
+    <name>plugins/darkroom/lightsurface/graphheight</name>
+    <type min="100" max="300">int</type>
+    <default>200</default>
+    <shortdescription>height of the light and surface graph</shortdescription>
+    <longdescription>height of the light graph of the light and surface module</longdescription>
+  </dtconfig>
+  <dtconfig>
     <name>plugins/darkroom/lowlight/graphheight</name>
     <type min="100" max="300">int</type>
     <default>200</default>

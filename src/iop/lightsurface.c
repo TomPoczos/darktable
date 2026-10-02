@@ -29,6 +29,7 @@
 #include "develop/imageop_gui.h"
 #include "dtgtk/paint.h"
 #include "gui/accelerators.h"
+#include "gui/draw.h"
 #include "gui/gtk.h"
 #include "iop/iop_api.h"
 
@@ -80,6 +81,16 @@ DT_MODULE_INTROSPECTION(1, dt_iop_lightsurface_params_t)
 #define LS_KEY_PERCENTILE 90.0
 // the floor under every log2 in the epic's math: log2(x) means log2(max(x, eps))
 #define LS_EPS (1.0f / 1048576.0f)
+
+// the light histograms of epic §M6: 0.1 EV bins over [-12, +2] EV
+#define LS_HIST_BINS 140
+#define LS_HIST_MIN (-12.0f)
+#define LS_HIST_MAX 2.0f
+// the light graph shows light levels in [-8, +2] EV on x, and corrections in
+// [-2, +2] EV on y, the range of the node params
+#define LS_GRAPH_X_MIN (-8.0f)
+#define LS_GRAPH_X_MAX 2.0f
+#define LS_GRAPH_Y_MAX 2.0f
 
 typedef struct dt_iop_lightsurface_params_t
 {
@@ -164,7 +175,8 @@ typedef enum dt_iop_lightsurface_display_t
 typedef struct dt_iop_lightsurface_gui_data_t
 {
   GtkNotebook *notebook;
-  GtkWidget *graph_box, *ratio_label;
+  GtkDrawingArea *area;
+  GtkWidget *ratio_label;
   GtkWidget *form, *relief, *fill;
   dt_gui_collapsible_section_t nodes_section;
   GtkWidget *light_node[LS_LIGHT_NODES];
@@ -177,6 +189,18 @@ typedef struct dt_iop_lightsurface_gui_data_t
   // history. under the gui lock, since the full pipe reads them
   dt_iop_lightsurface_display_t display_mode;
   gboolean show_warn;
+  // the light graph, GUI thread only. the histograms count light levels
+  // (epic §M6) before and after the light edit
+  float hist_before[LS_HIST_BINS], hist_after[LS_HIST_BINS];
+  gboolean hist_valid;     // a layer of the current image and model was found
+  float ratio_before, ratio_after;
+  int hovered_node, dragged_node; // -1 for none
+  float drag_offset;       // node value minus the pointer's, in EV, at the press
+  gboolean pointer_in;     // the pointer is over the graph, at pointer_x
+  double pointer_x;        // in graph coordinates, for scrolling
+  // the light level under the pointer on the image, drawn on the graph
+  float cursor_lambda;
+  gboolean cursor_lambda_valid;
 #ifdef HAVE_AI
   // shared with the pipe threads, under the gui lock
   _ls_layer_t *layer;          // published by the preview pipe
@@ -187,6 +211,7 @@ typedef struct dt_iop_lightsurface_gui_data_t
 } dt_iop_lightsurface_gui_data_t;
 
 static void _update_status(dt_iop_module_t *self);
+static void _update_stats(dt_iop_module_t *self);
 
 const char *name()
 {
@@ -275,8 +300,8 @@ static void _ctx_free(gpointer data)
 void init_global(dt_iop_module_so_t *self)
 {
   dt_iop_lightsurface_global_data_t *gd = calloc(1, sizeof(*gd));
-  dt_pthread_mutex_init(&gd->lock, NULL);
-  dt_pthread_mutex_init(&gd->load_lock, NULL);
+  dt_pthread_mutex_init(&gd->lock);
+  dt_pthread_mutex_init(&gd->load_lock);
   gd->ctx_by_id = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, _ctx_free);
   self->data = gd;
 }
@@ -843,6 +868,11 @@ static void _light_full(const _ls_layer_t *const L, const float *const guide,
 // lc + (lambda - lc) != lambda for about 2 % of inputs, so the module would
 // stop being an identity at defaults (epic §5)
 
+#endif // HAVE_AI
+
+// the light curve and the light delta are needed without AI too: the light
+// graph draws them
+
 // secants and tangents of the node curve F, epic §M3.3. v must be sanitized
 // (_sanitize_nodes(), which commit_params() applies): only then are all the
 // secants at least LS_NODE_MIN_STEP and the curve defined
@@ -904,6 +934,8 @@ static inline float _light_delta(const float lambda,
   const float a3 = log2f(1.0f + phi * exp2f(fminf(-lambda2, 100.0f))) - log2f(1.0f + phi);
   return a1 + a2 + a3;
 }
+
+#ifdef HAVE_AI
 
 // H(h) of epic §M4.3: the periodic Catmull-Rom spline through (45 j, q_j)
 static inline float _hue_curve(const float h_deg, const float q[LS_HUE_NODES])
@@ -1218,6 +1250,7 @@ static void _preview_pipe_finished_callback(gpointer instance, dt_iop_module_t *
   if(!g) return;
 
   _update_status(self);
+  _update_stats(self);
 
   // only when the layer is the one the placeholder waited for: otherwise a
   // canvas whose key never matches would reprocess after every preview run,
@@ -1510,6 +1543,7 @@ static void _model_changed(GtkWidget *widget, dt_iop_module_t *self)
   dt_dev_add_history_item(darktable.develop, self, TRUE);
   _rebuild_models(self);
   _update_status(self);
+  _update_stats(self);
 }
 
 static void _display_changed(GtkWidget *widget, dt_iop_module_t *self)
@@ -1566,6 +1600,540 @@ static void _push_nodes(dt_iop_module_t *self, const int i)
   DT_LEAVE_GUI_UPDATE();
 }
 
+/* --- light graph --- */
+
+// the node values as commit_params() sanitizes them, and their tangents
+static void _graph_nodes(const dt_iop_lightsurface_params_t *const p,
+                         dt_iop_lightsurface_data_t *const d,
+                         float m[LS_LIGHT_NODES])
+{
+  memcpy(d, p, sizeof(*d));
+  _sanitize_nodes(d->light_node);
+  _curve_tangents(d->light_node, m);
+}
+
+#ifdef HAVE_AI
+static inline void _hist_add(float hist[LS_HIST_BINS], const float v)
+{
+  const float b = (v - LS_HIST_MIN) * (LS_HIST_BINS / (LS_HIST_MAX - LS_HIST_MIN));
+  // also false for NaN
+  if(b >= 0.0f && b < (float)LS_HIST_BINS) hist[(int)b] += 1.0f;
+}
+
+// the k-th smallest of a[0, n), which ends up at a[k] with nothing larger
+// before it (Hoare's selection). the stats run on every drag step, where
+// two full sorts of a layer took 64 ms
+static float _select(float *const a, const int64_t n, const int64_t k)
+{
+  int64_t lo = 0, hi = n - 1;
+  while(lo < hi)
+  {
+    const float pivot = a[lo + (hi - lo) / 2];
+    int64_t i = lo, j = hi;
+    while(i <= j)
+    {
+      while(a[i] < pivot) i++;
+      while(a[j] > pivot) j--;
+      if(i <= j)
+      {
+        const float t = a[i];
+        a[i++] = a[j];
+        a[j--] = t;
+      }
+    }
+    // now a[lo, j] <= pivot <= a[i, hi], and anything between equals pivot
+    if(k <= j)
+      hi = j;
+    else if(k >= i)
+      lo = i;
+    else
+      break;
+  }
+  return a[k];
+}
+
+// P90 - P10 of the finite values of a, nearest rank as in _percentile();
+// reorders a. 0 if there are none
+static float _lighting_ratio(float *const a, const size_t n)
+{
+  size_t m = 0;
+  for(size_t k = 0; k < n; k++)
+    if(dt_isfinite(a[k])) a[m++] = a[k];
+  if(!m) return 0.0f;
+  const int64_t k90 = (int64_t)floor(90.0 / 100.0 * (double)(m - 1));
+  const int64_t k10 = (int64_t)floor(10.0 / 100.0 * (double)(m - 1));
+  const float p90 = _select(a, m, k90);
+  // the selection left the k90 smallest values in front of a[k90]
+  const float p10 = k10 < k90 ? _select(a, k90, k10) : p90;
+  return p90 - p10;
+}
+
+// epic §M6 for a layer and the committed params d (nodes sanitized, m their
+// tangents): histograms of the light level before and after the light edit,
+// lambda and lambda + dL, counted on every 2nd pixel in x and y, and the
+// lighting ratio of each, taken on the same samples. FALSE if out of memory
+static gboolean _light_stats(const _ls_layer_t *const L,
+                             const dt_iop_lightsurface_data_t *const d,
+                             const float m[LS_LIGHT_NODES],
+                             float hist_before[LS_HIST_BINS],
+                             float hist_after[LS_HIST_BINS],
+                             float *const ratio_before,
+                             float *const ratio_after)
+{
+  const int sw = (L->w + 1) / 2;
+  const int sh = (L->h + 1) / 2;
+  const size_t ns = (size_t)sw * sh;
+  float *const before = dt_alloc_align_float(ns);
+  float *const after = dt_alloc_align_float(ns);
+  if(!before || !after)
+  {
+    dt_free_align(before);
+    dt_free_align(after);
+    return FALSE;
+  }
+
+  DT_OMP_FOR()
+  for(size_t s = 0; s < ns; s++)
+  {
+    const size_t k = (size_t)2 * (s / sw) * L->w + 2 * (s % sw);
+    const float lambda = L->lambda[k];
+    before[s] = lambda;
+    after[s] = lambda + _light_delta(lambda, L->lambda_c[k], L->lambda_f[k], d, m);
+  }
+
+  memset(hist_before, 0, sizeof(float) * LS_HIST_BINS);
+  memset(hist_after, 0, sizeof(float) * LS_HIST_BINS);
+  for(size_t s = 0; s < ns; s++)
+  {
+    _hist_add(hist_before, before[s]);
+    _hist_add(hist_after, after[s]);
+  }
+  *ratio_before = _lighting_ratio(before, ns);
+  *ratio_after = _lighting_ratio(after, ns);
+
+  dt_free_align(before);
+  dt_free_align(after);
+  return TRUE;
+}
+#endif
+
+// the graph's statistics and the ratio label, from the current layer
+static void _update_stats(dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  gboolean valid = FALSE;
+
+#ifdef HAVE_AI
+  const dt_iop_lightsurface_params_t *p = self->params;
+  // only a layer of this image and of the model the edit uses, as for the
+  // status line: until the right one arrives the graph shows no histogram
+  gboolean fell_back = FALSE;
+  char *id = dt_ai_registry_is_enabled() ? _resolve_model_id(p->model_hash, &fell_back) : NULL;
+  const uint32_t hash = id ? dt_intrinsic_hash(id) : 0;
+  g_free(id);
+
+  dt_iop_gui_enter_critical_section(self);
+  _ls_layer_t *L = hash && g->layer
+    && g->layer->key.imgid == self->dev->image_storage.id
+    && g->layer->key.model_hash == hash
+    ? _layer_ref(g->layer) : NULL;
+  dt_iop_gui_leave_critical_section(self);
+
+  if(L)
+  {
+    dt_iop_lightsurface_data_t d;
+    float m[LS_LIGHT_NODES];
+    _graph_nodes(p, &d, m);
+    valid = _light_stats(L, &d, m, g->hist_before, g->hist_after,
+                         &g->ratio_before, &g->ratio_after);
+    _layer_unref(L);
+  }
+#endif
+
+  g->hist_valid = valid;
+  gchar *text = NULL;
+  if(!valid)
+    text = g_strdup("");
+  else if(fabsf(g->ratio_after - g->ratio_before) < 0.05f)
+    text = g_strdup_printf(_("lighting ratio %.1f EV"), g->ratio_before);
+  else
+    text = g_strdup_printf(_("lighting ratio %.1f EV → %.1f EV"),
+                           g->ratio_before, g->ratio_after);
+  gtk_label_set_text(GTK_LABEL(g->ratio_label), text);
+  g_free(text);
+  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+}
+
+static void _graph_geometry(GtkWidget *widget, int *inset, int *width, int *height)
+{
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+  *inset = DT_PIXEL_APPLY_DPI(4);
+  *width = allocation.width - 2 * (*inset);
+  *height = allocation.height - 2 * (*inset) - DT_RESIZE_HANDLE_SIZE;
+}
+
+// light level in EV to graph x, and back
+static inline float _graph_x(const float ev, const int width)
+{
+  return (ev - LS_GRAPH_X_MIN) / (LS_GRAPH_X_MAX - LS_GRAPH_X_MIN) * width;
+}
+
+static inline float _graph_ev(const double x, const int width)
+{
+  return LS_GRAPH_X_MIN + (float)x / MAX(width, 1) * (LS_GRAPH_X_MAX - LS_GRAPH_X_MIN);
+}
+
+// correction in EV to graph y, and back
+static inline float _graph_y(const float c, const int height)
+{
+  return (0.5f - 0.5f * c / LS_GRAPH_Y_MAX) * height;
+}
+
+static inline float _graph_c(const double y, const int height)
+{
+  return (1.0f - 2.0f * (float)y / MAX(height, 1)) * LS_GRAPH_Y_MAX;
+}
+
+// x_i of light node i: -7 ... +1 EV
+static inline float _node_ev(const int i)
+{
+  return (float)(i - (LS_LIGHT_NODES - 2));
+}
+
+// the node drawn within 8 px of (x, y) in graph coordinates, the nearest
+// if several are; -1 if none is
+static int _node_at(dt_iop_module_t *self,
+                    const double x, const double y,
+                    const int width, const int height)
+{
+  dt_iop_lightsurface_data_t d;
+  float m[LS_LIGHT_NODES];
+  _graph_nodes(self->params, &d, m);
+
+  const double r = DT_PIXEL_APPLY_DPI(8);
+  double best = r * r;
+  int node = -1;
+  for(int i = 0; i < LS_LIGHT_NODES; i++)
+  {
+    const double dx = x - _graph_x(_node_ev(i), width);
+    const double dy = y - _graph_y(d.light_node[i], height);
+    const double d2 = dx * dx + dy * dy;
+    if(d2 <= best)
+    {
+      best = d2;
+      node = i;
+    }
+  }
+  return node;
+}
+
+// a light histogram as a path through its bin centers, from and back to
+// the bottom of the graph
+static void _hist_path(cairo_t *cr,
+                       const float hist[LS_HIST_BINS],
+                       const float scale,
+                       const int width, const int height)
+{
+  const float bin = (LS_HIST_MAX - LS_HIST_MIN) / LS_HIST_BINS;
+  cairo_move_to(cr, _graph_x(LS_HIST_MIN + 0.5f * bin, width), height);
+  for(int b = 0; b < LS_HIST_BINS; b++)
+    cairo_line_to(cr, _graph_x(LS_HIST_MIN + (b + 0.5f) * bin, width),
+                  height - scale * hist[b]);
+  cairo_line_to(cr, _graph_x(LS_HIST_MAX - 0.5f * bin, width), height);
+}
+
+static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  if(width <= 0 || height <= 0) return FALSE;
+
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+  cairo_surface_t *cst =
+    dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, allocation.width, allocation.height);
+  cairo_t *cr = cairo_create(cst);
+  gtk_render_background(gtk_widget_get_style_context(widget), cr,
+                        0, 0, allocation.width, allocation.height);
+  cairo_translate(cr, inset, inset);
+
+  // background and border
+  cairo_rectangle(cr, 0, 0, width, height);
+  set_color(cr, darktable.bauhaus->graph_bg);
+  cairo_fill_preserve(cr);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  set_color(cr, darktable.bauhaus->graph_border);
+  cairo_stroke(cr);
+
+  cairo_save(cr);
+  cairo_rectangle(cr, 0, 0, width, height);
+  cairo_clip(cr);
+
+  // a grid line per EV of light, and the zero correction
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(0.5));
+  set_color(cr, darktable.bauhaus->graph_grid);
+  for(int ev = (int)ceilf(LS_GRAPH_X_MIN); ev <= (int)floorf(LS_GRAPH_X_MAX); ev++)
+  {
+    if(ev == 0) continue;
+    const float x = _graph_x(ev, width);
+    dt_draw_line(cr, x, 0, x, height);
+  }
+  cairo_stroke(cr);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  dt_draw_line(cr, 0, _graph_y(0.0f, height), width, _graph_y(0.0f, height));
+  cairo_stroke(cr);
+
+  // the key light
+  const float key_x = _graph_x(0.0f, width);
+  set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  dt_draw_line(cr, key_x, 0, key_x, height);
+  cairo_stroke(cr);
+
+  // the histograms, scaled together so that the visible part of "before"
+  // peaks at 90 % of the height: they measure image area, not correction
+  if(g->hist_valid)
+  {
+    const float bin = (LS_HIST_MAX - LS_HIST_MIN) / LS_HIST_BINS;
+    float peak = 0.0f;
+    for(int b = 0; b < LS_HIST_BINS; b++)
+      if(LS_HIST_MIN + (b + 0.5f) * bin >= LS_GRAPH_X_MIN)
+        peak = fmaxf(peak, g->hist_before[b]);
+    if(peak > 0.0f)
+    {
+      const float scale = 0.9f * height / peak;
+      const GdkRGBA fg = darktable.bauhaus->graph_fg;
+      _hist_path(cr, g->hist_before, scale, width, height);
+      cairo_close_path(cr);
+      cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.3);
+      cairo_fill(cr);
+      _hist_path(cr, g->hist_after, scale, width, height);
+      cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, 0.8);
+      cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+      cairo_stroke(cr);
+    }
+  }
+
+  dt_iop_lightsurface_data_t d;
+  float m[LS_LIGHT_NODES];
+  _graph_nodes(self->params, &d, m);
+
+  // the node curve's correction C(x)
+  set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(2.0));
+  for(int px = 0; px <= width; px++)
+  {
+    const float y = _graph_y(_light_correction(_graph_ev(px, width), d.light_node, m), height);
+    if(px)
+      cairo_line_to(cr, px, y);
+    else
+      cairo_move_to(cr, px, y);
+  }
+  cairo_stroke(cr);
+
+  // with fill, the total correction C(x) + a_3(x + C(x)): the light delta
+  // of a pixel with no form or relief to scale
+  if(d.fill > 0.0f)
+  {
+    const double dashes[2] = { DT_PIXEL_APPLY_DPI(4.0), DT_PIXEL_APPLY_DPI(3.0) };
+    cairo_set_dash(cr, dashes, 2, 0.0);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+    for(int px = 0; px <= width; px++)
+    {
+      const float y = _graph_y(_light_delta(_graph_ev(px, width), 0.0f, 0.0f, &d, m), height);
+      if(px)
+        cairo_line_to(cr, px, y);
+      else
+        cairo_move_to(cr, px, y);
+    }
+    cairo_stroke(cr);
+    cairo_set_dash(cr, NULL, 0, 0.0);
+  }
+
+  // the nodes
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+  for(int i = 0; i < LS_LIGHT_NODES; i++)
+  {
+    cairo_arc(cr, _graph_x(_node_ev(i), width), _graph_y(d.light_node[i], height),
+              DT_PIXEL_APPLY_DPI(4.0), 0.0, 2.0 * M_PI);
+    set_color(cr, darktable.bauhaus->graph_fg);
+    cairo_stroke_preserve(cr);
+    if(i == g->hovered_node || i == g->dragged_node)
+      set_color(cr, darktable.bauhaus->graph_fg);
+    else
+      set_color(cr, darktable.bauhaus->graph_bg);
+    cairo_fill(cr);
+  }
+
+  // the light level under the pointer on the image
+  if(g->cursor_lambda_valid)
+  {
+    const float x = _graph_x(g->cursor_lambda, width);
+    set_color(cr, darktable.bauhaus->graph_fg_active);
+    cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+    dt_draw_line(cr, x, 0, x, height);
+    cairo_stroke(cr);
+  }
+
+  // the key light's label, at the bottom right of its line
+  PangoFontDescription *desc = dt_gui_get_font();
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_font_description(layout, desc);
+  pango_cairo_context_set_resolution(pango_layout_get_context(layout), darktable.gui->dpi);
+  pango_layout_set_text(layout, C_("light graph", "key"), -1);
+  PangoRectangle ink;
+  pango_layout_get_pixel_extents(layout, &ink, NULL);
+  set_color(cr, darktable.bauhaus->graph_fg);
+  cairo_move_to(cr, key_x + DT_PIXEL_APPLY_DPI(3) - ink.x,
+                height - DT_PIXEL_APPLY_DPI(3) - ink.height - ink.y);
+  pango_cairo_show_layout(cr, layout);
+  g_object_unref(layout);
+  pango_font_description_free(desc);
+
+  cairo_restore(cr);
+  cairo_destroy(cr);
+  cairo_set_source_surface(crf, cst, 0, 0);
+  cairo_paint(crf);
+  cairo_surface_destroy(cst);
+  return FALSE;
+}
+
+// sets light node i from the graph, as moving its slider would: the
+// neighbors are pushed (epic §M3.2) and one history item is added
+static void _graph_set_node(dt_iop_module_t *self, const int i, const float v)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_lightsurface_params_t *p = self->params;
+  const float value = CLAMP(v, -LS_GRAPH_Y_MAX, LS_GRAPH_Y_MAX);
+  if(p->light_node[i] == value) return;
+
+  p->light_node[i] = value;
+  _push_nodes(self, i);
+  DT_ENTER_GUI_UPDATE();
+  dt_bauhaus_slider_set(g->light_node[i], value);
+  DT_LEAVE_GUI_UPDATE();
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  _update_stats(self);
+}
+
+static void _area_motion(GtkEventControllerMotion *controller,
+                         double x, double y,
+                         dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  GtkWidget *widget = dt_gui_get_widget(controller);
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  const double gx = x - inset, gy = y - inset;
+  g->pointer_in = TRUE;
+  g->pointer_x = gx;
+
+  // a release the gesture never reported (a broken grab) must not leave
+  // the node following the pointer
+  if(g->dragged_node >= 0 && !(dt_key_modifier_state() & GDK_BUTTON1_MASK))
+    g->dragged_node = -1;
+
+  if(g->dragged_node >= 0)
+  {
+    _graph_set_node(self, g->dragged_node, _graph_c(gy, height) + g->drag_offset);
+    return;
+  }
+
+  const int node = _node_at(self, gx, gy, width, height);
+  if(node != g->hovered_node)
+  {
+    g->hovered_node = node;
+    gtk_widget_queue_draw(widget);
+  }
+}
+
+static void _area_leave(GtkEventControllerMotion *controller, dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  g->pointer_in = FALSE;
+  if(g->dragged_node >= 0) return;
+  g->hovered_node = -1;
+  gtk_widget_queue_draw(dt_gui_get_widget(controller));
+}
+
+static void _area_button_press(GtkGestureSingle *gesture,
+                               int n_press,
+                               double x, double y,
+                               dt_iop_module_t *self)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  GtkWidget *widget = dt_gui_get_widget(gesture);
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  const int node = _node_at(self, x - inset, y - inset, width, height);
+  if(node < 0) return;
+
+  g->hovered_node = node;
+  if(n_press == 2)
+  {
+    // the first press started a drag; this one resets the node instead
+    g->dragged_node = -1;
+    _graph_set_node(self, node, 0.0f);
+  }
+  else
+  {
+    // the node keeps its distance to the pointer, so grabbing it off
+    // center does not move it
+    dt_iop_lightsurface_data_t d;
+    float m[LS_LIGHT_NODES];
+    _graph_nodes(self->params, &d, m);
+    g->dragged_node = node;
+    g->drag_offset = d.light_node[node] - _graph_c(y - inset, height);
+  }
+  gtk_widget_queue_draw(widget);
+}
+
+static void _area_button_release(GtkGestureSingle *gesture,
+                                 int n_press,
+                                 double x, double y,
+                                 dt_iop_module_t *self)
+{
+  if(gtk_gesture_single_get_current_button(gesture) != GDK_BUTTON_PRIMARY) return;
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  g->dragged_node = -1;
+  if(!g->pointer_in) g->hovered_node = -1;
+  gtk_widget_queue_draw(dt_gui_get_widget(gesture));
+}
+
+// the node nearest the pointer's light level, in tone equalizer's steps
+// (toneequal.c:2908-2913)
+static void _area_scrolled(GtkEventControllerScroll *controller,
+                           double dx, double dy,
+                           dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(dy == 0.0 || !g->pointer_in) return;
+
+  const GdkModifierType state = dt_key_modifier_state();
+  float step;
+  if(dt_modifier_is(state, GDK_SHIFT_MASK))
+    step = 1.0f;  // coarse
+  else if(dt_modifier_is(state, GDK_CONTROL_MASK))
+    step = 0.1f;  // fine
+  else if(dt_modifier_is(state, 0))
+    step = 0.25f; // standard
+  else
+    return;       // shift+alt resizes the graph (dt_ui_resize_wrap())
+
+  int inset, width, height;
+  _graph_geometry(dt_gui_get_widget(controller), &inset, &width, &height);
+  const float ev = _graph_ev(g->pointer_x, width);
+  const int i = CLAMP((int)roundf(ev - _node_ev(0)), 0, LS_LIGHT_NODES - 1);
+  const dt_iop_lightsurface_params_t *p = self->params;
+  _graph_set_node(self, i, p->light_node[i] - (float)dy * step);
+}
+
 void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
 {
   dt_iop_lightsurface_gui_data_t *g = self->gui_data;
@@ -1574,10 +2142,12 @@ void gui_changed(dt_iop_module_t *self, GtkWidget *w, void *previous)
     if(w == g->light_node[i])
     {
       _push_nodes(self, i);
-      return;
+      break;
     }
 
   if(!w || w == g->relief) _update_status(self);
+  // gui_update() comes through here too
+  _update_stats(self);
 }
 
 void gui_update(dt_iop_module_t *self)
@@ -1631,9 +2201,21 @@ void gui_init(dt_iop_module_t *self)
   /* light */
   GtkWidget *page = self->widget = dt_ui_notebook_page(g->notebook, N_("light"), NULL);
 
-  // the light graph goes here (LS-10)
-  g->graph_box = dt_gui_vbox();
-  dt_gui_box_add(page, g->graph_box);
+  g->hovered_node = g->dragged_node = -1;
+  g->area = GTK_DRAWING_AREA(dt_ui_resize_wrap
+                             (NULL, 0, "plugins/darkroom/lightsurface/graphheight"));
+  g_signal_connect(G_OBJECT(g->area), "draw", G_CALLBACK(_area_draw), self);
+  dt_gui_connect_click(g->area, _area_button_press, _area_button_release, self);
+  dt_gui_connect_motion(g->area, _area_motion, _area_motion, _area_leave, self);
+  dt_gui_connect_scroll(g->area, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
+                                 | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE, _area_scrolled, self);
+  gtk_widget_set_tooltip_text
+    (GTK_WIDGET(g->area),
+     _("how much of the image is lit at each level, relative to the key light (0 EV):"
+       " filled before the edit, outlined after it.\n"
+       "the curve is the correction applied at each level.\n"
+       "drag a node to move it, scroll to move the nearest one, double-click to reset it"));
+  dt_gui_box_add(page, g->area);
 
   g->ratio_label = dt_ui_label_new("");
   dt_gui_box_add(page, g->ratio_label);
