@@ -23,6 +23,7 @@
 // src/develop/pixelpipe_hb.c)
 
 #include "bauhaus/bauhaus.h"
+#include "common/collection.h"
 #include "common/colorspaces.h"
 #include "common/imagebuf.h"
 #include "develop/imageop.h"
@@ -200,13 +201,22 @@ typedef struct dt_iop_lightsurface_gui_data_t
   double pointer_x;        // in graph coordinates, for scrolling
   // the light level under the pointer on the image, drawn on the graph
   float cursor_lambda;
-  gboolean cursor_lambda_valid;
+  gboolean cursor_lambda_valid;  // the readout below is of the pixel under the pointer
+  // the surface and color under the pointer, from the same layer sample. rho is
+  // relative to the layer's rho_ref, the reference the surface edits act on
+  float cursor_rho, cursor_hue, cursor_sat;
+  int cursor_pos_x, cursor_pos_y; // the pointer in preview coordinates, for drawing
+  gboolean cursor_valid;   // the pointer is over the image
+  gboolean has_focus;      // set by gui_focus(); the on-image editing needs it
 #ifdef HAVE_AI
   // shared with the pipe threads, under the gui lock
   _ls_layer_t *layer;          // published by the preview pipe
   gboolean full_needs_refresh; // a canvas pipe rendered a placeholder
   _ls_key_t wanted;            // the key that placeholder was waiting for
   gboolean analyzing;          // the preview is computing a layer
+  // GUI thread only: the edit's model as _update_stats() last resolved it, 0
+  // for none, so the pointer handlers need not read the model list
+  uint32_t model_hash;
 #endif
 } dt_iop_lightsurface_gui_data_t;
 
@@ -1731,6 +1741,7 @@ static void _update_stats(dt_iop_module_t *self)
   char *id = dt_ai_registry_is_enabled() ? _resolve_model_id(p->model_hash, &fell_back) : NULL;
   const uint32_t hash = id ? dt_intrinsic_hash(id) : 0;
   g_free(id);
+  g->model_hash = hash;
 
   dt_iop_gui_enter_critical_section(self);
   _ls_layer_t *L = hash && g->layer
@@ -2158,10 +2169,329 @@ void gui_update(dt_iop_module_t *self)
   gui_changed(self, NULL, NULL);
 }
 
+#ifdef HAVE_AI
+
+/* --- on-image readout and editing --- */
+
+static gboolean _in_mask_editing(const dt_iop_module_t *self)
+{
+  const dt_develop_t *dev = self->dev;
+  return dev->form_gui && dev->form_visible;
+}
+
+// the preview pipe's input of this module at a cursor position given in
+// preview coordinates. the backtransform stops after crop, as in
+// toneequal.c:_get_point(): this module sits after crop in every order, and
+// crop changes the roi of the whole pipe, so the layer already includes it.
+// if the module is moved below rotation or perspective, the transforms after
+// it are missing and the position is wrong
+static void _cursor_to_input(const dt_iop_module_t *self,
+                             const int c_x,
+                             const int c_y,
+                             float *x,
+                             float *y)
+{
+  const double crop_order =
+    dt_ioppr_get_iop_order(self->dev->iop_order_list, "crop", 0);
+
+  float pts[2] = { c_x, c_y };
+  dt_dev_distort_backtransform_plus(darktable.develop, darktable.develop->preview_pipe,
+                                    crop_order,
+                                    DT_DEV_TRANSFORM_DIR_FORW_EXCL, pts, 1);
+  *x = pts[0];
+  *y = pts[1];
+}
+
+// bilinear samples of the layer's lambda, rho, hue and saturation at (u, v),
+// fractions of the image. hue is a periodic angle, so it is averaged as a
+// vector, weighted by the same bilinear weights
+static void _layer_sample(const _ls_layer_t *const L,
+                          const float u,
+                          const float v,
+                          float *lambda,
+                          float *rho,
+                          float *hue,
+                          float *sat)
+{
+  const int lw = L->w;
+  const int lh = L->h;
+  const float Xc = CLAMP(u * lw - 0.5f, 0.0f, (float)(lw - 1));
+  const float Yc = CLAMP(v * lh - 0.5f, 0.0f, (float)(lh - 1));
+  const int x0 = (int)floorf(Xc);
+  const int y0 = (int)floorf(Yc);
+  const int x1 = MIN(x0 + 1, lw - 1);
+  const int y1 = MIN(y0 + 1, lh - 1);
+  const float fx = Xc - x0;
+  const float fy = Yc - y0;
+  const size_t idx[4] = { (size_t)y0 * lw + x0, (size_t)y0 * lw + x1,
+                          (size_t)y1 * lw + x0, (size_t)y1 * lw + x1 };
+  const float wgt[4] = { (1.0f - fx) * (1.0f - fy), fx * (1.0f - fy),
+                         (1.0f - fx) * fy, fx * fy };
+
+  float lam = 0.0f, r = 0.0f, s = 0.0f, hc = 0.0f, hs = 0.0f;
+  for(int k = 0; k < 4; k++)
+  {
+    lam += wgt[k] * L->lambda[idx[k]];
+    r += wgt[k] * L->rho[idx[k]];
+    s += wgt[k] * L->sat[idx[k]];
+    const float a = L->hue[idx[k]] * ((float)M_PI / 180.0f);
+    hc += wgt[k] * cosf(a);
+    hs += wgt[k] * sinf(a);
+  }
+  float h = atan2f(hs, hc) * (180.0f / (float)M_PI);
+  if(h < 0.0f) h += 360.0f;
+  *lambda = lam;
+  *rho = r;
+  *hue = h;
+  *sat = s;
+}
+
+int mouse_moved(dt_iop_module_t *self,
+                const float pzx,
+                const float pzy,
+                const double pressure,
+                const int which,
+                const float zoom_scale)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(!g) return 0;
+
+  float wd, ht;
+  if(!dt_dev_get_preview_size(self->dev, &wd, &ht)) return 0;
+
+  const float fx = pzx * wd;
+  const float fy = pzy * ht;
+  const gboolean inside = fx >= 0.0f && fx < wd && fy >= 0.0f && fy < ht;
+
+  gboolean valid = FALSE;
+  float lambda = 0.0f, rho = 0.0f, hue = 0.0f, sat = 0.0f;
+  if(inside)
+  {
+    // only a layer of this image and of the edit's model, as for the graph:
+    // a scroll edit placed from another model's light levels lands elsewhere
+    dt_iop_gui_enter_critical_section(self);
+    _ls_layer_t *L = g->model_hash && g->layer
+      && g->layer->key.imgid == self->dev->image_storage.id
+      && g->layer->key.model_hash == g->model_hash
+      ? _layer_ref(g->layer) : NULL;
+    dt_iop_gui_leave_critical_section(self);
+
+    if(L)
+    {
+      float bx, by;
+      _cursor_to_input(self, (int)fx, (int)fy, &bx, &by);
+      // the layer is of the preview input of this module, src_w x src_h
+      const float u = (bx + 0.5f) / L->src_w;
+      const float v = (by + 0.5f) / L->src_h;
+      if(u >= 0.0f && u < 1.0f && v >= 0.0f && v < 1.0f)
+      {
+        _layer_sample(L, u, v, &lambda, &rho, &hue, &sat);
+        rho -= L->rho_ref;
+        valid = dt_isfinite(lambda) && dt_isfinite(rho)
+          && dt_isfinite(hue) && dt_isfinite(sat);
+      }
+      _layer_unref(L);
+    }
+  }
+
+  dt_iop_gui_enter_critical_section(self);
+  g->cursor_valid = inside;
+  g->cursor_pos_x = inside ? (int)fx : 0;
+  g->cursor_pos_y = inside ? (int)fy : 0;
+  g->cursor_lambda_valid = valid;
+  if(valid)
+  {
+    g->cursor_lambda = lambda;
+    g->cursor_rho = rho;
+    g->cursor_hue = hue;
+    g->cursor_sat = sat;
+  }
+  dt_iop_gui_leave_critical_section(self);
+
+  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_control_queue_redraw_center();
+  // unlike toneequal.c, which returns 1: nothing here uses a drag, so the
+  // darkroom keeps panning with the left button (src/views/darkroom.c:4537)
+  return 0;
+}
+
+int mouse_leave(dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(!g) return 0;
+
+  dt_iop_gui_enter_critical_section(self);
+  g->cursor_valid = FALSE;
+  g->cursor_lambda_valid = FALSE;
+  dt_iop_gui_leave_critical_section(self);
+
+  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  dt_control_queue_redraw_center();
+  return 1;
+}
+
+// adds `delta` to nodes i and j, split linearly by t, the pointer's fraction
+// of the way from i to j, keeping both in the params' range
+static void _split_delta(float *const v,
+                         const int i,
+                         const int j,
+                         const float t,
+                         const float delta)
+{
+  v[i] = CLAMP(v[i] + delta * (1.0f - t), -LS_GRAPH_Y_MAX, LS_GRAPH_Y_MAX);
+  v[j] = CLAMP(v[j] + delta * t, -LS_GRAPH_Y_MAX, LS_GRAPH_Y_MAX);
+}
+
+int scrolled(dt_iop_module_t *self,
+             const float x,
+             const float y,
+             const int up,
+             const uint32_t state)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  dt_iop_lightsurface_params_t *p = self->params;
+
+  DT_GUARD_GUI_UPDATE(1);
+  if(!g || !g->has_focus) return 0;
+
+  // turn the module on if it is off
+  if(!self->enabled && self->off)
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->off), 1);
+
+  if(_in_mask_editing(self)) return 0;
+
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean valid = g->cursor_valid && g->cursor_lambda_valid;
+  const float lambda = g->cursor_lambda;
+  const float hue = g->cursor_hue;
+  const float sat = g->cursor_sat;
+  dt_iop_gui_leave_critical_section(self);
+  if(!valid) return 1;
+
+  // alt selects the surface edit; the other modifiers pick the step on top.
+  // the modifiers as dt_modifier_is() sees them, latched shortcut ones included
+  const GdkModifierType mods = (state | dt_modifier_shortcuts)
+                               & gtk_accelerator_get_default_mod_mask();
+  const gboolean alt = (mods & GDK_MOD1_MASK) != 0;
+  const GdkModifierType other = mods & ~GDK_MOD1_MASK;
+  float step;
+  if(other == GDK_SHIFT_MASK)
+    step = 1.0f;  // coarse
+  else if(other == GDK_CONTROL_MASK)
+    step = 0.1f;  // fine
+  else
+    step = 0.25f; // standard
+  const float delta = up ? step : -step;
+
+  if(alt)
+  {
+    const float w_c = fminf(1.0f, sat / LS_SAT_FULL);
+    if(w_c < 0.05f)
+    {
+      dt_control_log(_("light and surface: this surface is too neutral for hue edits"));
+      return 1;
+    }
+    // hue node j sits at 45 j degrees; a hue that rounded up to 360 wraps to 0
+    const float pos = hue / 45.0f;
+    const float f = floorf(pos);
+    const int i = (((int)f % LS_HUE_NODES) + LS_HUE_NODES) % LS_HUE_NODES;
+    _split_delta(p->surface_hue, i, (i + 1) % LS_HUE_NODES, pos - f, delta * w_c);
+
+    DT_ENTER_GUI_UPDATE();
+    for(int j = 0; j < LS_HUE_NODES; j++)
+      dt_bauhaus_slider_set(g->surface_hue[j], p->surface_hue[j]);
+    DT_LEAVE_GUI_UPDATE();
+  }
+  else
+  {
+    // node i sits at -7 + i EV; outside [-7, +1] all of it goes to the end node
+    const float pos = CLAMP(lambda - _node_ev(0), 0.0f, (float)(LS_LIGHT_NODES - 1));
+    const int i = MIN((int)pos, LS_LIGHT_NODES - 2);
+    const float t = pos - i;
+    _split_delta(p->light_node, i, i + 1, t, delta);
+    // _push_nodes() keeps the node it starts from: start from the one that
+    // moved most, or a clash between the two is settled against the edit
+    _push_nodes(self, t > 0.5f ? i + 1 : i);
+
+    DT_ENTER_GUI_UPDATE();
+    dt_bauhaus_slider_set(g->light_node[i], p->light_node[i]);
+    dt_bauhaus_slider_set(g->light_node[i + 1], p->light_node[i + 1]);
+    DT_LEAVE_GUI_UPDATE();
+  }
+
+  dt_dev_add_history_item(darktable.develop, self, TRUE);
+  _update_stats(self);
+  return 1;
+}
+
+static const char *_light_category(const float lambda)
+{
+  if(lambda >= 1.0f) return _("highlight");
+  if(lambda >= -1.0f) return _("key light");
+  if(lambda >= -3.0f) return _("half shade");
+  return _("shade");
+}
+
+void gui_post_expose(dt_iop_module_t *self,
+                     cairo_t *cr,
+                     const float width,
+                     const float height,
+                     const float pointerx,
+                     const float pointery,
+                     const float zoom_scale)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  if(!g || _in_mask_editing(self)) return;
+
+  dt_iop_gui_enter_critical_section(self);
+  const gboolean show = g->has_focus && g->cursor_valid && g->cursor_lambda_valid;
+  const float lambda = g->cursor_lambda;
+  const float rho = g->cursor_rho;
+  const float x_pointer = g->cursor_pos_x;
+  const float y_pointer = g->cursor_pos_y;
+  dt_iop_gui_leave_critical_section(self);
+  if(!show) return;
+
+  char light[128], surface[64], text[200];
+  snprintf(light, sizeof(light), _("light %+.1f EV (%s)"), lambda, _light_category(lambda));
+  snprintf(surface, sizeof(surface), _("surface %+.1f EV"), rho);
+  snprintf(text, sizeof(text), "%s\n%s", light, surface);
+
+  float bg_rgb[3];
+  float frame_color[3];
+  dt_draw_backbuf_contrast(self->dev, pointerx, pointery, bg_rgb, frame_color,
+                           16.0f / (zoom_scale * width));
+  dt_draw_correction_cursor(cr, x_pointer, y_pointer, zoom_scale, 0.0f, frame_color,
+                            bg_rgb, FALSE, bg_rgb, FALSE, text);
+}
+
+#endif // HAVE_AI
+
 void gui_focus(dt_iop_module_t *self, gboolean in)
 {
   dt_iop_lightsurface_gui_data_t *g = self->gui_data;
-  if(in || !g) return;
+  if(!g) return;
+
+#ifdef HAVE_AI
+  dt_iop_gui_enter_critical_section(self);
+  g->has_focus = in;
+  if(!in) g->cursor_lambda_valid = FALSE;
+  dt_iop_gui_leave_critical_section(self);
+#endif
+
+  if(in)
+  {
+#ifdef HAVE_AI
+    dt_control_hinter_message(_("scroll over image to change the light at that level\n"
+                                "alt+scroll to change the surface lightness of that hue\n"
+                                "shift+scroll for large steps; ctrl+scroll for small steps"));
+#endif
+    return;
+  }
+#ifdef HAVE_AI
+  dt_collection_hint_message(darktable.collection);
+  gtk_widget_queue_draw(GTK_WIDGET(g->area));
+#endif
 
   // as toneequal.c does with its mask: leaving the module shows the image again
   dt_iop_gui_enter_critical_section(self);
