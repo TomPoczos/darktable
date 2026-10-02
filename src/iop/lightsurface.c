@@ -92,6 +92,13 @@ DT_MODULE_INTROSPECTION(1, dt_iop_lightsurface_params_t)
 #define LS_GRAPH_X_MIN (-8.0f)
 #define LS_GRAPH_X_MAX 2.0f
 #define LS_GRAPH_Y_MAX 2.0f
+// the light x surface map of the view page: 64 x 64 cells over light in
+// [-8, +2] EV and surface in [-5, +5] EV from the median
+#define LS_MAP_BINS 64
+#define LS_MAP_X_MIN (-8.0f)
+#define LS_MAP_X_MAX 2.0f
+#define LS_MAP_Y_MIN (-5.0f)
+#define LS_MAP_Y_MAX 5.0f
 
 typedef struct dt_iop_lightsurface_params_t
 {
@@ -183,7 +190,8 @@ typedef struct dt_iop_lightsurface_gui_data_t
   GtkWidget *light_node[LS_LIGHT_NODES];
   GtkWidget *surface_contrast;
   GtkWidget *surface_hue[LS_HUE_NODES];
-  GtkWidget *model, *display, *warn_toggle, *status_label, *map_box;
+  GtkWidget *model, *display, *warn_toggle, *status_label, *map_box, *map_mode;
+  GtkDrawingArea *map_area;
   uint32_t *model_hashes;  // index-aligned with the first n_models entries of `model`
   int n_models;            // an entry past these is the "not installed" one, not a choice
   // what is shown, not what is edited: never in the params, so never in the
@@ -195,12 +203,19 @@ typedef struct dt_iop_lightsurface_gui_data_t
   float hist_before[LS_HIST_BINS], hist_after[LS_HIST_BINS];
   gboolean hist_valid;     // a layer of the current image and model was found
   float ratio_before, ratio_after;
+  // the light x surface map, GUI thread only: counts per cell, row 0 at the
+  // lowest surface level, before and after the edit
+  float map_before[LS_MAP_BINS * LS_MAP_BINS], map_after[LS_MAP_BINS * LS_MAP_BINS];
+  gboolean map_show_after; // GUI only, so not in the params
   int hovered_node, dragged_node; // -1 for none
   float drag_offset;       // node value minus the pointer's, in EV, at the press
   gboolean pointer_in;     // the pointer is over the graph, at pointer_x
   double pointer_x;        // in graph coordinates, for scrolling
   // the light level under the pointer on the image, drawn on the graph
   float cursor_lambda;
+  // the light layer's own lambda_c and lambda_f there, to place the readout
+  // on the map after the edit
+  float cursor_lambda_c, cursor_lambda_f;
   gboolean cursor_lambda_valid;  // the readout below is of the pixel under the pointer
   // the surface and color under the pointer, from the same layer sample. rho is
   // relative to the layer's rho_ref, the reference the surface edits act on
@@ -1722,6 +1737,15 @@ static void _model_changed(GtkWidget *widget, dt_iop_module_t *self)
   _update_stats(self);
 }
 
+static void _map_mode_changed(GtkWidget *widget, dt_iop_module_t *self)
+{
+  DT_GUARD_GUI_UPDATE();
+
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+  g->map_show_after = dt_bauhaus_combobox_get(widget) == 1;
+  gtk_widget_queue_draw(GTK_WIDGET(g->map_area));
+}
+
 static void _display_changed(GtkWidget *widget, dt_iop_module_t *self)
 {
   DT_GUARD_GUI_UPDATE();
@@ -1796,6 +1820,16 @@ static inline void _hist_add(float hist[LS_HIST_BINS], const float v)
   if(b >= 0.0f && b < (float)LS_HIST_BINS) hist[(int)b] += 1.0f;
 }
 
+// the cell of the light x surface map a sample falls in, or -1 outside it or
+// for NaN
+static inline int _map_cell(const float x, const float y)
+{
+  const float bx = (x - LS_MAP_X_MIN) * (LS_MAP_BINS / (LS_MAP_X_MAX - LS_MAP_X_MIN));
+  const float by = (y - LS_MAP_Y_MIN) * (LS_MAP_BINS / (LS_MAP_Y_MAX - LS_MAP_Y_MIN));
+  return bx >= 0.0f && bx < (float)LS_MAP_BINS && by >= 0.0f && by < (float)LS_MAP_BINS
+    ? (int)by * LS_MAP_BINS + (int)bx : -1;
+}
+
 // the k-th smallest of a[0, n), which ends up at a[k] with nothing larger
 // before it (Hoare's selection). the stats run on every drag step, where
 // two full sorts of a layer took 64 ms
@@ -1847,12 +1881,17 @@ static float _lighting_ratio(float *const a, const size_t n)
 // epic §M6 for a layer and the committed params d (nodes sanitized, m their
 // tangents): histograms of the light level before and after the light edit,
 // lambda and lambda + dL, counted on every 2nd pixel in x and y, and the
-// lighting ratio of each, taken on the same samples. FALSE if out of memory
+// lighting ratio of each, taken on the same samples. the same samples also fill
+// the light x surface map: x is the light level and y the surface level
+// rho - rho_ref, before and after the light and surface edits, the latter with
+// the dS_lr that process() upsamples (epic §M4). FALSE if out of memory
 static gboolean _light_stats(const _ls_layer_t *const L,
                              const dt_iop_lightsurface_data_t *const d,
                              const float m[LS_LIGHT_NODES],
                              float hist_before[LS_HIST_BINS],
                              float hist_after[LS_HIST_BINS],
+                             float map_before[LS_MAP_BINS * LS_MAP_BINS],
+                             float map_after[LS_MAP_BINS * LS_MAP_BINS],
                              float *const ratio_before,
                              float *const ratio_after)
 {
@@ -1861,34 +1900,54 @@ static gboolean _light_stats(const _ls_layer_t *const L,
   const size_t ns = (size_t)sw * sh;
   float *const before = dt_alloc_align_float(ns);
   float *const after = dt_alloc_align_float(ns);
-  if(!before || !after)
+  int *const cells = dt_alloc_align_type(int, 2 * ns);
+  if(!before || !after || !cells)
   {
     dt_free_align(before);
     dt_free_align(after);
+    dt_free_align(cells);
     return FALSE;
   }
 
+  // as process(), which leaves dS out when no surface param is set
+  const gboolean surface = _surface_active(d);
+  // the map cells are found here, in parallel, so that the serial pass below
+  // only counts: this runs on every drag step
   DT_OMP_FOR()
-  for(size_t s = 0; s < ns; s++)
-  {
-    const size_t k = (size_t)2 * (s / sw) * L->w + 2 * (s % sw);
-    const float lambda = L->lambda[k];
-    before[s] = lambda;
-    after[s] = lambda + _light_delta(lambda, L->lambda_c[k], L->lambda_f[k], d, m);
-  }
+  for(int r = 0; r < sh; r++)
+    for(int c = 0; c < sw; c++)
+    {
+      const size_t s = (size_t)r * sw + c;
+      const size_t k = (size_t)2 * r * L->w + 2 * c;
+      const float lambda = L->lambda[k];
+      const float y = L->rho[k] - L->rho_ref;
+      const float dS = surface
+        ? _surface_delta(L->Y[k], L->rho[k], L->rho_ref, d->surface_contrast,
+                         L->hue[k], L->sat[k], d->surface_hue)
+        : 0.0f;
+      before[s] = lambda;
+      after[s] = lambda + _light_delta(lambda, L->lambda_c[k], L->lambda_f[k], d, m);
+      cells[2 * s] = _map_cell(lambda, y);
+      cells[2 * s + 1] = _map_cell(after[s], y + dS);
+    }
 
   memset(hist_before, 0, sizeof(float) * LS_HIST_BINS);
   memset(hist_after, 0, sizeof(float) * LS_HIST_BINS);
+  memset(map_before, 0, sizeof(float) * LS_MAP_BINS * LS_MAP_BINS);
+  memset(map_after, 0, sizeof(float) * LS_MAP_BINS * LS_MAP_BINS);
   for(size_t s = 0; s < ns; s++)
   {
     _hist_add(hist_before, before[s]);
     _hist_add(hist_after, after[s]);
+    if(cells[2 * s] >= 0) map_before[cells[2 * s]] += 1.0f;
+    if(cells[2 * s + 1] >= 0) map_after[cells[2 * s + 1]] += 1.0f;
   }
   *ratio_before = _lighting_ratio(before, ns);
   *ratio_after = _lighting_ratio(after, ns);
 
   dt_free_align(before);
   dt_free_align(after);
+  dt_free_align(cells);
   return TRUE;
 }
 #endif
@@ -1922,7 +1981,7 @@ static void _update_stats(dt_iop_module_t *self)
     float m[LS_LIGHT_NODES];
     _graph_nodes(p, &d, m);
     valid = _light_stats(L, &d, m, g->hist_before, g->hist_after,
-                         &g->ratio_before, &g->ratio_after);
+                         g->map_before, g->map_after, &g->ratio_before, &g->ratio_after);
     _layer_unref(L);
   }
 #endif
@@ -1939,6 +1998,7 @@ static void _update_stats(dt_iop_module_t *self)
   gtk_label_set_text(GTK_LABEL(g->ratio_label), text);
   g_free(text);
   gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(GTK_WIDGET(g->map_area));
 }
 
 static void _graph_geometry(GtkWidget *widget, int *inset, int *width, int *height)
@@ -2178,6 +2238,156 @@ static gboolean _area_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *sel
   return FALSE;
 }
 
+// the light x surface map: cells are the counts of _light_stats() on a log
+// scale, shared between before and after so the two stay comparable. x is
+// light and y surface, and since the output luminance is light x surface,
+// x + y = c are lines of equal output gray
+static gboolean _map_draw(GtkWidget *widget, cairo_t *crf, dt_iop_module_t *self)
+{
+  dt_iop_lightsurface_gui_data_t *g = self->gui_data;
+
+  int inset, width, height;
+  _graph_geometry(widget, &inset, &width, &height);
+  if(width <= 0 || height <= 0) return FALSE;
+
+  GtkAllocation allocation;
+  gtk_widget_get_allocation(widget, &allocation);
+  cairo_surface_t *cst =
+    dt_cairo_image_surface_create(CAIRO_FORMAT_ARGB32, allocation.width, allocation.height);
+  cairo_t *cr = cairo_create(cst);
+  gtk_render_background(gtk_widget_get_style_context(widget), cr,
+                        0, 0, allocation.width, allocation.height);
+  cairo_translate(cr, inset, inset);
+
+  cairo_rectangle(cr, 0, 0, width, height);
+  set_color(cr, darktable.bauhaus->graph_bg);
+  cairo_fill_preserve(cr);
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  set_color(cr, darktable.bauhaus->graph_border);
+  cairo_stroke(cr);
+
+  cairo_save(cr);
+  cairo_rectangle(cr, 0, 0, width, height);
+  cairo_clip(cr);
+
+  const float sx = width / (LS_MAP_X_MAX - LS_MAP_X_MIN);
+  const float sy = height / (LS_MAP_Y_MAX - LS_MAP_Y_MIN);
+  // surface up: row 0 is the lowest surface level
+  const float *const map = g->map_show_after ? g->map_after : g->map_before;
+
+  if(g->hist_valid)
+  {
+    float peak = 0.0f;
+    for(int k = 0; k < LS_MAP_BINS * LS_MAP_BINS; k++)
+      peak = fmaxf(peak, fmaxf(g->map_before[k], g->map_after[k]));
+    if(peak > 0.0f)
+    {
+      const GdkRGBA fg = darktable.bauhaus->graph_fg;
+      const float norm = 1.0f / log1pf(peak);
+      const float cw = width / (float)LS_MAP_BINS;
+      const float ch = height / (float)LS_MAP_BINS;
+      for(int j = 0; j < LS_MAP_BINS; j++)
+        for(int i = 0; i < LS_MAP_BINS; i++)
+        {
+          const float c = map[j * LS_MAP_BINS + i];
+          if(c <= 0.0f) continue;
+          cairo_set_source_rgba(cr, fg.red, fg.green, fg.blue, log1pf(c) * norm);
+          // a hair of overlap hides the seams between cells
+          cairo_rectangle(cr, i * cw, height - (j + 1) * ch, cw + 0.5, ch + 0.5);
+          cairo_fill(cr);
+        }
+    }
+  }
+
+  // lines of equal output gray, x + y = c
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(0.5));
+  set_color(cr, darktable.bauhaus->graph_grid);
+  for(int c = -10; c <= 4; c++)
+  {
+    if(c == 0) continue;
+    dt_draw_line(cr, 0, height - (c - LS_MAP_X_MIN - LS_MAP_Y_MIN) * sy,
+                 width, height - (c - LS_MAP_X_MAX - LS_MAP_Y_MIN) * sy);
+    cairo_stroke(cr);
+  }
+  cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.0));
+  set_color(cr, darktable.bauhaus->graph_fg);
+  dt_draw_line(cr, 0, height - (-LS_MAP_X_MIN - LS_MAP_Y_MIN) * sy,
+               width, height - (-LS_MAP_X_MAX - LS_MAP_Y_MIN) * sy);
+  cairo_stroke(cr);
+
+  // the pointer's light and surface, where it is after the edit if that is
+  // what the map shows
+  if(g->cursor_lambda_valid)
+  {
+    float x = g->cursor_lambda;
+    float y = g->cursor_rho;
+#ifdef HAVE_AI
+    if(g->map_show_after)
+    {
+      const dt_iop_lightsurface_params_t *p = self->params;
+      dt_iop_lightsurface_data_t d;
+      float m[LS_LIGHT_NODES];
+      _graph_nodes(p, &d, m);
+      x += _light_delta(x, g->cursor_lambda_c, g->cursor_lambda_f, &d, m);
+      // the reading is already relative to rho_ref, and has a valid pixel
+      y += _surface_delta(1.0f, y, 0.0f, d.surface_contrast, g->cursor_hue, g->cursor_sat,
+                          d.surface_hue);
+    }
+#endif
+    if(dt_isfinite(x) && dt_isfinite(y))
+    {
+      cairo_arc(cr, (x - LS_MAP_X_MIN) * sx, height - (y - LS_MAP_Y_MIN) * sy,
+                DT_PIXEL_APPLY_DPI(4.0), 0.0, 2.0 * M_PI);
+      set_color(cr, darktable.bauhaus->graph_fg_active);
+      cairo_set_line_width(cr, DT_PIXEL_APPLY_DPI(1.5));
+      cairo_stroke(cr);
+    }
+  }
+
+  // labels: the key gray line, and the axes
+  PangoFontDescription *desc = dt_gui_get_font();
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  pango_layout_set_font_description(layout, desc);
+  pango_cairo_context_set_resolution(pango_layout_get_context(layout), darktable.gui->dpi);
+  set_color(cr, darktable.bauhaus->graph_fg);
+  PangoRectangle ink;
+
+  // the c = 0 line enters at the top, at x = -LS_MAP_Y_MAX, and runs down to
+  // the right: below and left of that point the label stays clear of it
+  pango_layout_set_text(layout, C_("light x surface map", "key gray"), -1);
+  pango_layout_get_pixel_extents(layout, &ink, NULL);
+  cairo_move_to(cr, (-LS_MAP_Y_MAX - LS_MAP_X_MIN) * sx - DT_PIXEL_APPLY_DPI(3)
+                    - ink.width - ink.x,
+                DT_PIXEL_APPLY_DPI(3) - ink.y);
+  pango_cairo_show_layout(cr, layout);
+
+  pango_layout_set_text(layout, _("light (EV from key)"), -1);
+  pango_layout_get_pixel_extents(layout, &ink, NULL);
+  cairo_move_to(cr, 0.5 * (width - ink.width) - ink.x,
+                height - DT_PIXEL_APPLY_DPI(3) - ink.height - ink.y);
+  pango_cairo_show_layout(cr, layout);
+
+  pango_layout_set_text(layout, _("surface (EV from median)"), -1);
+  pango_layout_get_pixel_extents(layout, &ink, NULL);
+  cairo_save(cr);
+  // turned a quarter left, the layout's y runs along the screen's x: the
+  // ink's top, at ink.y, sits 3 px from the left edge
+  cairo_translate(cr, DT_PIXEL_APPLY_DPI(3) - ink.y, 0.5 * (height + ink.width) + ink.x);
+  cairo_rotate(cr, -0.5 * M_PI);
+  pango_cairo_show_layout(cr, layout);
+  cairo_restore(cr);
+
+  g_object_unref(layout);
+  pango_font_description_free(desc);
+
+  cairo_restore(cr);
+  cairo_destroy(cr);
+  cairo_set_source_surface(crf, cst, 0, 0);
+  cairo_paint(crf);
+  cairo_surface_destroy(cst);
+  return FALSE;
+}
+
 // sets light node i from the graph, as moving its slider would: the
 // neighbors are pushed (epic §M3.2) and one history item is added
 static void _graph_set_node(dt_iop_module_t *self, const int i, const float v)
@@ -2368,16 +2578,18 @@ static void _cursor_to_input(const dt_iop_module_t *self,
   *y = pts[1];
 }
 
-// bilinear samples of the layer's lambda, rho, hue and saturation at (u, v),
-// fractions of the image. hue is a periodic angle, so it is averaged as a
-// vector, weighted by the same bilinear weights
+// bilinear samples of the layer's lambda, lambda_c, lambda_f, rho, hue and
+// saturation at (u, v), fractions of the image. hue is a periodic angle, so
+// it is averaged as a vector, weighted by the same bilinear weights
 static void _layer_sample(const _ls_layer_t *const L,
                           const float u,
                           const float v,
                           float *lambda,
                           float *rho,
                           float *hue,
-                          float *sat)
+                          float *sat,
+                          float *lambda_c,
+                          float *lambda_f)
 {
   const int lw = L->w;
   const int lh = L->h;
@@ -2394,10 +2606,12 @@ static void _layer_sample(const _ls_layer_t *const L,
   const float wgt[4] = { (1.0f - fx) * (1.0f - fy), fx * (1.0f - fy),
                          (1.0f - fx) * fy, fx * fy };
 
-  float lam = 0.0f, r = 0.0f, s = 0.0f, hc = 0.0f, hs = 0.0f;
+  float lam = 0.0f, lc = 0.0f, lf = 0.0f, r = 0.0f, s = 0.0f, hc = 0.0f, hs = 0.0f;
   for(int k = 0; k < 4; k++)
   {
     lam += wgt[k] * L->lambda[idx[k]];
+    lc += wgt[k] * L->lambda_c[idx[k]];
+    lf += wgt[k] * L->lambda_f[idx[k]];
     r += wgt[k] * L->rho[idx[k]];
     s += wgt[k] * L->sat[idx[k]];
     const float a = L->hue[idx[k]] * ((float)M_PI / 180.0f);
@@ -2410,6 +2624,8 @@ static void _layer_sample(const _ls_layer_t *const L,
   *rho = r;
   *hue = h;
   *sat = s;
+  *lambda_c = lc;
+  *lambda_f = lf;
 }
 
 int mouse_moved(dt_iop_module_t *self,
@@ -2430,7 +2646,7 @@ int mouse_moved(dt_iop_module_t *self,
   const gboolean inside = fx >= 0.0f && fx < wd && fy >= 0.0f && fy < ht;
 
   gboolean valid = FALSE;
-  float lambda = 0.0f, rho = 0.0f, hue = 0.0f, sat = 0.0f;
+  float lambda = 0.0f, rho = 0.0f, hue = 0.0f, sat = 0.0f, lc = 0.0f, lf = 0.0f;
   if(inside)
   {
     // only a layer of this image and of the edit's model, as for the graph:
@@ -2451,10 +2667,10 @@ int mouse_moved(dt_iop_module_t *self,
       const float v = (by + 0.5f) / L->src_h;
       if(u >= 0.0f && u < 1.0f && v >= 0.0f && v < 1.0f)
       {
-        _layer_sample(L, u, v, &lambda, &rho, &hue, &sat);
+        _layer_sample(L, u, v, &lambda, &rho, &hue, &sat, &lc, &lf);
         rho -= L->rho_ref;
         valid = dt_isfinite(lambda) && dt_isfinite(rho)
-          && dt_isfinite(hue) && dt_isfinite(sat);
+          && dt_isfinite(hue) && dt_isfinite(sat) && dt_isfinite(lc) && dt_isfinite(lf);
       }
       _layer_unref(L);
     }
@@ -2468,6 +2684,8 @@ int mouse_moved(dt_iop_module_t *self,
   if(valid)
   {
     g->cursor_lambda = lambda;
+    g->cursor_lambda_c = lc;
+    g->cursor_lambda_f = lf;
     g->cursor_rho = rho;
     g->cursor_hue = hue;
     g->cursor_sat = sat;
@@ -2475,6 +2693,7 @@ int mouse_moved(dt_iop_module_t *self,
   dt_iop_gui_leave_critical_section(self);
 
   gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(GTK_WIDGET(g->map_area));
   dt_control_queue_redraw_center();
   // unlike toneequal.c, which returns 1: nothing here uses a drag, so the
   // darkroom keeps panning with the left button (src/views/darkroom.c:4537)
@@ -2492,6 +2711,7 @@ int mouse_leave(dt_iop_module_t *self)
   dt_iop_gui_leave_critical_section(self);
 
   gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(GTK_WIDGET(g->map_area));
   dt_control_queue_redraw_center();
   return 1;
 }
@@ -2657,6 +2877,7 @@ void gui_focus(dt_iop_module_t *self, gboolean in)
 #ifdef HAVE_AI
   dt_collection_hint_message(darktable.collection);
   gtk_widget_queue_draw(GTK_WIDGET(g->area));
+  gtk_widget_queue_draw(GTK_WIDGET(g->map_area));
 #endif
 
   // as toneequal.c does with its mask: leaving the module shows the image again
@@ -2830,9 +3051,28 @@ void gui_init(dt_iop_module_t *self)
   gtk_label_set_line_wrap(GTK_LABEL(g->status_label), TRUE);
   dt_gui_box_add(page, g->status_label);
 
-  // the light x surface map goes here (LS-13)
   g->map_box = dt_gui_vbox();
   dt_gui_box_add(page, g->map_box);
+  dt_gui_box_add(g->map_box, dt_ui_section_label_new(_("light x surface map")));
+
+  g->map_show_after = TRUE;
+  g->map_area = GTK_DRAWING_AREA(dt_ui_resize_wrap
+                                 (NULL, 0, "plugins/darkroom/lightsurface/mapheight"));
+  g_signal_connect(G_OBJECT(g->map_area), "draw", G_CALLBACK(_map_draw), self);
+  gtk_widget_set_tooltip_text
+    (GTK_WIDGET(g->map_area),
+     _("where the image's pixels sit in light (across) and surface (up).\n"
+       "the output gray is light x surface, so pixels on the same diagonal"
+       " merge in a black and white print: whether they differ by light or by"
+       " material tells which control separates them"));
+  dt_gui_box_add(g->map_box, g->map_area);
+
+  DT_BAUHAUS_COMBOBOX_NEW_FULL(g->map_mode, self, NULL, N_("map shows"), NULL,
+                               1, _map_mode_changed, self,
+                               N_("before"), N_("after"));
+  // a reset (double-click) returns to "after", not to the first entry
+  dt_bauhaus_combobox_set_default(g->map_mode, 1);
+  dt_gui_box_add(g->map_box, g->map_mode);
 
   self->widget = GTK_WIDGET(g->notebook);
 
