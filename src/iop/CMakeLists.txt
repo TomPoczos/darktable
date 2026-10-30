@@ -166,6 +166,7 @@ add_iop(primaries "primaries.c")
 add_iop(colorequal "colorequal.c")
 add_iop(contrastntexture "contrastntexture.c")
 add_iop(contrastadv "contrastadv.c")
+add_iop(lightsurface "lightsurface.c")
 add_iop(rasterfile "rasterfile.c")
 add_iop(satcurvergb "satcurvergb.c")
 

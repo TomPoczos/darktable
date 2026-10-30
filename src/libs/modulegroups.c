@@ -1736,6 +1736,7 @@ void init_presets(dt_lib_module_t *self)
   AM("bilat");
   AM("contrastntexture");
   AM("contrastadv");
+  AM("lightsurface");
   AM("filmicrgb");
   AM("levels");
   AM("rgbcurve");
@@ -1917,6 +1918,7 @@ void init_presets(dt_lib_module_t *self)
   AM("temperature");
   AM("contrastntexture");
   AM("contrastadv");
+  AM("lightsurface");
   AM("highlights");
 
   SMG(C_("modulegroup", "color"), "color");
